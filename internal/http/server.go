@@ -77,6 +77,9 @@ func (s *Server) Run(ctx context.Context) error {
 		slog.String("listener", s.name),
 		slog.Duration("grace", s.shutdown.ShutdownTimeout))
 
+	//nolint:contextcheck // shutdownCtx is deliberately not derived from ctx: ctx
+	// is already cancelled by the time we get here, so inheriting it would abort
+	// the drain instantly. See the comment above.
 	if err := s.server.Shutdown(shutdownCtx); err != nil {
 		return fmt.Errorf("shutdown %s: %w", s.name, err)
 	}

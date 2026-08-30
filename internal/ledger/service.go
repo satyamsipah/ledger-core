@@ -56,19 +56,19 @@ type TransactionRequest struct {
 	Entries        []EntryRequest
 }
 
-// LedgerService posts and reverses transactions and answers balance questions.
+// Service posts and reverses transactions and answers balance questions.
 //
 // It holds no state beyond its repository: concurrency safety here comes from
 // database row locks, not from anything this struct could protect with a mutex,
 // and a service that carried per-account state in memory would be wrong the
 // moment a second replica started.
-type LedgerService struct {
+type Service struct {
 	repo Repository
 }
 
-// NewLedgerService wires a service to its repository.
-func NewLedgerService(repo Repository) *LedgerService {
-	return &LedgerService{repo: repo}
+// NewService wires a service to its repository.
+func NewService(repo Repository) *Service {
+	return &Service{repo: repo}
 }
 
 // PostTransaction writes a balanced transaction and moves the affected
@@ -79,7 +79,7 @@ func NewLedgerService(repo Repository) *LedgerService {
 // last, at COMMIT, on entries that are all present by then; and the outbox row
 // commits with the journal it describes, which is what makes invariant 6 hold
 // without a distributed transaction.
-func (s *LedgerService) PostTransaction(ctx context.Context, req TransactionRequest) (*Transaction, error) {
+func (s *Service) PostTransaction(ctx context.Context, req TransactionRequest) (*Transaction, error) {
 	if err := req.validate(); err != nil {
 		return nil, err
 	}
@@ -150,7 +150,7 @@ func (s *LedgerService) PostTransaction(ctx context.Context, req TransactionRequ
 // Reversal can legitimately fail with ErrInsufficientFunds: undoing a transfer
 // moves money back out of the receiving account, and that account may have
 // spent it. The caller has to resolve that, and no amount of retrying will.
-func (s *LedgerService) ReverseTransaction(ctx context.Context, txID uuid.UUID, reason string) (*Transaction, error) {
+func (s *Service) ReverseTransaction(ctx context.Context, txID uuid.UUID, reason string) (*Transaction, error) {
 	if reason == "" {
 		return nil, ErrReversalReasonRequired
 	}
@@ -260,7 +260,7 @@ func (s *LedgerService) ReverseTransaction(ctx context.Context, txID uuid.UUID, 
 // what lets the overdraft CHECK mean anything. The projection is a separate
 // read model, and the two disagreeing is precisely the signal the
 // reconciliation engine exists to catch.
-func (s *LedgerService) GetBalance(ctx context.Context, accountID uuid.UUID) (Balance, error) {
+func (s *Service) GetBalance(ctx context.Context, accountID uuid.UUID) (Balance, error) {
 	return s.repo.GetBalance(ctx, accountID)
 }
 
@@ -281,7 +281,7 @@ func (s *LedgerService) GetBalance(ctx context.Context, accountID uuid.UUID) (Ba
 // stop being visible in the one place users actually look. A genuinely
 // monotonic temporal view needs a commit-ordered sequence, which belongs with
 // the reconciliation engine. See docs/DECISIONS.md, Phase 2.
-func (s *LedgerService) GetBalanceAsOf(ctx context.Context, accountID uuid.UUID, at time.Time) (Money, error) {
+func (s *Service) GetBalanceAsOf(ctx context.Context, accountID uuid.UUID, at time.Time) (Money, error) {
 	return s.repo.GetBalanceAsOf(ctx, accountID, at)
 }
 
@@ -292,7 +292,7 @@ func (s *LedgerService) GetBalanceAsOf(ctx context.Context, accountID uuid.UUID,
 // then discards, and any entry inserted between two page requests shifts every
 // subsequent offset by one, so a client paging through a busy account both
 // pays more per page and silently skips rows.
-func (s *LedgerService) GetStatement(ctx context.Context, q StatementQuery) (Statement, error) {
+func (s *Service) GetStatement(ctx context.Context, q StatementQuery) (Statement, error) {
 	if q.AccountID == uuid.Nil {
 		return Statement{}, fmt.Errorf("statement: account id is required: %w", ErrAccountNotFound)
 	}

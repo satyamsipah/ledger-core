@@ -1,6 +1,8 @@
 package http
 
 import (
+	"context"
+	"errors"
 	"log/slog"
 	nethttp "net/http"
 	"runtime/debug"
@@ -79,27 +81,32 @@ func requestMetrics(metrics *observability.Metrics) func(nethttp.Handler) nethtt
 func recoverer(logger *slog.Logger) func(nethttp.Handler) nethttp.Handler {
 	return func(next nethttp.Handler) nethttp.Handler {
 		return nethttp.HandlerFunc(func(w nethttp.ResponseWriter, r *nethttp.Request) {
-			defer func() {
+			// The request context is passed into the deferred closure rather
+			// than captured from r, so the recovery path logs against the same
+			// context the handler ran under even if r is reassigned.
+			defer func(ctx context.Context) {
 				rec := recover()
 				if rec == nil {
 					return
 				}
 				// A client disconnecting mid-write is not a panic worth paging
 				// on; re-panic so the server handles it as it normally would.
-				if err, ok := rec.(error); ok && err == nethttp.ErrAbortHandler {
+				// errors.Is rather than ==, so a wrapped ErrAbortHandler is
+				// still recognised instead of paging someone at 3am.
+				if err, ok := rec.(error); ok && errors.Is(err, nethttp.ErrAbortHandler) {
 					panic(rec)
 				}
-				logger.LogAttrs(r.Context(), slog.LevelError, "panic recovered",
+				logger.LogAttrs(ctx, slog.LevelError, "panic recovered",
 					slog.Any("panic", rec),
 					slog.String("method", r.Method),
 					slog.String("path", r.URL.Path),
-					slog.String("request_id", chimiddleware.GetReqID(r.Context())),
+					slog.String("request_id", chimiddleware.GetReqID(ctx)),
 					slog.String("stack", string(debug.Stack())),
 				)
 				writeJSON(w, nethttp.StatusInternalServerError, map[string]string{
 					"error": "internal error",
 				})
-			}()
+			}(r.Context())
 			next.ServeHTTP(w, r)
 		})
 	}

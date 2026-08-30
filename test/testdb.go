@@ -118,8 +118,8 @@ func newPool(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 // and the concurrency tests deliberately queue two hundred writers on five
 // accounts -- a production-sized budget would turn honest lock waiting into
 // spurious failures and hide whatever the test was actually looking for.
-func newLedgerService(pool *pgxpool.Pool) *ledger.LedgerService {
-	return ledger.NewLedgerService(pgledger.New(pool, 30*time.Second))
+func newLedgerService(pool *pgxpool.Pool) *ledger.Service {
+	return ledger.NewService(pgledger.New(pool, 30*time.Second))
 }
 
 // newAccount inserts an ACTIVE asset account, returning the id.

@@ -577,7 +577,7 @@ func randomTransaction(rng *rand.Rand, accounts []uuid.UUID) ledger.TransactionR
 
 // fund moves an opening balance into an account through the real posting path,
 // so that no test sets up its fixtures by a route the system does not use.
-func fund(t *testing.T, ctx context.Context, svc *ledger.LedgerService, from, to uuid.UUID, amount int64) {
+func fund(t *testing.T, ctx context.Context, svc *ledger.Service, from, to uuid.UUID, amount int64) {
 	t.Helper()
 
 	fromDirection, toDirection := ledger.DirectionCredit, ledger.DirectionDebit

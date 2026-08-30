@@ -2,6 +2,7 @@ package test
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/golang-migrate/migrate/v4"
@@ -91,13 +92,13 @@ func TestMigrations_RoundTrip(t *testing.T) {
 		// works when the ones after it have already been undone.
 		for {
 			err := migrator.Steps(-1)
-			if err == migrate.ErrNoChange {
+			if errors.Is(err, migrate.ErrNoChange) {
 				break
 			}
 			require.NoError(t, err)
 
 			version, dirty, err := migrator.Version()
-			if err == migrate.ErrNilVersion {
+			if errors.Is(err, migrate.ErrNilVersion) {
 				break
 			}
 			require.NoError(t, err)

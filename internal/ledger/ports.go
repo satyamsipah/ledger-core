@@ -45,8 +45,8 @@ type Tx interface {
 	// LockAccounts takes the row locks that serialise concurrent posting, and
 	// returns each account together with its current balance.
 	//
-	// ids must be sorted; see LedgerService.PostTransaction for why the order
-	// is what prevents deadlock.
+	// ids must be sorted; see Service.PostTransaction for why the order is
+	// what prevents deadlock.
 	LockAccounts(ctx context.Context, ids []uuid.UUID) ([]LockedAccount, error)
 
 	// InsertTransaction writes the header and fills in the timestamps the

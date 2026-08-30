@@ -9,8 +9,8 @@
 // session, or a future service does something this code never anticipated.
 //
 // Phase 2 adds the posting core: Money, the double-entry domain types,
-// LedgerService.PostTransaction and ReverseTransaction, and the balance
-// queries. There is still no HTTP layer -- the service is the boundary.
+// Service.PostTransaction and ReverseTransaction, and the balance queries.
+// There is still no HTTP layer -- the service is the boundary.
 //
 // Two comments in this package are worth reading before changing anything in
 // it: the sign-convention block in types.go, which explains why an account's

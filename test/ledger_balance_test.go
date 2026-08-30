@@ -311,7 +311,7 @@ func TestBalanceQueries_RejectUnknownAccounts(t *testing.T) {
 func transfer(
 	t *testing.T,
 	ctx context.Context,
-	svc *ledger.LedgerService,
+	svc *ledger.Service,
 	debitAccount, creditAccount uuid.UUID,
 	amount int64,
 ) *ledger.Transaction {

@@ -13,7 +13,7 @@ written yet does something unanticipated.
 
 **Phase 2 complete: the ledger core.** Transactions post and reverse, balances
 move under row locks, and every write emits an outbox event. There is no HTTP
-layer yet — `LedgerService` is the boundary, and it is exercised directly by the
+layer yet — `ledger.Service` is the boundary, and it is exercised directly by
 tests.
 
 Phase 1 (skeleton, schema, local environment) is unchanged and still the
@@ -47,7 +47,7 @@ make help        # every target
 cmd/api             public HTTP surface
 cmd/projector       Kafka consumer maintaining the read-side balance projection
 cmd/reconciler      scheduled invariant checks against data at rest
-internal/ledger     double-entry domain: Money, entries, LedgerService
+internal/ledger     double-entry domain: Money, entries, ledger.Service
 internal/ledger/pgledger  the PostgreSQL repository: locking and SQL
 internal/idempotency  request de-duplication (invariant 5)
 internal/outbox     transactional outbox (invariant 6)
@@ -91,7 +91,7 @@ Full reasoning is in
 
 ## Posting
 
-`LedgerService.PostTransaction` does all of its work in one database
+`ledger.Service.PostTransaction` does all of its work in one database
 transaction, in this order:
 
 1. **Lock** every account the transaction touches, in one statement, ordered by

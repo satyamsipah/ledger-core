@@ -26,6 +26,8 @@ import (
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
 
+	"github.com/satyamsipah/ledger-core/internal/ledger"
+	"github.com/satyamsipah/ledger-core/internal/ledger/pgledger"
 	"github.com/satyamsipah/ledger-core/migrations"
 )
 
@@ -110,19 +112,47 @@ func newPool(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 	return pool, nil
 }
 
-// newAccount inserts an ACTIVE account and its zeroed balance row, returning
-// the id. Each call uses a fresh UUID and external_ref so tests never collide
-// and never need to clean up after each other -- which matters here because
-// journal_entries cannot be truncated, by design.
+// newLedgerService builds a service over the shared pool.
+//
+// The timeout is deliberately generous. It bounds a whole posting transaction,
+// and the concurrency tests deliberately queue two hundred writers on five
+// accounts -- a production-sized budget would turn honest lock waiting into
+// spurious failures and hide whatever the test was actually looking for.
+func newLedgerService(pool *pgxpool.Pool) *ledger.LedgerService {
+	return ledger.NewLedgerService(pgledger.New(pool, 30*time.Second))
+}
+
+// newAccount inserts an ACTIVE asset account, returning the id.
 func newAccount(t *testing.T, ctx context.Context, pool *pgxpool.Pool, currency string, allowNegative bool) uuid.UUID {
+	t.Helper()
+	return newTypedAccount(t, ctx, pool, ledger.AccountTypeAsset, currency, allowNegative)
+}
+
+// newTypedAccount inserts an ACTIVE account of the given type, returning the id.
+//
+// Each call uses a fresh UUID and external_ref so tests never collide and never
+// need to clean up after each other -- which matters here because
+// journal_entries cannot be truncated, by design.
+//
+// The type matters more than it looks: an ASSET account is DEBIT-normal, so the
+// two sign conventions coincide on it and a sign bug stays invisible. Tests
+// that care about the balance sign use LIABILITY accounts, where they diverge.
+func newTypedAccount(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	accountType ledger.AccountType,
+	currency string,
+	allowNegative bool,
+) uuid.UUID {
 	t.Helper()
 
 	id := mustUUIDv7(t)
 	_, err := pool.Exec(ctx, `
 		INSERT INTO accounts (id, external_ref, account_type, normal_balance,
 		                      currency, owner_id, allow_negative, status)
-		VALUES ($1, $2, 'ASSET', 'DEBIT', $3, NULL, $4, 'ACTIVE')`,
-		id, "test-"+id.String(), currency, allowNegative)
+		VALUES ($1, $2, $3, $4, $5, NULL, $6, 'ACTIVE')`,
+		id, "test-"+id.String(), accountType, accountType.NormalBalance(), currency, allowNegative)
 	require.NoError(t, err, "insert account")
 
 	_, err = pool.Exec(ctx, `

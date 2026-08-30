@@ -8,6 +8,13 @@
 // the database constraints are what remain true when a migration, an admin
 // session, or a future service does something this code never anticipated.
 //
-// Phase 1 defines the schema and the domain error vocabulary. Posting logic
-// arrives in Phase 2.
+// Phase 2 adds the posting core: Money, the double-entry domain types,
+// LedgerService.PostTransaction and ReverseTransaction, and the balance
+// queries. There is still no HTTP layer -- the service is the boundary.
+//
+// Two comments in this package are worth reading before changing anything in
+// it: the sign-convention block in types.go, which explains why an account's
+// balance is not signed the same way its transactions are, and the isolation
+// note on pgledger.Repository.InTx, which explains why the write path runs at
+// READ COMMITTED and what that obliges every write path to do.
 package ledger

@@ -1,0 +1,157 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A second push to the same branch cancels the first: nothing is learned from a
+# green run against a commit that has already been replaced.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# pgx, OpenTelemetry, prometheus/client_golang and testcontainers-go all declare
+# go >= 1.25, so that is the floor for the whole module.
+env:
+  GO_VERSION: "1.25"
+
+jobs:
+  build:
+    name: build and vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Verify go.mod is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: Verify formatting
+        run: |
+          unformatted=$(gofmt -s -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt -s clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - run: go build ./...
+      - run: go vet ./...
+
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.13.2
+
+  test:
+    name: test -race
+    runs-on: ubuntu-latest
+    # Testcontainers pulls images and the concurrency tests are not instant.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      # Pre-pull so a slow registry shows up as a pull failure rather than as a
+      # container start-up timeout inside the test.
+      - name: Pull test images
+        run: docker pull postgres:16-alpine
+
+      - name: Run tests
+        run: go test -race -count=1 -timeout=15m ./...
+        env:
+          TESTCONTAINERS_RYUK_DISABLED: "false"
+
+  migrations:
+    name: migration round-trip
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: ledger
+          POSTGRES_USER: ledger
+          POSTGRES_PASSWORD: ledger
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ledger -d ledger"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgres://ledger:ledger@localhost:5432/ledger?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install golang-migrate
+        run: |
+          curl -sSL https://github.com/golang-migrate/migrate/releases/download/v4.17.1/migrate.linux-amd64.tar.gz \
+            | tar xz -C /usr/local/bin migrate
+          migrate -version
+
+      # Runs independently of the Go suite so a broken .down.sql is reported as
+      # a migration failure, not buried in a test log.
+      - name: Migrate up
+        run: migrate -path=migrations -database="$DATABASE_URL" up
+
+      - name: Assert schema is present
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "
+            SELECT 1/count(*) FROM pg_tables
+             WHERE schemaname='public'
+               AND tablename IN ('accounts','transactions','journal_entries',
+                                 'account_balances','idempotency_keys','outbox')
+            HAVING count(*) = 6;"
+
+      - name: Migrate all the way down
+        run: migrate -path=migrations -database="$DATABASE_URL" down -all
+
+      - name: Assert nothing was left behind
+        run: |
+          leftover=$(psql "$DATABASE_URL" -tAc "
+            SELECT count(*) FROM pg_tables
+             WHERE schemaname='public' AND tablename <> 'schema_migrations';")
+          if [ "$leftover" != "0" ]; then
+            echo "down migrations left $leftover table(s) behind"
+            psql "$DATABASE_URL" -c "\dt"
+            exit 1
+          fi
+          functions=$(psql "$DATABASE_URL" -tAc "
+            SELECT count(*) FROM pg_proc p
+              JOIN pg_namespace n ON n.oid = p.pronamespace
+             WHERE n.nspname='public'
+               AND p.proname IN ('set_updated_at','ledger_sync_allow_negative',
+                                 'ledger_reject_journal_mutation',
+                                 'ledger_assert_transaction_balanced');")
+          if [ "$functions" != "0" ]; then
+            echo "down migrations left $functions trigger function(s) behind"
+            exit 1
+          fi
+
+      - name: Migrate up again
+        run: migrate -path=migrations -database="$DATABASE_URL" up
+
+      - name: Seed the chart of accounts
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f deploy/seed/seed.sql

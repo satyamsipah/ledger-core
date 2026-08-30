@@ -475,3 +475,396 @@ audit. Anything built on it before Phase 3 inherits the spoofability.
 - A duplicate `transactions.idempotency_key` currently surfaces as a wrapped
   `unique_violation` rather than a domain error. Mapping it belongs with the
   idempotency service, which owns what a replay means.
+
+---
+
+## Phase 3 — The write path under duplicates and concurrency
+
+### D20. The idempotency key is completed inside the ledger transaction; the reservation is not
+
+**Decided.** Two database transactions, and precisely which work lives in which
+is the whole design.
+
+1. **Reservation** — `INSERT … status = 'IN_PROGRESS' … ON CONFLICT DO NOTHING`,
+   committed on its own, before any ledger work.
+2. **The work** — journal entries, balance updates, outbox row, **and**
+   `UPDATE idempotency_keys SET status = 'COMPLETED', response_status,
+   response_body, transaction_id`, all in one transaction.
+
+Everything rests on one property, and it is worth stating as a proposition:
+
+> A record in `IN_PROGRESS` is **proof that no transaction committed under that
+> key**, because the move to `COMPLETED` happens in the same transaction as the
+> journal entries.
+
+That is what makes a stale lease safe to reclaim with no fencing token, no lock
+service, and no distributed coordination of any kind.
+
+**Rejected: one transaction, no observable IN_PROGRESS.** Write the record with
+the journal entries and let duplicates block on the unique index
+(`ON CONFLICT DO UPDATE … RETURNING` to read the winner's row once it commits).
+Atomicity is perfect and the crash window is not merely handled but
+*unreachable*. It was rejected for two reasons. The 409-with-`Retry-After`
+behaviour becomes impossible to express, because a row written inside the
+ledger's transaction is invisible until commit, and by then its status is
+already `COMPLETED`. And a hundred duplicates of one key park a hundred
+connections on the winner for the full duration of a posting transaction —
+against `LEDGER_POSTGRES_MAX_CONNS` of 20 that is service-wide pool exhaustion,
+caused by retries of a single request and affecting every unrelated account.
+`ErrRequestInProgress`'s doc comment warned about exactly this in Phase 1.
+
+**Rejected: reserve, work, complete — three transactions.** The textbook
+version, and *the bug this phase exists to remove*. The work commits, the
+completion fails, and the key is left `IN_PROGRESS` over a transaction that
+really posted. The retry then finds a stale lease, correctly concludes that a
+stale lease means no commit — and is wrong for the first time, because that
+inference is only sound while `COMPLETED` and the journal are atomic. It posts
+the money twice. A Redis-only record fails the same way and faster, since a
+cache eviction is not even a crash.
+
+**Why the reservation may live outside the atomic step.** It carries no
+consequence beyond "somebody is trying". Losing one, duplicating one, or
+abandoning one costs availability and never correctness. Every crash window
+degrades in one direction only:
+
+| Crash point | State left behind | Consequence |
+|---|---|---|
+| After reservation, before/during the work | `IN_PROGRESS`, no transaction | Stale lease, reclaimable. Liveness only |
+| **At the work's COMMIT** (the ambiguous one) | Atomic: both or neither | No window at all |
+| After commit, before the response | `COMPLETED` | The retry replays |
+
+**Three independent defences**, in the order a duplicate meets them: the primary
+key of `idempotency_keys`; the `status = 'IN_PROGRESS'` guard on the completing
+`UPDATE`, which aborts the loser of a reclaim race and takes its journal entries
+down with it; and `transactions_idempotency_key_key`, which fires inside the
+ledger transaction regardless of anything `internal/idempotency` does. The third
+is the one that would still be standing if the other two were deleted. It also
+closes the Phase 2 gap that left a duplicate key surfacing as a raw
+`unique_violation`.
+
+**Consequence: the response must be rendered before COMMIT.** It has to be
+durable at the same instant the journal entries are, so the usual middleware
+shape — wrap the `ResponseWriter`, persist what the handler wrote — cannot
+supply it. Hence `ledger.ResponseRenderer`, a callback that runs inside the
+transaction. The middleware owns the read path (replay, 409, 422); the write
+happens in the service. Splitting it that way is the price of the guarantee.
+
+**Consequence: the lease needs its own clock.** `expires_at` is the 24-hour TTL
+on the replay record; `lease_expires_at` is how long one request may hold the
+key. Seconds against a day. Conflating them means choosing between a crashed
+request blocking its own retry for 24 hours and a replay record vanishing while
+its owner is still running.
+
+### D21. The 24-hour TTL bounds storage, never correctness
+
+**Decided.** Sweeping deletes the *replay record*. The key itself stays reserved
+permanently by `transactions_idempotency_key_key`, so a retry arriving after the
+TTL is refused with `ErrKeyExpired` rather than executed again.
+
+**Rejected:** having the sweeper also `NULL` out `transactions.idempotency_key`
+so the key becomes reusable. That mutates history to tidy up a cache, and it
+destroys the audit link between a client's key and the transaction it created.
+
+The property this buys is worth naming: **expiry can never cause a double post.**
+The worst it can do is fail to replay a response, which is a strictly smaller
+problem, and the client is told so explicitly rather than being handed a second
+transaction.
+
+### D22. Deterministic rejections are cached; transient ones release the key
+
+**Decided.** A rejection that is a property of the **request** is stored as
+`FAILED` and replayed. A rejection that is a property of the **world** hands the
+key back.
+
+- Cached: unbalanced, too few entries, mixed currency, currency mismatch,
+  invalid currency or scale, overflow, unknown type, malformed entry, malformed
+  body, missing reversal reason, already reversed, not posted.
+- Released: insufficient funds, account frozen, account or transaction not
+  found, any 5xx, timeouts, a lost lease.
+
+**Why not cache everything**, which is what Stripe does and is simpler:
+`ErrInsufficientFunds` is transient. The account may be funded a second later,
+and burning the key permanently would force an honest client to mint a new one
+for what is, to it, the same operation — the exact situation idempotency keys
+exist to avoid. Frozen accounts get unfrozen and missing accounts get created,
+so both are treated the same way.
+
+**Why not release everything**, which is also simpler: an unbalanced transaction
+will never balance. Re-running the whole posting path to re-derive a foregone
+conclusion is wasted work on every retry of a client that has a bug.
+
+**Getting this wrong is asymmetric, and mildly so in both directions.** Caching
+a transient failure costs availability; releasing a deterministic one costs a
+little wasted work. Neither can double-post, because the release is guarded on
+`status = 'IN_PROGRESS'` — so if the ledger transaction did commit and the
+release ran anyway, it matches nothing.
+
+### D23. Redis is not a dependency yet; `Cache` is an interface with a no-op default
+
+**Decided.** `idempotency.Cache` is declared, `NoopCache` is wired, and
+`redis/go-redis/v9` is not in `go.mod`.
+
+The read-through fast path is specified — it may hold **terminal records only**,
+so a stale read is indistinguishable from a fresh one and the cache cannot
+produce a wrong answer — but the implementation is deferred. Correctness never
+depended on Redis, which is the property that makes deferring it possible at all,
+and `ledger_idempotency_outcomes_total{outcome="cache_hit"}` against
+`cache_miss` is what will say whether the dependency has earned itself.
+
+**Rejected:** adding the client now because the architecture diagram has Redis in
+it. A dependency added before the measurement that justifies it is one nobody
+ever removes.
+
+### D24. The idempotency key namespace is global, and there is no authentication
+
+**Not decided. A known gap, recorded in the same spirit as D19.**
+
+The fingerprint covers the canonicalized body, the HTTP method and the route
+pattern. It does **not** cover the authenticated principal, because there is no
+authentication in this service yet.
+
+**What that permits, stated plainly.** Keys share one namespace across every
+caller. Anyone who learns or guesses another caller's `Idempotency-Key` can send
+it and be handed that caller's stored response body — a transaction id, its
+accounts, and its amounts. Requiring a UUID makes an *accidental* collision
+essentially impossible; it does nothing about a deliberate one.
+
+**Why a placeholder principal was considered and rejected.** Threading a
+constant, or a client-supplied header, into the fingerprint would make the code
+look as though it had a tenant boundary. It would not have one: a value the
+caller controls is not an identity, and the first reader to see
+`principal` in the digest would reasonably assume the problem was solved. A gap
+that looks closed is worse than one that is visibly open, which is the same
+argument D19 makes about `RealIP`.
+
+**What has to happen when auth lands**, so the work is not rediscovered:
+`idempotency_keys.key` becomes a composite primary key of
+`(principal, key)` — namespacing rather than merely fingerprinting, so a
+cross-tenant probe cannot even observe that a key exists. Adding the principal
+to the fingerprint alone would turn the leak into a 422, which is safe but still
+tells the prober that the key is in use.
+
+**Until then:** this service must not be exposed to mutually untrusting callers.
+That is a deployment constraint, and it belongs in the runbook alongside D19's.
+
+### D25. Sharding preserves invariant 4 and weakens liveness
+
+**Decided.** An account may be split into N child accounts (migration 000012).
+Writes route to a random shard; the logical balance is the `SUM` over shards.
+Shards are ordinary rows in `accounts`, so the composite foreign key, the
+deferred trigger, the overdraft `CHECK`, the balance-row trigger and D11's
+ordered locking all keep working untouched.
+
+**The invariant analysis, because it is subtle enough to get backwards.**
+`account_balances_no_overdraft_check` is per row, so a debit routed to shard 7
+is checked against shard 7, not the logical total. Therefore:
+
+- **Safety is preserved.** Every shard is individually non-negative, so their sum
+  is non-negative. The logical account cannot be overdrawn without overdrawing
+  some shard first, and the constraint stops that. **Invariant 4 still holds.**
+- **Liveness is weakened.** 800 spread as 100 across eight shards refuses a debit
+  of 500 the account plainly holds. The check is conservative, not wrong.
+
+Sharding therefore trades false refusals for throughput — the correct direction
+for a ledger, since the failure is a refusal rather than a silent overdraft.
+
+**Consequence, and the restriction it forces:** sharding is only correct on
+accounts where a shard running dry is not a real outcome, meaning accounts whose
+traffic is effectively one-directional — house floats, revenue, fee collection.
+**A drainable customer wallet must not be sharded.** The database cannot check
+traffic direction, so this is a policy the operator holds;
+`TestSharding_CanRefuseADebitTheLogicalAccountCouldAfford` pins the refusal as a
+known, reproducible property rather than something to be rediscovered from a
+support ticket.
+
+**Rejected:** a cross-row check summing the shards before permitting a debit.
+`CHECK` cannot span rows, so it would have to be a trigger aggregating every
+shard — which re-serialises exactly what sharding de-serialised, and deletes the
+entire point.
+
+**Deferred to Phase 4:** a rebalancer moving value between sibling shards as
+ordinary internal transactions. It fixes the false refusal over time without
+touching the hot path, and it is the reason the down migration refuses to move
+balances itself — a ledger movement inside a migration is one with no journal
+entries behind it, which breaks invariant 2 to tidy up a rollback.
+
+**Reversal deliberately does not re-route.** The original's entries already name
+the shards the money went to, so mirroring returns it to those same shards.
+Routing a reversal afresh would pick at random and could drive one shard negative
+while a sibling held the funds — turning a correction into an insufficient-funds
+failure on an account that plainly has the money.
+
+**Benchmark.** 32 writers × 8 posts into one logical account, PostgreSQL 16 in a
+container on a developer laptop, three runs:
+
+| Arm | Transactions | Elapsed | Throughput |
+|---|---|---|---|
+| Single account | 256 | 576–691 ms | **371–444 tx/s** |
+| 16 shards | 256 | 130–158 ms | **1621–1965 tx/s** |
+
+**4.4×–4.8×, not 16×, and the gap is the finding.** Sixteen shards do not buy
+sixteen times the throughput because the row lock stops being the bottleneck
+well before that: the 25-connection pool, WAL fsync and CPU take over. The
+practical reading is that the first few shards recover most of the available
+gain and the rest is largely wasted contention-management, so the sensible
+default for a hot account is 4–8 rather than 16. Absolute figures describe this
+laptop and should not be quoted; the ratio is the transferable result.
+
+### D26. Retries are for two SQLSTATEs only — and this amends D10
+
+**Decided.** `internal/db.Retrier` re-runs a transaction aborted with `40001`
+(serialization failure) or `40P01` (deadlock detected). Five attempts, full
+jitter, and the parent context bounds the whole sequence rather than each
+attempt.
+
+**D10 said there is no retry loop in the posting path.** That reasoning still
+holds — READ COMMITTED plus ordered row locks converts contention into queueing
+rather than aborts — and this does not weaken it. The loop exists because
+"deadlocks cannot happen" is a claim about a lock ordering that a future write
+path could break, and because the optional advisory locks introduce a second
+lock space. **`ledger_db_tx_retries_total{sqlstate="40P01"}` staying at zero is a
+continuous proof of D11 that no single test can give.** Measured, not assumed:
+the hot-account contention test reports 0.0000% over 500 transactions.
+
+**The exclusions are the important part**, and each is excluded for a different
+reason:
+
+- `context.DeadlineExceeded`, connection resets, and anything surfacing from
+  COMMIT itself are **ambiguous** — the transaction may have committed while the
+  answer was lost. Retrying an ambiguous write in a ledger is how money moves
+  twice. This retrier must not manufacture the bug the idempotency key exists to
+  catch.
+- Domain errors are **deterministic**. `ErrBalanceVersionConflict` is the
+  sharpest case: retrying it would re-read state a row lock was supposed to have
+  protected.
+
+Classification is on SQLSTATE alone, through `errors.As` so that pgledger's
+wrapped errors still match. A type assertion would have disabled the whole
+mechanism in production while passing every test written against a bare error.
+
+**Full jitter, uniform over `[0, window)` with no floor.** When N writers are
+aborted by one deadlock, a deterministic delay wakes them together and they
+collide again — the retries reproduce the contention that caused them. A minimum
+delay would resynchronise exactly the writers jitter is meant to separate.
+
+**The transaction id is generated once, outside the loop, and reused.** A fresh
+id per attempt is simpler and wrong in one specific way: if an attempt ever did
+commit and was reported as aborted, a second id would post the money twice,
+where a reused one collides on the primary key and says so.
+
+### D27. Advisory locks are available, off by default, and honestly second-order
+
+**Decided.** `pg_advisory_xact_lock(classid, objid)` per account behind
+`LEDGER_LEDGER_ADVISORY_LOCKS`, taken before any row lock and in the same
+ascending id order.
+
+**What it actually buys, without overselling it.** With D11's ordered row
+locking already in place, this does not remove contention — it moves where
+writers queue. The gain is that they queue *earlier*: an advisory lock is a hash
+table entry, so a blocked writer stops before touching the heap, before the
+visibility checks on `accounts` and `account_balances`, and before the buffer
+pins those take. On an extremely hot account that shortens the critical section
+by the reads the losers no longer perform. Expect roughly neutral in the common
+case; it exists for the pathological one and to be measured.
+
+**Process-wide, never per request.** Advisory locks are a separate lock space, so
+a deployment where only some write paths take them has two independent lock
+orderings instead of D11's single global one — which is the shape a deadlock
+needs. The flag is read once at startup.
+
+**Batched rather than one statement over `unnest`.** Relying on the order in
+which PostgreSQL evaluates a function across the rows of a projection is relying
+on a plan shape, which is the same caveat D11 records about `ORDER BY`.
+Statements in a batch execute in the order queued, which is a guarantee, and
+they still cost one round trip.
+
+### D28. `response_body` is `BYTEA`, not `JSONB`
+
+**Decided**, in migration 000011, after the defect was caught by a test.
+
+The API promises that a replay returns the stored response **byte for byte**.
+`JSONB` cannot keep that promise, because it is a *parsed* representation rather
+than a stored one: it reorders object keys into its own internal order, discards
+insignificant whitespace, drops duplicate keys and normalises numbers. A
+response round-tripped through it comes back as a different sequence of bytes.
+
+The document is semantically identical, which is exactly why this is easy to
+miss and unpleasant to find — `Content-Length` changes, any signature or ETag
+over the body changes, and two callers holding what should be one answer can no
+longer compare them.
+
+`BYTEA` is the honest type for an opaque payload the database never looks
+inside. Nothing queries into `response_body`; migration 000007 had already
+declined to index it, so `JSONB`'s one advantage was never claimed while its
+normalisation actively broke the guarantee.
+
+**Worth recording how it was found**, because the weaker test would have
+shipped it: `TestAPI_ReplayReturnsTheStoredResponseByteForByte` compares raw
+bytes. The obvious version — unmarshal both and compare the objects — passes
+against `JSONB`.
+
+### D29. RFC 9457 problem details, a required key, and an opaque cursor
+
+Three smaller API decisions, grouped because each is a rejection of the obvious
+alternative.
+
+**Errors are `application/problem+json`.** Rejected: inventing
+`{"error": "..."}`. Error shapes are the part of an API clients hard-code most
+and change least willingly, and RFC 9457 is the one shape a generic HTTP client
+already understands. The `type` URI is the machine-readable discriminator;
+`title` and `detail` are prose and may be reworded. `detail` is suppressed on
+5xx, because a constraint or table name in a public error body is free
+reconnaissance.
+
+**`Idempotency-Key` is required on writes, not optional.** An optional key is one
+a client forgets under precisely the conditions — timeouts, retries, a partial
+outage — that make it matter, and the first time that happens it is a duplicate
+payment rather than a lesson.
+
+**The statement cursor is opaque.** Rejected: exposing `created_at` and `id` as
+two query parameters. The position must be a pair because timestamps tie (D17),
+and a client that could see both fields would eventually construct its own, get
+the tie-breaking subtly wrong, and silently skip entries from a statement. An
+opaque token makes the only supported cursor the one this service issued.
+
+**The OpenAPI spec is checked in both directions by the suite** — `chi.Walk`
+against the spec's paths, and the problem-type table against the spec's enum. A
+specification nobody validates rots, and the drift is discovered by a client
+integrating against a path that no longer exists.
+
+### Phase 2 gaps, resolved
+
+- A duplicate `transactions.idempotency_key` now maps to
+  `ErrDuplicateIdempotencyKey` and a 409, instead of a wrapped
+  `unique_violation`. See D20.
+- `PostTransaction` has a retry loop after all, for the reasons and with the
+  restrictions in D26. D10's consequence ("there is no retry loop in the posting
+  path") is superseded.
+
+### Known gaps carried into Phase 4
+
+- **The client IP is still spoofable (D19).** Phase 3 was expected to settle
+  this with the gateway design and did not, because the phase was scoped to the
+  write path rather than to deployment topology. Nothing added in Phase 3 reads
+  `r.RemoteAddr` — the idempotency, retry and sharding paths never consult it —
+  so no new surface inherits the spoofability, but the gap is unchanged and now
+  overdue.
+- **The idempotency key namespace is global and unauthenticated (D24).** This is
+  the one that must be closed before the service faces mutually untrusting
+  callers.
+- **Redis is unimplemented (D23).** The hit-rate counter exists; the client does
+  not.
+- **A shard rebalancer does not exist (D25).** Until it does, a sharded account
+  can refuse a debit it could afford, and shard balances drift apart under
+  one-directional traffic without ever converging.
+- **`pending_minor` is still read and carried but never moved.** Holds and
+  authorisations did not arrive in Phase 3.
+- **The saga's write-header-first path can still reach `POSTED` with zero
+  entries.** Closed on `PostTransaction`, open on the saga.
+- **A reversal still fails if any account it touches has since been `FROZEN`.**
+  Unchanged from Phase 2, and still arguable.
+- **Shard accounts are created with `gen_random_uuid()` (v4), not v7.** A
+  deliberate deviation from D3: shards are created by a rare admin operation on
+  a small table, so index locality on `accounts` is not the concern that
+  motivated v7 for `journal_entries`. Worth noting so the inconsistency is not
+  read as an oversight.

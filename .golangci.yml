@@ -1,0 +1,48 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  enable:
+    - bodyclose
+    - contextcheck   # CLAUDE.md requires context threaded everywhere
+    - errorlint      # catches == comparison on wrapped errors, which silently
+                     # breaks every domain sentinel in internal/ledger
+    - gosec
+    - misspell
+    - noctx
+    - nolintlint
+    - revive
+    - rowserrcheck   # an unchecked rows.Err() hides a truncated result set
+    - sqlclosecheck
+
+  settings:
+    errcheck:
+      check-type-assertions: true
+    revive:
+      rules:
+        # CLAUDE.md: every exported function carries a doc comment.
+        - name: exported
+          severity: warning
+    gosec:
+      excludes:
+        # Integer conversions are audited by hand where money is involved; the
+        # rule fires on every int32 config field and drowns the real findings.
+        - G115
+
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - gosec
+          - errcheck
+
+formatters:
+  enable:
+    - gofmt
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

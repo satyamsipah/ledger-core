@@ -1,0 +1,195 @@
+name: ledger-core
+
+# Local orchestration for the whole stack. `docker compose up` from a clean
+# machine brings up Postgres, applies migrations, starts Redpanda and Kafka
+# Connect, registers the Debezium outbox connector, and starts the API.
+#
+# Every dependency edge uses a health condition rather than plain depends_on:
+# without them, Connect races Postgres to a connection refused and Compose
+# reports a healthy stack made of crash loops.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    command:
+      - postgres
+      # wal_level=logical is what makes CDC possible at all. Debezium decodes
+      # the write-ahead log; at the default 'replica' level the log does not
+      # carry enough information to reconstruct row changes.
+      - -c
+      - wal_level=logical
+      - -c
+      - max_wal_senders=10
+      - -c
+      - max_replication_slots=10
+      # Local only: makes slow queries visible while developing.
+      - -c
+      - log_min_duration_statement=200
+    environment:
+      POSTGRES_DB: ledger
+      POSTGRES_USER: ledger
+      POSTGRES_PASSWORD: ledger
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # -U and -d are not optional here: bare pg_isready reports the server up
+      # while it is still running its init scripts and refusing connections.
+      test: ["CMD-SHELL", "pg_isready -U ledger -d ledger"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  migrate:
+    image: migrate/migrate:v4.17.1
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ../migrations:/migrations:ro
+    command:
+      - -path=/migrations
+      - -database=postgres://ledger:ledger@postgres:5432/ledger?sslmode=disable
+      - up
+    # A one-shot container. Services that need the schema wait on
+    # service_completed_successfully rather than on this being "up".
+    restart: on-failure
+
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --overprovisioned
+      - --node-id=0
+      - --check=false
+      # Two listeners: containers reach the broker as redpanda:29092, the host
+      # as localhost:9092. A single listener cannot advertise an address that
+      # resolves correctly from both sides.
+      - --kafka-addr=INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092
+      - --advertise-kafka-addr=INTERNAL://redpanda:29092,EXTERNAL://localhost:9092
+      # Two arguments, not --set=k=v: rpk does not parse the joined form and
+      # forwards it to the broker binary, which then refuses to start.
+      - --set
+      - redpanda.auto_create_topics_enabled=true
+    ports:
+      - "9092:9092"
+      - "9644:9644"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  connect:
+    image: quay.io/debezium/connect:2.7
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      BOOTSTRAP_SERVERS: redpanda:29092
+      GROUP_ID: ledger-connect
+      CONFIG_STORAGE_TOPIC: _connect_configs
+      OFFSET_STORAGE_TOPIC: _connect_offsets
+      STATUS_STORAGE_TOPIC: _connect_status
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      # Schemas off: the outbox payload is already a self-describing JSON
+      # document, and wrapping it in a Connect envelope means every consumer
+      # unwraps twice.
+      CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+    ports:
+      - "8083:8083"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8083/connectors || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
+
+  connect-init:
+    image: curlimages/curl:8.10.1
+    depends_on:
+      connect:
+        condition: service_healthy
+      # The connector references public.outbox, so the table must exist before
+      # it is registered.
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - ./debezium/outbox-connector.json:/config/outbox-connector.json:ro
+    # PUT against /config rather than POST to /connectors, so re-running
+    # `docker compose up` updates the connector instead of failing with 409.
+    command:
+      - --fail
+      - --show-error
+      - --silent
+      - -X
+      - PUT
+      - -H
+      - "Content-Type: application/json"
+      - --data
+      - "@/config/outbox-connector.json"
+      - http://connect:8083/connectors/ledger-outbox/config
+    restart: on-failure
+
+  redis:
+    image: redis:7-alpine
+    # Persistence off deliberately. Redis is the idempotency fast path only;
+    # correctness lives in Postgres, and a durable Redis would invite code that
+    # forgets that.
+    command: ["redis-server", "--appendonly", "no", "--save", ""]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        SERVICE: api
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+    environment:
+      LEDGER_ENV: local
+      LEDGER_HTTP_ADDR: ":8080"
+      LEDGER_METRICS_ADDR: ":9090"
+      LEDGER_POSTGRES_DSN: postgres://ledger:ledger@postgres:5432/ledger?sslmode=disable
+      LEDGER_REDIS_ADDR: redis:6379
+      LEDGER_KAFKA_BROKERS: redpanda:29092
+      LEDGER_LOG_LEVEL: debug
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+volumes:
+  postgres-data:
+  redpanda-data:

@@ -1,0 +1,40 @@
+{
+  "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+  "plugin.name": "pgoutput",
+
+  "database.hostname": "postgres",
+  "database.port": "5432",
+  "database.user": "ledger",
+  "database.password": "ledger",
+  "database.dbname": "ledger",
+
+  "topic.prefix": "ledger",
+  "table.include.list": "public.outbox",
+
+  "slot.name": "ledger_outbox_slot",
+  "publication.name": "ledger_outbox_pub",
+  "publication.autocreate.mode": "disabled",
+
+  "snapshot.mode": "no_data",
+
+  "transforms": "outbox",
+  "transforms.outbox.type": "io.debezium.transforms.outbox.EventRouter",
+  "transforms.outbox.table.field.event.id": "id",
+  "transforms.outbox.table.field.event.key": "aggregate_id",
+  "transforms.outbox.table.field.event.type": "event_type",
+  "transforms.outbox.table.field.event.payload": "payload",
+  "transforms.outbox.table.expand.json.payload": "true",
+  "transforms.outbox.route.by.field": "aggregate_type",
+  "transforms.outbox.route.topic.replacement": "ledger.events.${routedByValue}",
+  "transforms.outbox.table.fields.additional.placement": "event_type:header:eventType,created_at:header:createdAt",
+
+  "key.converter": "org.apache.kafka.connect.storage.StringConverter",
+  "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+  "value.converter.schemas.enable": "false",
+
+  "heartbeat.interval.ms": "10000",
+  "topic.creation.enable": "true",
+  "topic.creation.default.replication.factor": "1",
+  "topic.creation.default.partitions": "3",
+  "topic.creation.default.cleanup.policy": "delete"
+}

@@ -1,0 +1,10 @@
+.git
+.github
+.claude
+bin
+tmp
+docs
+node_modules
+*.test
+coverage.out
+deploy/docker-compose.yml

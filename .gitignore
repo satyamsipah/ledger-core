@@ -1,0 +1,10 @@
+.env
+.env.*
+.claude/settings.local.json
+CLAUDE.local.md
+/bin
+/tmp
+node_modules/
+.DS_Store
+*.test
+coverage.out

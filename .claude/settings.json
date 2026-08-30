@@ -1,0 +1,37 @@
+{
+  "permissions": {
+    "defaultMode": "default",
+    "allow": [
+      "Bash(go build *)",
+      "Bash(go test *)",
+      "Bash(go vet *)",
+      "Bash(go mod *)",
+      "Bash(go run *)",
+      "Bash(gofmt *)",
+      "Bash(golangci-lint *)",
+      "Bash(make *)",
+      "Bash(docker compose *)",
+      "Bash(docker ps *)",
+      "Bash(migrate *)",
+      "Bash(psql *)",
+      "Bash(k6 run *)",
+      "Bash(git status)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(git add *)",
+      "Bash(npm run *)",
+      "Bash(npx *)"
+    ],
+    "deny": [
+      "Bash(rm -rf *)",
+      "Bash(git push --force *)",
+      "Bash(docker system prune *)",
+      "Read(./.env)",
+      "Read(./.env.*)"
+    ]
+  },
+  "attribution": {
+    "commit": "",
+    "pr": ""
+  }
+}

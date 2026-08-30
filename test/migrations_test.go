@@ -28,6 +28,7 @@ var expectedTables = []string{
 // stale definition.
 var expectedFunctions = []string{
 	"ledger_assert_transaction_balanced",
+	"ledger_create_account_balance",
 	"ledger_reject_journal_mutation",
 	"ledger_sync_allow_negative",
 	"set_updated_at",

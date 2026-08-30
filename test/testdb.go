@@ -155,10 +155,14 @@ func newTypedAccount(
 		id, "test-"+id.String(), accountType, accountType.NormalBalance(), currency, allowNegative)
 	require.NoError(t, err, "insert account")
 
-	_, err = pool.Exec(ctx, `
-		INSERT INTO account_balances (account_id, available_minor, pending_minor, allow_negative)
-		VALUES ($1, 0, 0, $2)`, id, allowNegative)
-	require.NoError(t, err, "insert account balance")
+	// The balance row is not inserted here: migration 000009 creates it from an
+	// AFTER INSERT trigger on accounts, so that the posting path's
+	// SELECT ... FOR UPDATE always has a row to lock. Inserting it again would
+	// be redundant, and asserting it exists is worth more than creating it.
+	var balances int
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*) FROM account_balances WHERE account_id = $1`, id).Scan(&balances))
+	require.Equal(t, 1, balances, "creating an account must create its balance row")
 
 	return id
 }

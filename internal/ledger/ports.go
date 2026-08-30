@@ -6,6 +6,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/satyamsipah/ledger-core/internal/idempotency"
 	"github.com/satyamsipah/ledger-core/internal/outbox"
 )
 
@@ -74,6 +75,19 @@ type Tx interface {
 
 	// AppendEvent writes the outbox row that carries this change to Kafka.
 	AppendEvent(ctx context.Context, e outbox.Event) error
+
+	// CompleteIdempotency moves the request's idempotency key to COMPLETED,
+	// carrying the response that a retry will be handed.
+	//
+	// Its presence on THIS interface rather than on a store of its own is the
+	// design, not a shortcut. Every method here runs in one database
+	// transaction, so declaring the completion alongside InsertEntries is what
+	// makes "the key and the journal commit together" a property of the type
+	// rather than a convention someone has to remember. Writing it through a
+	// pool instead is the exact bug this phase exists to prevent: the money
+	// commits, the completion does not, and the retry -- correctly reasoning
+	// that IN_PROGRESS means no commit -- posts it a second time.
+	CompleteIdempotency(ctx context.Context, c idempotency.Completion) error
 }
 
 // LockedAccount is an account and its balance, read under the row locks taken

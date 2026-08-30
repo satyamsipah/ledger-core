@@ -23,6 +23,23 @@ type Metrics struct {
 
 	// HTTPDuration records latency by route and method.
 	HTTPDuration *prometheus.HistogramVec
+
+	// IdempotencyOutcomes counts what the idempotency state machine decided:
+	// acquired, replayed, conflict, in_progress, expired, reclaimed, released,
+	// failed, cache_hit, cache_miss.
+	//
+	// Unlabelled by route on purpose. The interesting questions -- what
+	// fraction of traffic is retries, is the cache earning its dependency, are
+	// leases being reclaimed (which means requests are dying mid-flight) -- are
+	// all answered in aggregate, and a route label would multiply the series
+	// count for no extra answer.
+	IdempotencyOutcomes *prometheus.CounterVec
+
+	// IdempotencySwept counts expired records deleted by the TTL sweeper. A
+	// counter that stops moving while traffic continues means the sweeper has
+	// died, which is otherwise invisible until the table is large enough to
+	// hurt.
+	IdempotencySwept prometheus.Counter
 }
 
 // NewMetrics builds the registry and registers the process collectors.
@@ -53,9 +70,26 @@ func NewMetrics(service string) *Metrics {
 			// how the multi-second tail is shaped.
 			Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5},
 		}, []string{"route", "method"}),
+		IdempotencyOutcomes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace:   "ledger",
+			Subsystem:   "idempotency",
+			Name:        "outcomes_total",
+			Help:        "Idempotency state machine decisions by outcome.",
+			ConstLabels: prometheus.Labels{"service": service},
+		}, []string{"outcome"}),
+		IdempotencySwept: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace:   "ledger",
+			Subsystem:   "idempotency",
+			Name:        "swept_total",
+			Help:        "Expired idempotency records deleted by the TTL sweeper.",
+			ConstLabels: prometheus.Labels{"service": service},
+		}),
 	}
 
-	registry.MustRegister(m.HTTPRequests, m.HTTPDuration)
+	registry.MustRegister(
+		m.HTTPRequests, m.HTTPDuration,
+		m.IdempotencyOutcomes, m.IdempotencySwept,
+	)
 	return m
 }
 

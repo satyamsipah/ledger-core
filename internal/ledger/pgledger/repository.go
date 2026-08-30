@@ -22,6 +22,8 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/satyamsipah/ledger-core/internal/idempotency"
+	"github.com/satyamsipah/ledger-core/internal/idempotency/pgidem"
 	"github.com/satyamsipah/ledger-core/internal/ledger"
 	"github.com/satyamsipah/ledger-core/internal/outbox"
 )
@@ -687,6 +689,16 @@ func (t *txn) AppendEvent(ctx context.Context, e outbox.Event) error {
 	return outbox.Append(ctx, t.tx, e)
 }
 
+// CompleteIdempotency marks the request's key COMPLETED inside the caller's
+// transaction, which is what keeps invariant 5 true without a second write.
+//
+// Delegated to pgidem for the same reason AppendEvent delegates to outbox: the
+// statement belongs with the table it owns, and what belongs here is the fact
+// that it is issued against t.tx and not against a pool.
+func (t *txn) CompleteIdempotency(ctx context.Context, c idempotency.Completion) error {
+	return pgidem.Complete(ctx, t.tx, c)
+}
+
 func marshalMetadata(metadata map[string]any) ([]byte, error) {
 	if len(metadata) == 0 {
 		// The column is NOT NULL DEFAULT '{}'; sending an explicit empty object
@@ -729,6 +741,18 @@ func mapError(err error) error {
 	case pgerrcode.RestrictViolation:
 		if strings.Contains(pgErr.Message, "append-only") {
 			return fmt.Errorf("%s: %w", pgErr.Message, ledger.ErrImmutableJournal)
+		}
+
+	case pgerrcode.UniqueViolation:
+		if pgErr.ConstraintName == "transactions_idempotency_key_key" {
+			// The database's own defence of invariant 5, and the only one that
+			// owes nothing to internal/idempotency being correct. It normally
+			// stays silent because the idempotency record catches a duplicate
+			// first; reaching it means the record was swept while the key it
+			// describes lived on, which is exactly what a retry arriving after
+			// the 24-hour TTL looks like. Closes the Phase 2 gap that left this
+			// surfacing as a raw unique_violation.
+			return fmt.Errorf("%s: %w", pgErr.Message, ledger.ErrDuplicateIdempotencyKey)
 		}
 
 	case pgerrcode.ForeignKeyViolation:

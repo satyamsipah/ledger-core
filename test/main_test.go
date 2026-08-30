@@ -36,6 +36,7 @@ func runSuite(m *testing.M) (int, error) {
 		return 0, err
 	}
 	defer func() { _ = stop(ctx) }()
+	sharedDSN = dsn
 
 	migrator, err := newMigrator(dsn)
 	if err != nil {

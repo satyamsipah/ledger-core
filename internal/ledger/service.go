@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/satyamsipah/ledger-core/internal/idempotency"
 	"github.com/satyamsipah/ledger-core/internal/outbox"
 )
 
@@ -45,15 +46,57 @@ type EntryRequest struct {
 	Amount    Money
 }
 
+// ResponseRenderer turns a transaction that is about to commit into the exact
+// HTTP response a later retry will be handed.
+//
+// It is a callback, and the inversion is deliberate. The response has to be
+// durable at the same instant the journal entries are, which means it must be
+// produced *before* COMMIT -- so the usual middleware shape, where the response
+// is captured after the handler returns, cannot supply it. Rendering is an HTTP
+// concern and stays in the HTTP layer; the transaction boundary is a service
+// concern and stays here. A callback is the honest way to have both.
+//
+// It runs inside the database transaction, so it must not perform I/O.
+type ResponseRenderer func(*Transaction) (status int, body []byte, err error)
+
+// Idempotent binds a request to an idempotency key that has already been
+// reserved by the caller.
+//
+// Key and Render travel together because neither is useful alone: a key with no
+// renderer would leave the record IN_PROGRESS over a committed transaction --
+// precisely the state the design guarantees is unreachable -- and a renderer
+// with no key has nothing to write. Making them one struct means the broken
+// combination cannot be expressed.
+type Idempotent struct {
+	// Key is a reservation this caller already holds in IN_PROGRESS. The
+	// service does not acquire it; by the time a request reaches here, the HTTP
+	// layer has already resolved replay, conflict and in-progress.
+	Key string
+
+	// Render produces the response stored with the transaction.
+	Render ResponseRenderer
+}
+
 // TransactionRequest is a complete transaction to post. It is validated as a
 // whole before anything touches the database, so a malformed request never
 // takes a row lock.
 type TransactionRequest struct {
-	Type           TransactionType
+	Type        TransactionType
+	ExternalRef *string
+	Metadata    map[string]any
+	Entries     []EntryRequest
+
+	// IdempotencyKey populates transactions.idempotency_key, whose partial
+	// unique index is the database's own defence of invariant 5. It is set from
+	// Idempotency.Key when that is present, and may be set alone by internal
+	// callers that want the column populated without a replay record.
 	IdempotencyKey *string
-	ExternalRef    *string
-	Metadata       map[string]any
-	Entries        []EntryRequest
+
+	// Idempotency, when set, completes the reserved key inside the same
+	// database transaction as the journal entries. This is the mechanism behind
+	// invariant 5; see internal/idempotency for why the atomicity is the whole
+	// guarantee.
+	Idempotency *Idempotent
 }
 
 // Service posts and reverses transactions and answers balance questions.
@@ -84,6 +127,19 @@ func (s *Service) PostTransaction(ctx context.Context, req TransactionRequest) (
 		return nil, err
 	}
 
+	// The key reaches the transactions row whichever way the caller supplied it,
+	// so transactions_idempotency_key_key -- the defence that owes nothing to
+	// this package's correctness -- is armed either way.
+	if req.Idempotency != nil {
+		key := req.Idempotency.Key
+		req.IdempotencyKey = &key
+	}
+
+	// Generated once, OUTSIDE any retry the caller may have wrapped around this
+	// call, and reused by every attempt. A fresh id per attempt would be simpler
+	// and is wrong in one specific way: if an attempt ever did commit and was
+	// then reported as aborted, a second id would post the money twice, where a
+	// reused one collides on the primary key and says so.
 	txID, err := uuid.NewV7()
 	if err != nil {
 		return nil, fmt.Errorf("generate transaction id: %w", err)
@@ -128,6 +184,15 @@ func (s *Service) PostTransaction(ctx context.Context, req TransactionRequest) (
 			return err
 		}
 
+		// Last, and inside this transaction. Everything the response describes
+		// is now present in this transaction's snapshot, so the stored body is
+		// a description of state that either becomes durable with it or
+		// disappears with it. There is no third outcome, and that absence is
+		// invariant 5.
+		if err := completeIdempotency(ctx, tx, req.Idempotency, header); err != nil {
+			return err
+		}
+
 		posted = header
 		return nil
 	})
@@ -136,6 +201,35 @@ func (s *Service) PostTransaction(ctx context.Context, req TransactionRequest) (
 	}
 
 	return posted, nil
+}
+
+// completeIdempotency renders the response and writes the terminal record,
+// inside the caller's transaction.
+//
+// Rendering happens here rather than after COMMIT because a response rendered
+// afterwards would have to be stored afterwards, and a store afterwards is a
+// second transaction -- which is the failure this whole phase is built to make
+// unreachable. The cost is that Render runs while account row locks are held,
+// so it must not do I/O; the ResponseRenderer doc comment says so.
+func completeIdempotency(ctx context.Context, tx Tx, idem *Idempotent, header *Transaction) error {
+	if idem == nil {
+		return nil
+	}
+	if idem.Render == nil {
+		return fmt.Errorf("idempotency key %s: %w", idem.Key, ErrMissingRenderer)
+	}
+
+	status, body, err := idem.Render(header)
+	if err != nil {
+		return fmt.Errorf("render response for transaction %s: %w", header.ID, err)
+	}
+
+	return tx.CompleteIdempotency(ctx, idempotency.Completion{
+		Key:            idem.Key,
+		ResponseStatus: status,
+		ResponseBody:   body,
+		TransactionID:  header.ID,
+	})
 }
 
 // ReverseTransaction undoes a posted transaction by writing a new one whose
@@ -151,6 +245,27 @@ func (s *Service) PostTransaction(ctx context.Context, req TransactionRequest) (
 // moves money back out of the receiving account, and that account may have
 // spent it. The caller has to resolve that, and no amount of retrying will.
 func (s *Service) ReverseTransaction(ctx context.Context, txID uuid.UUID, reason string) (*Transaction, error) {
+	return s.reverse(ctx, txID, reason, nil)
+}
+
+// ReverseTransactionIdempotent reverses a transaction under a reserved
+// idempotency key.
+//
+// A reversal needs idempotency at least as much as a posting does, and arguably
+// more: the status transition already makes a second reversal fail loudly, but
+// it fails with ErrAlreadyReversed, which a retrying client cannot distinguish
+// from "somebody else reversed this behind my back". Replaying the original
+// response answers the question the retry was actually asking.
+func (s *Service) ReverseTransactionIdempotent(
+	ctx context.Context,
+	txID uuid.UUID,
+	reason string,
+	idem *Idempotent,
+) (*Transaction, error) {
+	return s.reverse(ctx, txID, reason, idem)
+}
+
+func (s *Service) reverse(ctx context.Context, txID uuid.UUID, reason string, idem *Idempotent) (*Transaction, error) {
 	if reason == "" {
 		return nil, ErrReversalReasonRequired
 	}
@@ -215,6 +330,10 @@ func (s *Service) ReverseTransaction(ctx context.Context, txID uuid.UUID, reason
 			Status:   TransactionStatusPosted,
 			Metadata: metadata,
 		}
+		if idem != nil {
+			key := idem.Key
+			header.IdempotencyKey = &key
+		}
 		if err := tx.InsertTransaction(ctx, header); err != nil {
 			return err
 		}
@@ -240,6 +359,10 @@ func (s *Service) ReverseTransaction(ctx context.Context, txID uuid.UUID, reason
 		}
 
 		if err := appendTransactionEvent(ctx, tx, EventTypeTransactionReversed, header, balances, &txID, reason); err != nil {
+			return err
+		}
+
+		if err := completeIdempotency(ctx, tx, idem, header); err != nil {
 			return err
 		}
 

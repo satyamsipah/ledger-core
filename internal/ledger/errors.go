@@ -93,6 +93,23 @@ var (
 	// schema's CHECK constraint accepts.
 	ErrInvalidTransactionType = errors.New("ledger: unknown transaction type")
 
+	// ErrMissingRenderer means a request carried an idempotency key with no
+	// ResponseRenderer. Committing that would leave the key IN_PROGRESS over a
+	// transaction that really posted -- the one state the idempotency design
+	// guarantees is unreachable -- so it fails the transaction instead.
+	ErrMissingRenderer = errors.New("ledger: an idempotent request needs a response renderer")
+
+	// ErrDuplicateIdempotencyKey means transactions_idempotency_key_key rejected
+	// the insert: this key already names a transaction.
+	//
+	// Reaching this means the idempotency record was gone while the key it
+	// describes was not -- almost always a retry arriving after the 24-hour TTL
+	// swept the replay record. That is the designed outcome rather than a
+	// failure: the record's expiry ends the ability to replay, never the
+	// uniqueness of the key, so the retry is refused instead of posting a
+	// second transaction.
+	ErrDuplicateIdempotencyKey = errors.New("ledger: idempotency key already names a transaction")
+
 	// ErrBalanceVersionConflict means a balance UPDATE guarded by
 	// `WHERE version = $expected` matched no row while the posting path held
 	// that row's lock. That combination is impossible unless something mutated

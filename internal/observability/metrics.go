@@ -24,6 +24,24 @@ type Metrics struct {
 	// HTTPDuration records latency by route and method.
 	HTTPDuration *prometheus.HistogramVec
 
+	// TxRetries counts database transactions retried, by SQLSTATE and by the
+	// operation that was retrying.
+	//
+	// This is an assertion about D11, not merely an operational gauge. The
+	// ordered locking in pgledger.LockAccounts is supposed to make deadlocks
+	// unconstructible, and a 40P01 series that stays flat at zero is the
+	// continuous proof of it -- far stronger than a test that exercises one
+	// scenario. A 40P01 that starts counting means a write path has begun
+	// taking locks in some other order, and it says so before anyone reports a
+	// failed payment.
+	TxRetries *prometheus.CounterVec
+
+	// TxAttempts records how many attempts each operation needed, so the abort
+	// rate is a distribution rather than a total. One transaction retried four
+	// times and four retried once produce the same counter and very different
+	// systems.
+	TxAttempts *prometheus.HistogramVec
+
 	// IdempotencyOutcomes counts what the idempotency state machine decided:
 	// acquired, replayed, conflict, in_progress, expired, reclaimed, released,
 	// failed, cache_hit, cache_miss.
@@ -70,6 +88,23 @@ func NewMetrics(service string) *Metrics {
 			// how the multi-second tail is shaped.
 			Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5},
 		}, []string{"route", "method"}),
+		TxRetries: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace:   "ledger",
+			Subsystem:   "db",
+			Name:        "tx_retries_total",
+			Help:        "Database transactions retried, by SQLSTATE and operation.",
+			ConstLabels: prometheus.Labels{"service": service},
+		}, []string{"operation", "sqlstate"}),
+		TxAttempts: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace:   "ledger",
+			Subsystem:   "db",
+			Name:        "tx_attempts",
+			Help:        "Attempts required per database transaction, by operation.",
+			ConstLabels: prometheus.Labels{"service": service},
+			// Linear and small: the retry cap is five, so anything past that is
+			// impossible and the interesting shape is entirely in the first few.
+			Buckets: []float64{1, 2, 3, 4, 5},
+		}, []string{"operation"}),
 		IdempotencyOutcomes: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace:   "ledger",
 			Subsystem:   "idempotency",
@@ -88,6 +123,7 @@ func NewMetrics(service string) *Metrics {
 
 	registry.MustRegister(
 		m.HTTPRequests, m.HTTPDuration,
+		m.TxRetries, m.TxAttempts,
 		m.IdempotencyOutcomes, m.IdempotencySwept,
 	)
 	return m

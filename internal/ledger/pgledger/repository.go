@@ -22,6 +22,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/satyamsipah/ledger-core/internal/db"
 	"github.com/satyamsipah/ledger-core/internal/idempotency"
 	"github.com/satyamsipah/ledger-core/internal/idempotency/pgidem"
 	"github.com/satyamsipah/ledger-core/internal/ledger"
@@ -34,10 +35,43 @@ var (
 	_ ledger.Tx         = (*txn)(nil)
 )
 
+// advisoryLockClass namespaces this service's advisory locks.
+//
+// The two-argument form of pg_advisory_xact_lock exists precisely so that
+// unrelated subsystems can share a database without colliding in a lock space
+// that is global to it. A single-argument lock keyed on an account hash would
+// be one careless hash collision away from blocking on some other component's
+// lock, and the resulting wait would be invisible in every query plan.
+const advisoryLockClass = 0x4C454447 // "LEDG"
+
 // Repository is the PostgreSQL-backed ledger repository.
 type Repository struct {
-	pool    *pgxpool.Pool
-	timeout time.Duration
+	pool          *pgxpool.Pool
+	timeout       time.Duration
+	retrier       *db.Retrier
+	advisoryLocks bool
+}
+
+// Option configures a Repository.
+type Option func(*Repository)
+
+// WithRetrier installs a retrier for aborted transactions. Without one a
+// repository still works and simply surfaces 40001 and 40P01 to the caller,
+// which is the Phase 2 behaviour.
+func WithRetrier(retrier *db.Retrier) Option {
+	return func(r *Repository) { r.retrier = retrier }
+}
+
+// WithAdvisoryLocks turns on per-account advisory locking.
+//
+// ALL OR NOTHING, PER PROCESS. Advisory locks live in a lock space entirely
+// separate from row locks, so a deployment where some write paths take them and
+// others do not has two independent lock orderings instead of the single global
+// one D11 depends on -- and two orderings is exactly the shape a deadlock needs.
+// The flag is therefore read once at startup and applied to every write path,
+// never per request.
+func WithAdvisoryLocks(enabled bool) Option {
+	return func(r *Repository) { r.advisoryLocks = enabled }
 }
 
 // New builds a repository over an existing pool.
@@ -45,9 +79,17 @@ type Repository struct {
 // The timeout bounds each logical operation rather than each statement: a
 // posting transaction that holds account row locks past its budget is blocking
 // every other writer touching those accounts, so the deadline that matters is
-// the one on the whole unit of work, not on its individual round trips.
-func New(pool *pgxpool.Pool, timeout time.Duration) *Repository {
-	return &Repository{pool: pool, timeout: timeout}
+// the one on the whole unit of work, not on its individual round trips. A
+// retried transaction is still one logical operation, so the budget covers
+// every attempt rather than resetting for each -- otherwise a five-attempt
+// retry would quietly consume five times the deadline the HTTP layer believes
+// it granted.
+func New(pool *pgxpool.Pool, timeout time.Duration, opts ...Option) *Repository {
+	r := &Repository{pool: pool, timeout: timeout}
+	for _, opt := range opts {
+		opt(r)
+	}
+	return r
 }
 
 // InTx runs fn inside one READ COMMITTED transaction.
@@ -76,10 +118,26 @@ func New(pool *pgxpool.Pool, timeout time.Duration) *Repository {
 // database itself, which enforces the overdraft CHECK and the balance trigger
 // unconditionally. A path that forgets produces a loud constraint violation,
 // not a quietly wrong balance.
+//
+// RETRIES, AND WHY THEY DO NOT CONTRADICT ANY OF THE ABOVE: the retrier only
+// re-runs 40001 and 40P01, the two aborts PostgreSQL guarantees rolled back
+// nothing. Under this isolation level and locking strategy neither should
+// occur, which is the point -- ledger_db_tx_retries_total is how "should not
+// occur" gets measured instead of assumed. See internal/db/retry.go.
 func (r *Repository) InTx(ctx context.Context, fn func(context.Context, ledger.Tx) error) error {
 	ctx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
 
+	if r.retrier == nil {
+		return r.runTx(ctx, fn)
+	}
+	return r.retrier.Do(ctx, "ledger_tx", func(ctx context.Context) error {
+		return r.runTx(ctx, fn)
+	})
+}
+
+// runTx is one attempt: begin, run, commit.
+func (r *Repository) runTx(ctx context.Context, fn func(context.Context, ledger.Tx) error) error {
 	pgTx, err := r.pool.BeginTx(ctx, pgx.TxOptions{
 		IsoLevel:   pgx.ReadCommitted,
 		AccessMode: pgx.ReadWrite,
@@ -93,7 +151,7 @@ func (r *Repository) InTx(ctx context.Context, fn func(context.Context, ledger.T
 	// connection to be destroyed rather than returned to the pool.
 	defer func() { _ = pgTx.Rollback(context.WithoutCancel(ctx)) }()
 
-	if err := fn(ctx, &txn{tx: pgTx}); err != nil {
+	if err := fn(ctx, &txn{tx: pgTx, advisoryLocks: r.advisoryLocks}); err != nil {
 		return err
 	}
 
@@ -365,7 +423,57 @@ func (r *Repository) GetStatement(ctx context.Context, q ledger.StatementQuery) 
 
 // txn implements ledger.Tx against one pgx transaction.
 type txn struct {
-	tx pgx.Tx
+	tx            pgx.Tx
+	advisoryLocks bool
+}
+
+// takeAdvisoryLocks locks each account in the advisory lock space before any
+// row lock is taken, when the feature is enabled.
+//
+// WHAT THIS BUYS, STATED HONESTLY: with the ordered row locking of D11 already
+// in place, this does not remove contention -- it moves where writers queue.
+// The gain is that they queue *earlier*: pg_advisory_xact_lock is a hash-table
+// entry, so a blocked writer stops before touching the heap, before the
+// visibility checks on accounts and account_balances, and before the buffer
+// pins those take. On an extremely hot account that shortens the critical
+// section by the cost of the reads the losers no longer perform. It is a
+// second-order effect and it is measured rather than assumed; see
+// docs/DECISIONS.md D25 for the benchmark that decides whether to enable it.
+//
+// A batch rather than one statement over unnest(), and the reason is the same
+// caveat D11 records about ORDER BY: relying on the order in which PostgreSQL
+// evaluates a function across the rows of a projection is relying on a plan
+// shape, not on anything guaranteed. Statements in a batch execute in the order
+// they were queued, which is a guarantee, and they still cost one round trip.
+// ids is already in ascending order, which is what keeps this ordering the same
+// one the row locks use.
+func (t *txn) takeAdvisoryLocks(ctx context.Context, ids []uuid.UUID) error {
+	if !t.advisoryLocks || len(ids) == 0 {
+		return nil
+	}
+
+	batch := &pgx.Batch{}
+	for _, id := range ids {
+		// hashtext rather than a Go-side hash, so the key depends only on the
+		// account id and stays identical across processes and language runtimes.
+		// Collisions cost throughput -- two unrelated accounts sharing a queue --
+		// and never correctness, because the row locks are still the thing that
+		// actually serialises the write.
+		batch.Queue(`SELECT pg_advisory_xact_lock($1::int, hashtext($2::text))`,
+			advisoryLockClass, id.String())
+	}
+
+	results := t.tx.SendBatch(ctx, batch)
+	for range ids {
+		if _, err := results.Exec(); err != nil {
+			_ = results.Close()
+			return fmt.Errorf("take advisory account locks: %w", mapError(err))
+		}
+	}
+	if err := results.Close(); err != nil {
+		return fmt.Errorf("close advisory account lock batch: %w", mapError(err))
+	}
+	return nil
 }
 
 // LockAccounts takes the row locks that serialise concurrent posting.
@@ -402,6 +510,13 @@ type txn struct {
 // constraint reads the copy would let the two disagree without anything
 // noticing.
 func (t *txn) LockAccounts(ctx context.Context, ids []uuid.UUID) ([]ledger.LockedAccount, error) {
+	// Before the row locks, never after, and in the same ascending id order.
+	// A second lock space entered in a different order than the first is how a
+	// deadlock gets built out of two individually correct orderings.
+	if err := t.takeAdvisoryLocks(ctx, ids); err != nil {
+		return nil, err
+	}
+
 	rows, err := t.tx.Query(ctx, `
 		SELECT a.id, a.currency, a.account_type, a.normal_balance, a.status,
 		       ab.allow_negative, ab.available_minor, ab.pending_minor, ab.version

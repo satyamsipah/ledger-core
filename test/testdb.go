@@ -12,6 +12,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -27,6 +29,7 @@ import (
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
 
+	"github.com/satyamsipah/ledger-core/internal/db"
 	"github.com/satyamsipah/ledger-core/internal/idempotency"
 	"github.com/satyamsipah/ledger-core/internal/idempotency/pgidem"
 	"github.com/satyamsipah/ledger-core/internal/ledger"
@@ -133,6 +136,68 @@ func newPool(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 // spurious failures and hide whatever the test was actually looking for.
 func newLedgerService(pool *pgxpool.Pool) *ledger.Service {
 	return ledger.NewService(pgledger.New(pool, 30*time.Second))
+}
+
+// newRetryingLedgerService builds a service with the retrier installed, and
+// returns the metrics registry so a test can read the retry counters back.
+//
+// The counters are the point rather than a bonus: "the ordered locking makes
+// deadlocks unconstructible" is a claim, and a contention test that does not
+// look at ledger_db_tx_retries_total{sqlstate="40P01"} cannot tell a system
+// where deadlocks never happen from one where they happen and are silently
+// retried away.
+func newRetryingLedgerService(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	advisoryLocks bool,
+) (*ledger.Service, *observability.Metrics) {
+	t.Helper()
+
+	metrics := observability.NewMetrics("test")
+	retrier := db.NewRetrier(slog.New(slog.NewTextHandler(io.Discard, nil)), metrics, 5, 0, 0)
+
+	repo := pgledger.New(pool, 30*time.Second,
+		pgledger.WithRetrier(retrier),
+		pgledger.WithAdvisoryLocks(advisoryLocks))
+
+	return ledger.NewService(repo), metrics
+}
+
+// counterValue sums a counter vector across the label sets matching want.
+//
+// Read out of the registry rather than tracked alongside it, so the number the
+// test reports is the number an operator would see on a dashboard. A test
+// counting retries in its own variable would still pass if the metric were
+// never incremented.
+func counterValue(t *testing.T, metrics *observability.Metrics, name string, want map[string]string) float64 {
+	t.Helper()
+
+	families, err := metrics.Registry().Gather()
+	require.NoError(t, err, "gather metrics")
+
+	var total float64
+	for _, family := range families {
+		if family.GetName() != name {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			labels := map[string]string{}
+			for _, pair := range metric.GetLabel() {
+				labels[pair.GetName()] = pair.GetValue()
+			}
+			matches := true
+			for key, value := range want {
+				if labels[key] != value {
+					matches = false
+					break
+				}
+			}
+			if matches {
+				total += metric.GetCounter().GetValue()
+			}
+		}
+	}
+	return total
 }
 
 // newIdempotencyStore builds a store over the shared pool.

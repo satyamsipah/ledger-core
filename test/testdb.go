@@ -200,6 +200,49 @@ func counterValue(t *testing.T, metrics *observability.Metrics, name string, wan
 	return total
 }
 
+// shardAccount splits an account into n shards via the migration's own
+// function, so the test exercises the code path an operator would use rather
+// than a hand-rolled set of INSERTs that could drift from it.
+func shardAccount(t *testing.T, ctx context.Context, pool *pgxpool.Pool, accountID uuid.UUID, n int) []uuid.UUID {
+	t.Helper()
+
+	_, err := pool.Exec(ctx, `SELECT ledger_shard_account($1, $2)`, accountID, n)
+	require.NoError(t, err, "shard account %s into %d", accountID, n)
+
+	rows, err := pool.Query(ctx, `
+		SELECT id FROM accounts WHERE parent_account_id = $1 ORDER BY shard_index`, accountID)
+	require.NoError(t, err)
+	defer rows.Close()
+
+	var shards []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		require.NoError(t, rows.Scan(&id))
+		shards = append(shards, id)
+	}
+	require.NoError(t, rows.Err())
+	require.Len(t, shards, n, "sharding must create exactly n shards")
+
+	return shards
+}
+
+// shardsTouched counts how many of an account's shards actually received
+// journal entries. A sharding implementation that routed everything to one
+// shard would pass every balance assertion and buy nothing, so the spread is
+// asserted directly.
+func shardsTouched(t *testing.T, ctx context.Context, pool *pgxpool.Pool, parentID uuid.UUID) int {
+	t.Helper()
+
+	var touched int
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT count(DISTINCT je.account_id)
+		  FROM journal_entries je
+		  JOIN accounts a ON a.id = je.account_id
+		 WHERE a.parent_account_id = $1`, parentID).Scan(&touched))
+
+	return touched
+}
+
 // newIdempotencyStore builds a store over the shared pool.
 func newIdempotencyStore(pool *pgxpool.Pool) *pgidem.Store {
 	return pgidem.New(pool, 30*time.Second)

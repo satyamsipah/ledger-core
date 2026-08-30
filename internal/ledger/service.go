@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand/v2"
 	"sort"
 	"time"
 
@@ -145,11 +146,18 @@ func (s *Service) PostTransaction(ctx context.Context, req TransactionRequest) (
 		return nil, fmt.Errorf("generate transaction id: %w", err)
 	}
 
-	accountIDs := sortedAccountIDs(req.Entries)
-
 	var posted *Transaction
 	err = s.repo.InTx(ctx, func(ctx context.Context, tx Tx) error {
-		accounts, err := lockAndValidate(ctx, tx, accountIDs, req.Entries)
+		// Routing happens first, inside the transaction and before any lock,
+		// because the accounts that get locked are the ones it picks.
+		entryRequests, err := routeToShards(ctx, tx, req.Entries)
+		if err != nil {
+			return err
+		}
+
+		accountIDs := sortedAccountIDs(entryRequests)
+
+		accounts, err := lockAndValidate(ctx, tx, accountIDs, entryRequests)
 		if err != nil {
 			return err
 		}
@@ -166,7 +174,7 @@ func (s *Service) PostTransaction(ctx context.Context, req TransactionRequest) (
 			return err
 		}
 
-		entries, err := buildEntries(txID, req.Entries)
+		entries, err := buildEntries(txID, entryRequests)
 		if err != nil {
 			return err
 		}
@@ -304,6 +312,14 @@ func (s *Service) reverse(ctx context.Context, txID uuid.UUID, reason string, id
 		// opposite directions. Because a reversal is a per-leg mirror it stays
 		// correct for a multi-currency transaction too, each currency balancing
 		// on its own exactly as it did originally.
+		//
+		// NOT re-routed through routeToShards, and that is load-bearing rather
+		// than an omission. The original's entries already name physical
+		// accounts -- the shards its money actually went to -- so mirroring
+		// them takes the money back out of those same shards. Routing a
+		// reversal afresh would pick shards at random and could drive one
+		// negative while a sibling held the funds, turning a correction into an
+		// insufficient-funds failure on an account that plainly has the money.
 		mirrored := make([]EntryRequest, len(original.Entries))
 		for i, e := range original.Entries {
 			mirrored[i] = EntryRequest{
@@ -550,6 +566,57 @@ func sortedAccountIDs(entries []EntryRequest) []uuid.UUID {
 		return ids[i].String() < ids[j].String()
 	})
 	return ids
+}
+
+// routeToShards rewrites entries naming a sharded account to name one of its
+// shards instead.
+//
+// # WHY RANDOM, AND WHY ONE SHARD PER ACCOUNT PER TRANSACTION
+//
+// Random because the goal is to spread row-lock contention evenly, and any
+// deterministic key would cluster. Hashing on the counterparty account, for
+// instance, sends every payment from one busy merchant to the same shard --
+// which is the original problem with extra steps. Random has no such structure
+// to be unlucky about.
+//
+// One shard per logical account per transaction, because a transaction touching
+// the same account twice would otherwise take two shard locks for one logical
+// movement: twice the lock footprint, and two balance rows moved where the
+// aggregation in applyEntries expects one.
+//
+// # WHAT THIS COSTS
+//
+// A debit is checked against the chosen shard's balance, not the logical total,
+// so a sharded account can refuse a debit it could plainly afford -- see
+// migration 000012 and D24. Safety survives (every shard is non-negative, so
+// their sum is), liveness does not. That is why sharding is only correct on
+// accounts whose traffic is effectively one-directional.
+func routeToShards(ctx context.Context, tx Tx, entries []EntryRequest) ([]EntryRequest, error) {
+	shards, err := tx.ResolveShards(ctx, sortedAccountIDs(entries))
+	if err != nil {
+		return nil, err
+	}
+	if len(shards) == 0 {
+		// Nothing here is sharded, which is the overwhelmingly common case.
+		// Returning the caller's slice untouched keeps the ordinary posting
+		// path free of any allocation this feature added.
+		return entries, nil
+	}
+
+	chosen := make(map[uuid.UUID]uuid.UUID, len(shards))
+	for accountID, ids := range shards {
+		chosen[accountID] = ids[rand.IntN(len(ids))]
+	}
+
+	routed := make([]EntryRequest, len(entries))
+	for i, e := range entries {
+		routed[i] = e
+		if shard, ok := chosen[e.AccountID]; ok {
+			routed[i].AccountID = shard
+		}
+	}
+
+	return routed, nil
 }
 
 // lockAndValidate takes the row locks and checks everything that depends on

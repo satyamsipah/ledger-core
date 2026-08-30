@@ -178,11 +178,28 @@ func (r *Repository) GetBalance(ctx context.Context, accountID uuid.UUID) (ledge
 		updatedAt      time.Time
 		currency       string
 	)
+	// The physical CTE is what makes sharding invisible to every read: an
+	// ordinary account resolves to itself, a sharded one resolves to itself
+	// plus its shards, and the aggregate below is correct for both without a
+	// branch. One join deep, which is why nested sharding is forbidden.
+	//
+	// SUM(version) rather than MAX, and it is not an approximation. Each
+	// shard's version only ever increases by one per write, so their sum is
+	// monotonic and advances by exactly one per logical write -- which is the
+	// property the projector needs in order to discard a redelivered event. MAX
+	// would stall whenever a write landed on a shard that was behind.
 	err := r.pool.QueryRow(ctx, `
-		SELECT ab.available_minor, ab.pending_minor, ab.version, ab.updated_at, a.currency
-		  FROM account_balances ab
-		  JOIN accounts a ON a.id = ab.account_id
-		 WHERE ab.account_id = $1`, accountID).
+		WITH physical AS (
+		    SELECT id FROM accounts WHERE id = $1
+		    UNION ALL
+		    SELECT id FROM accounts WHERE parent_account_id = $1
+		)
+		SELECT SUM(ab.available_minor), SUM(ab.pending_minor),
+		       SUM(ab.version), MAX(ab.updated_at), a.currency
+		  FROM physical p
+		  JOIN account_balances ab ON ab.account_id = p.id
+		  JOIN accounts a ON a.id = $1
+		 GROUP BY a.currency`, accountID).
 		Scan(&availableMinor, &pendingMinor, &version, &updatedAt, &currency)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ledger.Balance{}, fmt.Errorf("account %s: %w", accountID, ledger.ErrAccountNotFound)
@@ -235,6 +252,11 @@ func (r *Repository) GetBalanceAsOf(ctx context.Context, accountID uuid.UUID, at
 		WITH acct AS (
 		    SELECT id, currency, normal_balance FROM accounts WHERE id = $1
 		),
+		physical AS (
+		    SELECT id FROM accounts WHERE id = $1
+		    UNION ALL
+		    SELECT id FROM accounts WHERE parent_account_id = $1
+		),
 		baseline AS (
 		    SELECT 0::bigint                                       AS balance_minor,
 		           '-infinity'::timestamptz                        AS through_at,
@@ -247,7 +269,7 @@ func (r *Repository) GetBalanceAsOf(ctx context.Context, accountID uuid.UUID, at
 		  FROM acct a
 		  CROSS JOIN baseline b
 		  LEFT JOIN journal_entries je
-		         ON je.account_id = a.id
+		         ON je.account_id IN (SELECT id FROM physical)
 		        AND (je.created_at, je.id) > (b.through_at, b.through_id)
 		        AND je.created_at <= $2
 		 GROUP BY a.currency, b.balance_minor`, accountID, at).
@@ -289,12 +311,17 @@ func (r *Repository) GetStatement(ctx context.Context, q ledger.StatementQuery) 
 		WITH acct AS (
 		    SELECT id, currency, normal_balance FROM accounts WHERE id = $1
 		),
+		physical AS (
+		    SELECT id FROM accounts WHERE id = $1
+		    UNION ALL
+		    SELECT id FROM accounts WHERE parent_account_id = $1
+		),
 		opening AS (
 		    SELECT COALESCE(SUM(CASE WHEN je.direction = a.normal_balance
 		                             THEN je.amount_minor ELSE -je.amount_minor END), 0) AS balance_minor
 		      FROM acct a
 		      LEFT JOIN journal_entries je
-		             ON je.account_id = a.id
+		             ON je.account_id IN (SELECT id FROM physical)
 		            AND (je.created_at, je.id) <= ($2, $3)
 		),
 		page AS (
@@ -303,7 +330,7 @@ func (r *Repository) GetStatement(ctx context.Context, q ledger.StatementQuery) 
 		           CASE WHEN je.direction = a.normal_balance
 		                THEN je.amount_minor ELSE -je.amount_minor END AS signed_minor
 		      FROM acct a
-		      JOIN journal_entries je ON je.account_id = a.id
+		      JOIN journal_entries je ON je.account_id IN (SELECT id FROM physical)
 		     WHERE (je.created_at, je.id) > ($2, $3)
 		       AND je.created_at <= $4
 		     ORDER BY je.created_at, je.id
@@ -474,6 +501,47 @@ func (t *txn) takeAdvisoryLocks(ctx context.Context, ids []uuid.UUID) error {
 		return fmt.Errorf("close advisory account lock batch: %w", mapError(err))
 	}
 	return nil
+}
+
+// ResolveShards returns the shard accounts of every sharded id among ids.
+//
+// Only children are returned, never the parent itself. A sharded parent may
+// still hold a balance from before it was split -- ledger_shard_account
+// deliberately does not move it -- and that balance is counted in the logical
+// total, but routing new writes onto the parent would put 1/(n+1) of the
+// traffic back on the single row this feature exists to relieve.
+//
+// The empty result is the fast path and the common one: an installation with no
+// sharded accounts pays one indexed lookup that matches nothing, and no entry
+// is rewritten.
+func (t *txn) ResolveShards(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID][]uuid.UUID, error) {
+	rows, err := t.tx.Query(ctx, `
+		SELECT parent_account_id, id
+		  FROM accounts
+		 WHERE parent_account_id = ANY($1::uuid[])
+		   AND status = 'ACTIVE'
+		 ORDER BY parent_account_id, shard_index`, ids)
+	if err != nil {
+		return nil, fmt.Errorf("resolve account shards: %w", mapError(err))
+	}
+	defer rows.Close()
+
+	var shards map[uuid.UUID][]uuid.UUID
+	for rows.Next() {
+		var parent, shard uuid.UUID
+		if err := rows.Scan(&parent, &shard); err != nil {
+			return nil, fmt.Errorf("scan account shard: %w", err)
+		}
+		if shards == nil {
+			shards = make(map[uuid.UUID][]uuid.UUID, 1)
+		}
+		shards[parent] = append(shards[parent], shard)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("resolve account shards: %w", mapError(err))
+	}
+
+	return shards, nil
 }
 
 // LockAccounts takes the row locks that serialise concurrent posting.

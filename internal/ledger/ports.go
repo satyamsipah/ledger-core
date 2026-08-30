@@ -43,6 +43,19 @@ type Repository interface {
 // method here assumes the caller already holds the relevant row locks, which
 // LockAccounts is what provides.
 type Tx interface {
+	// ResolveShards maps each sharded account among ids to its shard accounts.
+	//
+	// Unsharded accounts are absent from the result rather than mapped to
+	// themselves, so the overwhelmingly common case -- nothing is sharded --
+	// is an empty map and a fast path rather than a rewrite of every entry.
+	//
+	// Called inside the transaction and before any lock is taken, because the
+	// ids that get locked are the ones this returns. Shard membership changes
+	// only through an explicit admin operation, so reading it at READ COMMITTED
+	// is safe: a shard cannot vanish under a transaction that has since locked
+	// it.
+	ResolveShards(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID][]uuid.UUID, error)
+
 	// LockAccounts takes the row locks that serialise concurrent posting, and
 	// returns each account together with its current balance.
 	//

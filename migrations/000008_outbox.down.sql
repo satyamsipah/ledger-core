@@ -1,0 +1,2 @@
+DROP PUBLICATION IF EXISTS ledger_outbox_pub;
+DROP TABLE IF EXISTS outbox;

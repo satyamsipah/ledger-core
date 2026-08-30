@@ -48,6 +48,13 @@ func NewRouter(deps Deps) nethttp.Handler {
 	r := chi.NewRouter()
 
 	r.Use(chimiddleware.RequestID)
+	// RealIP trusts client-controlled headers, so the address it writes into
+	// r.RemoteAddr is spoofable until something in front strips them. Suppressed
+	// rather than fixed because the correct behaviour depends on the deployment
+	// topology -- which proxy, how many hops -- and that is settled by the Phase 3
+	// gateway design. Do not treat r.RemoteAddr as trustworthy for rate limiting,
+	// fraud signals, or audit until then. See docs/DECISIONS.md D19.
+	//nolint:staticcheck // SA1019: deliberate, tracked as a known gap in D19.
 	r.Use(chimiddleware.RealIP)
 	r.Use(recoverer(deps.Logger))
 	r.Use(requestLogger(deps.Logger))

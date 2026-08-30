@@ -414,8 +414,53 @@ reversing it removes the trigger. Deleting balance rows on the way down would
 discard live balances for every account created while it was installed, which is
 data loss dressed up as a rollback.
 
+### D19. `chi middleware.RealIP` is a known vulnerability, deliberately left in place
+
+**Not decided.** Deferred to Phase 3, when the HTTP gateway design specifies what
+sits in front of this service.
+
+`internal/http/router.go` uses `chi`'s `middleware.RealIP`, which upstream has
+deprecated as a security issue rather than merely as an old API
+(GHSA-3fxj-6jh8-hvhx, GHSA-rjr7-jggh-pgcp, GHSA-9g5q-2w5x-hmxf). It overwrites
+`r.RemoteAddr` from the leftmost `X-Forwarded-For` value, or from
+`True-Client-IP` / `X-Real-IP`, **whether or not the infrastructure in front
+actually sets those headers**. Every one of them is client-controlled, so with
+no trusted proxy stripping them, any caller can assert any source address.
+
+**Why this matters here specifically.** `r.RemoteAddr` is what the request log
+records, and it is what per-IP rate limiting and fraud signals will read once
+they exist. A spoofable client IP means an attacker can both evade an IP-based
+limit and attribute their own requests to somebody else's address in the audit
+trail — and an audit trail that can be written by the party being audited is
+worse than none, because it is trusted.
+
+**Why it is not fixed in this phase.** The correct behaviour is not a library
+choice, it is a deployment fact. Getting it right means either trusting exactly
+the *n* rightmost hops of `X-Forwarded-For`, where *n* is the number of proxies
+actually in the path, or trusting one specific header that one specific load
+balancer is known to set and to strip from inbound requests. Both require
+knowing the topology — which reverse proxy or load balancer, how many hops,
+whether the service is ever reachable directly — and that is exactly what the
+Phase 3 gateway design has to pin down. Picking a header now would mean guessing
+the topology and encoding the guess as a security control, which is how these
+holes are created in the first place.
+
+**Status:** the call site carries a scoped `//nolint:staticcheck` pointing back
+at this entry, so CI is green and a real regression elsewhere is still visible —
+a permanently red required job stops being a signal within about a week, and the
+next genuine failure hides inside it.
+
+The cost of that is honest: the reminder is now a comment rather than a failing
+build, and comments are easier to walk past. Two things carry it instead. The
+suppression is on the single line, so it expires the moment the middleware is
+touched. And **until the trust model is chosen, `r.RemoteAddr` must not be
+treated as trustworthy** — not for rate limiting, not for fraud signals, not for
+audit. Anything built on it before Phase 3 inherits the spoofability.
+
 ### Known gaps carried into Phase 3
 
+- The client IP is spoofable; see D19 above. Resolve it with the gateway design,
+  not with a `nolint`.
 - The Phase 1 gap — a `transactions` row reaching `POSTED` with zero entries —
   is closed on the `PostTransaction` path, which always writes its legs in the
   same transaction. It remains open for the saga's write-header-first path.

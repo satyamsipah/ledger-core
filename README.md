@@ -11,9 +11,13 @@ written yet does something unanticipated.
 
 ## Status
 
-**Phase 1 complete: skeleton, schema, and local environment.** No posting logic
-yet — the schema, its invariants, and the tests that prove them are in place,
-and `docker compose up` brings the whole stack up from scratch.
+**Phase 2 complete: the ledger core.** Transactions post and reverse, balances
+move under row locks, and every write emits an outbox event. There is no HTTP
+layer yet — `LedgerService` is the boundary, and it is exercised directly by the
+tests.
+
+Phase 1 (skeleton, schema, local environment) is unchanged and still the
+foundation: `docker compose up` brings the whole stack up from scratch.
 
 ## Quick start
 
@@ -43,7 +47,8 @@ make help        # every target
 cmd/api             public HTTP surface
 cmd/projector       Kafka consumer maintaining the read-side balance projection
 cmd/reconciler      scheduled invariant checks against data at rest
-internal/ledger     double-entry domain: accounts, transactions, entries
+internal/ledger     double-entry domain: Money, entries, LedgerService
+internal/ledger/pgledger  the PostgreSQL repository: locking and SQL
 internal/idempotency  request de-duplication (invariant 5)
 internal/outbox     transactional outbox (invariant 6)
 internal/saga       multi-step orchestration with compensating transactions
@@ -84,6 +89,69 @@ statement, so it is checked at the only moment where it is meaningful: `COMMIT`.
 Full reasoning is in
 [000005_balance_invariant.up.sql](migrations/000005_balance_invariant.up.sql).
 
+## Posting
+
+`LedgerService.PostTransaction` does all of its work in one database
+transaction, in this order:
+
+1. **Lock** every account the transaction touches, in one statement, ordered by
+   account id. `FOR UPDATE` on `account_balances`, `FOR NO KEY UPDATE` on
+   `accounts`.
+2. **Validate** against the locked state: every account exists, is `ACTIVE`, and
+   holds the entry's currency.
+3. **Insert** the header and all journal entries.
+4. **Move** each balance by one aggregated delta, guarded by its expected
+   version, refusing any move that would overdraw a restricted account.
+5. **Append** the outbox event, so it commits with the journal it describes.
+6. **Commit**, where the deferred trigger has the last word.
+
+### Isolation and locking
+
+The write path runs at **READ COMMITTED** and prevents lost updates with
+explicit row locks rather than with a stronger isolation level. Every invariant
+here is per-row or per-transaction, so there is no write skew for `SERIALIZABLE`
+to catch, and `REPEATABLE READ` would convert contention on hot accounts into
+retry storms where a row lock converts it into a queue. Full reasoning, and what
+the trade-off obliges every write path to do, is in
+[DECISIONS.md D10](docs/DECISIONS.md).
+
+Locks are always acquired in ascending account-id order, which is what makes
+deadlock unreachable rather than merely rare. Replacing that ordered statement
+with the obvious per-account version makes
+`TestPostTransaction_ConcurrentOppositeTransfersDoNotDeadlock` fail with real
+`40P01` errors within seconds.
+
+### Two sign conventions
+
+A transaction balances under `DEBIT = +, CREDIT = −`, summed per currency. An
+account's *balance* is signed differently: positive when an entry's direction
+matches that account's normal balance. Without the second convention, a funded
+customer wallet — a `CREDIT`-normal `LIABILITY` — would store a negative
+balance and trip the overdraft `CHECK`. The two coincide on `DEBIT`-normal
+accounts, which is why the tests use wallets. See the block comment in
+[types.go](internal/ledger/types.go).
+
+### Money
+
+`Money` is `int64` minor units plus an ISO-4217 code, with no float constructor
+and no float accessor. `Add`, `Sub` and `Neg` return an error on currency
+mismatch and on int64 overflow — including `Neg(math.MinInt64)`, which has no
+positive counterpart and would otherwise silently keep its sign.
+
+It crosses the wire as `{"amount":"1250","currency":"INR","scale":2}`. The
+amount is a **string** because the dashboard is TypeScript, where every JSON
+number is a float64 and amounts past 2^53 lose precision silently. Decoding
+rejects a JSON number outright, and rejects a `scale` that contradicts the
+currency — `1250` at scale 0 is a hundred times `1250` at scale 2, and there is
+no way to tell them apart after the fact.
+
+### Reversal
+
+`ReverseTransaction` writes a **new** transaction with every leg's direction
+mirrored, and touches the original's `status` column and nothing else. It can
+legitimately fail with `ErrInsufficientFunds`: undoing a transfer moves money
+back out of the receiving account, which may have spent it.
+
 ## Tests
 
 No mocks for database behaviour — every test runs against real PostgreSQL via
@@ -99,6 +167,29 @@ Testcontainers, because the bugs that matter here live in the database.
   time, asserting no table, function, or publication is left behind
 - plus the overdraft CHECK, the currency composite FK, idempotency-key
   uniqueness, and the `posted_at`/`status` constraint
+
+Phase 2 adds, against the same real PostgreSQL:
+
+- `TestPostTransaction_UnderConcurrency` — 200 goroutines moving money between
+  five accounts. Final balances must equal, to the paisa, both the sum of the
+  committed transfers and what the journal independently says, and the five
+  accounts together must still hold exactly what they were funded with
+- `TestPostTransaction_ConcurrentOppositeTransfersDoNotDeadlock` — 120 writers
+  transferring in opposite directions; zero deadlocks permitted
+- `TestPostTransaction_OverdraftUnderConcurrency` — ten goroutines withdrawing
+  from an account that can fund four of them; exactly four may succeed
+- `TestPostTransaction_RandomTransactionsStayBalanced` — 10,000 randomly shaped
+  transactions, after which the global signed sum is still exactly zero and
+  every stored balance still agrees with the journal (~20s; `-short` skips it)
+- `TestReverseTransaction_ConcurrentReversals` — twenty simultaneous reversals
+  of one transaction; exactly one may commit, because two would each balance
+  perfectly and refund the money twice
+- `TestGetStatement_RunsTheBalanceForward` — running balances stay continuous
+  across keyset pages, and a full statement closes on the account's real balance
+- `Money` arithmetic across the int64 corners, and `signedAmount` over all four
+  direction/normal-balance combinations
+
+Coverage across `internal/ledger` and `internal/outbox` is 85.5%.
 
 ## Documentation
 

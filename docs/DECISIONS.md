@@ -190,3 +190,243 @@ therefore reach `POSTED` with no legs at all. This is legitimate while `PENDING`
 — the saga writes the header first — and a bug once posted. Enforcing it needs a
 deferred check on the status transition, which is business logic and belongs
 with the posting service.
+
+---
+
+## Phase 2 — The ledger core
+
+### D10. READ COMMITTED plus explicit row locks, not REPEATABLE READ or SERIALIZABLE
+
+**Decided.** The posting path runs at READ COMMITTED and serialises concurrent
+writers with `SELECT … FOR UPDATE` on `account_balances`, taken in ascending
+account-id order.
+
+The argument turns on what the invariants actually are. Every one of them is
+either a property of a single row — `allow_negative OR available_minor >= 0`, on
+one account — or of one transaction's own entries — the deferred sum, evaluated
+at COMMIT with every leg present. None is a predicate spanning rows that a
+concurrent transaction could invalidate without touching the same rows. That is
+the shape write skew takes, and we do not have it.
+
+**Rejected:** SERIALIZABLE. It defends the anomaly we do not have, at the price
+of mandatory retries everywhere and predicate locks (`SIReadLock`) taken over
+whatever `journal_entries` ranges the statement and temporal queries scan. Those
+escalate to page level on a large table, so a reporting query would begin
+aborting writers it never conflicted with.
+
+**Rejected:** REPEATABLE READ. It does catch the anomaly that threatens us — a
+lost update on a balance — but it catches it by raising `40001` and rolling
+back. A payments ledger has permanently hot accounts: every pay-in credits the
+same house float. On those, aborting turns contention into wasted work plus a
+retry storm, while a row lock turns it into a queue. Blocking degrades linearly
+and predictably; aborting degrades all at once, and the retries collide with
+each other.
+
+**Weakness accepted, and what covers it:** READ COMMITTED plus explicit locks is
+only correct while every write path remembers to lock. What makes that
+survivable is that it is not the enforcement mechanism — the overdraft `CHECK`
+and the deferred balance trigger fire unconditionally, so a path that forgets to
+lock produces a loud constraint violation rather than a quietly wrong balance.
+The application check exists to give a good error; the database check exists to
+be true.
+
+**Consequence:** there is no retry loop in the posting path, which keeps the
+interaction with idempotency in Phase 3 simple — a retried transaction would
+otherwise need to decide whether it was replaying its own earlier attempt.
+
+**Consequence:** read paths that need more than one round trip must run in a
+`REPEATABLE READ READ ONLY` transaction, because two statements at READ
+COMMITTED can straddle a concurrent commit. Phase 2 sidesteps this by making
+`GetBalanceAsOf` and `GetStatement` single statements, but the rule is written
+down because the next temporal query will not be.
+
+### D11. `ORDER BY id` inside the locking statement is the deadlock prevention
+
+**Decided.** One statement locks every account a transaction touches:
+`… WHERE a.id = ANY($1) ORDER BY a.id FOR NO KEY UPDATE OF a FOR UPDATE OF ab`.
+
+**Rejected:** locking each account in turn, in the order the client listed them.
+This is the obvious implementation and it deadlocks: concurrent `A→B` and `B→A`
+transfers each hold one row and wait for the other, and PostgreSQL kills one of
+them about a second later. Under load that is a steady drip of failed payments
+that retrying cannot fix, because the retries deadlock too.
+
+**Verified, not assumed.** That "PostgreSQL places `LockRows` above the sort" is
+a property of the plan shape rather than anything the standard promises, so
+`TestPostTransaction_ConcurrentOppositeTransfersDoNotDeadlock` asserts it by
+experiment. Replacing the ordered statement with per-account locking makes that
+test fail with real `40P01` errors within seconds, which is how we know it is
+testing the mechanism and not merely passing.
+
+**Sub-decision: two lock strengths.** `accounts` is taken `FOR NO KEY UPDATE`,
+not `FOR UPDATE`. Inserting into `journal_entries` takes `FOR KEY SHARE` on the
+referenced account row to check the foreign key; `FOR UPDATE` conflicts with
+that and `FOR NO KEY UPDATE` does not. Locking `accounts` the stronger way would
+make every posting block every other posting's foreign-key check, serialising
+transactions that share no account at all.
+
+### D12. The optimistic version bump is a tripwire, not concurrency control
+
+**Decided.** Kept, with `WHERE version = $expected` on the balance UPDATE, and a
+zero-row result raises `ErrBalanceVersionConflict` — which callers must never
+retry.
+
+**Being honest about it:** once the row's `FOR UPDATE` lock is held, nothing else
+can write it before this transaction ends, so the version predicate cannot fail
+legitimately. It is not optimistic concurrency control here, and describing it
+as such in the code would have been a lie that survives until someone builds a
+retry loop on top of it. If it ever matches nothing, a write path mutated the
+row without taking the lock, which is a bug to surface rather than a conflict to
+retry.
+
+**Why keep it at all:** the version bump itself is load-bearing for the
+Kafka-driven projector. Outbox delivery is at-least-once by design (D4), so a
+consumer needs a monotonic per-account version to discard a redelivered event
+instead of applying a balance change twice. The event payload therefore carries
+every touched balance and its resulting version.
+
+**Consequence:** entries are aggregated into one delta per account before being
+applied. A transaction touching the same account twice would otherwise consume
+two versions for one logical change, and the projector would see a version
+sequence it cannot reconcile against a single event.
+
+### D13. Balances are signed by the account's own normal balance
+
+**Decided.** `signedAmount(direction, normalBalance, amountMinor)` returns a
+positive value when the entry's direction matches the account's normal balance
+and a negative one otherwise. `account_balances.available_minor` therefore means
+"value this account holds, counted in its natural direction" on every account
+regardless of type.
+
+**Rejected:** reusing the transaction-level convention (`DEBIT = +`,
+`CREDIT = −`) for balances as well. It is the right convention for deciding
+whether a transaction balances — that is a property of the transaction, not of
+the accounts — but it is wrong for storage. A customer wallet is a `LIABILITY`
+and so `CREDIT`-normal; under the transaction convention a funded wallet holds a
+negative balance, and `account_balances_no_overdraft_check` would fire on every
+wallet with money in it while ignoring genuinely overdrawn asset accounts.
+
+**The trap this leaves:** the two conventions coincide for `DEBIT`-normal
+accounts, so a sign bug is invisible to any test written only against `ASSET`
+accounts. The tests use `LIABILITY` wallets deliberately, and the block comment
+in `types.go` says so.
+
+### D14. Phase 2 posts one currency per transaction
+
+**Decided.** `PostTransaction` rejects entries spanning several currencies with
+`ErrMixedCurrency`.
+
+**Noting the tension:** the schema is deliberately more permissive. The deferred
+trigger balances per `(transaction_id, currency)` precisely so an FX transaction
+can carry both legs, the seed data provides USD accounts for it, and `FX` is a
+valid `transaction_type`. This restriction is in the service, not the database.
+
+**Why anyway:** nothing in Phase 2 decides an exchange rate or where the
+sub-unit residue lands, and a multi-currency transaction without those answers
+is a rounding bug waiting for a quiet moment. `FX` is therefore currently
+unreachable through this path. Lifting the restriction is deleting one check,
+once the FX pricing it depends on exists.
+
+**Reversal is exempt**, and correctly so: mirroring is per-leg, so a reversal
+stays balanced per currency without knowing anything about rates.
+
+### D15. Reversal links through metadata; the status transition is the guard
+
+**Decided.** A reversal is a new `REVERSAL` transaction with mirrored directions.
+The original is touched only by `UPDATE transactions SET status = 'REVERSED'
+WHERE id = $1 AND status = 'POSTED'`. The back-link lives in
+`transactions.metadata`.
+
+**Rejected for now:** a `reverses_transaction_id` column with a partial unique
+index. It would be the better home for the link, but it is not needed for
+correctness, and the schema addition was deliberately deferred.
+
+**What actually prevents a double reversal:** the conditional UPDATE, backed by
+the `FOR UPDATE` the reversal already holds on the header. Under READ COMMITTED
+a blocked UPDATE re-evaluates its `WHERE` clause against the row version the
+winner committed, so the second reversal finds `REVERSED` and matches nothing.
+`TestReverseTransaction_ConcurrentReversals` runs twenty at once and asserts
+exactly one commits — worth asserting, because two reversals would each balance
+perfectly on their own and the balance invariant would not notice the money
+being refunded twice.
+
+**Consequence:** the metadata link is an audit trail, not a mechanism. Nothing
+reads it to make a decision.
+
+### D16. Temporal queries are bounded-stale, and this is documented rather than fixed
+
+**Decided.** `GetBalanceAsOf` sums the journal on `created_at`, which defaults to
+`now()` — transaction *start* time in PostgreSQL, not commit time.
+
+**The flaw, stated plainly:** a transaction beginning at 12:00:00 and committing
+at 12:00:03 writes entries stamped 12:00:00. A query for the balance at
+12:00:01, run at 12:00:02, misses entries that a later identical query will
+include. The answer is monotonic only once no transaction older than the
+requested instant is still in flight.
+
+**Rejected:** `clock_timestamp()`. It would order entries by real time, but the
+legs of one transaction would then carry different timestamps, so a statement
+could render half a transfer. The atomicity the rest of the system works to
+guarantee would stop being visible in the one place users actually look.
+
+**Rejected for Phase 2:** a commit-ordered sequence, which is the only thing that
+makes the temporal view exactly monotonic. It is real work and it belongs with
+the reconciliation engine.
+
+**Consequence:** whenever snapshots arrive, they may only be taken for an
+instant with no older transaction still in flight.
+
+### D17. `balance_snapshots` deferred; the read path ships with the seam for it
+
+**Decided.** `GetBalanceAsOf` is a full journal sum today. The query carries a
+`baseline` CTE that is a constant zero, and a `(created_at, id)` boundary
+comparison that already does the hand-off correctly.
+
+**Why the pair and not just a timestamp:** entries can share a `created_at`, so a
+snapshot cutting between two of them on time alone would either double-count the
+ties or drop them. Getting that wrong is the classic snapshot bug, and it is
+cheaper to be right about it now than to debug it later against real data.
+
+**Consequence:** introducing the table changes one CTE. Nothing else in the
+query, and nothing in the service, has to move.
+
+### D18. Balance rows are created by a trigger (migration 000009)
+
+**Decided.** `AFTER INSERT ON accounts` creates the zeroed `account_balances`
+row.
+
+**This closed a live hole rather than adding a convenience.** The posting path
+serialises on `SELECT … FROM account_balances … FOR UPDATE`. A row lock on a row
+that does not exist locks nothing *and reports no error while doing so*: two
+concurrent transfers against an account whose balance row was never inserted
+would both sail past the lock and neither would block the other. The
+serialisation point disappears silently at exactly the moment it matters.
+Guaranteeing the row exists lets the service treat "no row returned" as a
+missing account, which is a real error, rather than as an empty balance, which
+is a plausible-looking lie.
+
+**Consequence:** `test/testdb.go` no longer inserts the balance row, and asserts
+it exists instead. `deploy/seed/seed.sql` is unaffected — its insert is already
+`ON CONFLICT DO NOTHING`, and the trigger function is too.
+
+**Down migration keeps the backfilled rows.** The migration adds a trigger;
+reversing it removes the trigger. Deleting balance rows on the way down would
+discard live balances for every account created while it was installed, which is
+data loss dressed up as a rollback.
+
+### Known gaps carried into Phase 3
+
+- The Phase 1 gap — a `transactions` row reaching `POSTED` with zero entries —
+  is closed on the `PostTransaction` path, which always writes its legs in the
+  same transaction. It remains open for the saga's write-header-first path.
+- `pending_minor` is read and carried but never moved. Holds and authorisations
+  are Phase 3 work.
+- A reversal currently fails if any account it touches has since been `FROZEN`,
+  because it goes through the same `Postable()` check as a fresh post. That is
+  the stricter reading and it is deliberate for now, but it is arguable: freezing
+  an account is meant to stop new activity, and a reversal is a correction of
+  activity that already happened. Revisit when the admin path exists to say
+  which it wants.
+- A duplicate `transactions.idempotency_key` currently surfaces as a wrapped
+  `unique_violation` rather than a domain error. Mapping it belongs with the
+  idempotency service, which owns what a replay means.

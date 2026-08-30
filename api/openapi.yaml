@@ -1,0 +1,660 @@
+openapi: 3.1.0
+
+info:
+  title: Ledger-Core API
+  version: 0.3.0
+  description: |
+    The write and read surface of a double-entry ledger.
+
+    Three things about this API are unusual enough to state up front, because
+    each is a deliberate constraint rather than an oversight.
+
+    **Money is a string.** Every amount is a decimal string of *minor units*
+    (paise, cents) plus an ISO-4217 code and its exponent. It is a string
+    because JSON numbers become IEEE-754 doubles in JavaScript, which silently
+    loses precision past 2^53 minor units -- so a ledger sending numbers
+    corrupts exactly its largest and most important rows. The API rejects a
+    JSON number for an amount rather than accepting one that happens to round
+    trip today.
+
+    **Writes require an Idempotency-Key.** Required, not optional: an optional
+    key is one a client forgets under precisely the conditions -- timeouts,
+    retries, a partial outage -- that make it matter. Retrying a request with
+    the same key never creates a second transaction, at any level of
+    concurrency, and a retry after the original completed replays the stored
+    response byte for byte with `Idempotent-Replay: true`.
+
+    **Nothing is ever edited.** The journal is append-only. A mistake is
+    corrected by posting a reversal, which is a new transaction with mirrored
+    legs, so the ledger can always answer what it believed at any past instant.
+
+  license:
+    name: MIT
+
+servers:
+  - url: http://localhost:8080
+    description: Local development
+
+tags:
+  - name: transactions
+    description: The write path.
+  - name: accounts
+    description: Balances and statements.
+  - name: health
+    description: Liveness and readiness probes.
+
+paths:
+  /v1/transactions:
+    post:
+      tags: [transactions]
+      summary: Post a balanced transaction
+      operationId: postTransaction
+      description: |
+        Writes a transaction and its journal entries, and moves the affected
+        balances, in one database transaction.
+
+        The entries must sum to zero within a currency, and Phase 3 accepts a
+        single currency per transaction. The idempotency record is written in
+        the same transaction as the journal entries, so the transaction and the
+        record that describes it become durable together or not at all.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PostTransactionRequest'
+            examples:
+              transfer:
+                summary: Move 1250 paise between two accounts
+                value:
+                  type: TRANSFER
+                  external_ref: gw_8f2a41
+                  metadata:
+                    channel: upi
+                  entries:
+                    - account_id: 018f3a1b-0000-7000-8000-000000000001
+                      direction: DEBIT
+                      amount: { amount: "1250", currency: INR, scale: 2 }
+                    - account_id: 018f3a1b-0000-7000-8000-000000000002
+                      direction: CREDIT
+                      amount: { amount: "1250", currency: INR, scale: 2 }
+      responses:
+        '201':
+          description: |
+            Posted. A replayed response carries `Idempotent-Replay: true` and is
+            byte-for-byte the body stored when the transaction committed -- not
+            a re-rendering, so it does not drift across deploys.
+          headers:
+            Idempotent-Replay:
+              $ref: '#/components/headers/IdempotentReplay'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transaction'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /v1/transactions/{id}/reverse:
+    post:
+      tags: [transactions]
+      summary: Reverse a posted transaction
+      operationId: reverseTransaction
+      description: |
+        Writes a new `REVERSAL` transaction whose legs mirror the original's,
+        and marks the original `REVERSED`. The original's entries are never
+        touched: the journal rejects UPDATE and DELETE outright.
+
+        A reversal can legitimately fail with `insufficient-funds`, because
+        undoing a transfer moves money back out of the receiving account and
+        that account may have spent it. No amount of retrying will fix that.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - name: id
+          in: path
+          required: true
+          description: The transaction to reverse.
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReverseTransactionRequest'
+      responses:
+        '201':
+          description: The reversal transaction.
+          headers:
+            Idempotent-Replay:
+              $ref: '#/components/headers/IdempotentReplay'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transaction'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /v1/accounts/{id}/balance:
+    get:
+      tags: [accounts]
+      summary: Read an account's balance
+      operationId: getAccountBalance
+      description: |
+        Without `as_of`, returns the synchronous balance maintained inside the
+        posting transaction under the account's row lock. This is the
+        authoritative figure -- the one the overdraft constraint is evaluated
+        against -- not the Kafka-driven projection.
+
+        With `as_of`, recomputes the balance from the journal at an instant.
+        That answer is **bounded-stale by design**: journal entries are stamped
+        with transaction *start* time, so a query for 12:00:01 run at 12:00:02
+        misses a transaction that began at 12:00:00 and has not yet committed.
+        The answer becomes stable once no transaction older than the requested
+        instant is still in flight.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: as_of
+          in: query
+          required: false
+          description: RFC 3339 instant to reconstruct the balance at.
+          schema:
+            type: string
+            format: date-time
+      responses:
+        '200':
+          description: The balance.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/Balance'
+                  - $ref: '#/components/schemas/BalanceAsOf'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/accounts/{id}/statement:
+    get:
+      tags: [accounts]
+      summary: Read one page of an account's history
+      operationId: getAccountStatement
+      description: |
+        Keyset-paginated, not offset-paginated. The journal is append-only and
+        constantly growing, so `OFFSET 50000` makes the database walk fifty
+        thousand rows it then discards, and any entry inserted between two page
+        requests shifts every later offset by one -- so a client paging a busy
+        account both pays more per page and silently skips rows.
+
+        Follow `next_cursor` to the next page. The cursor is opaque: it encodes
+        a `(created_at, id)` pair, because timestamps tie and paginating on the
+        timestamp alone would repeat or drop entries at a page boundary. Do not
+        construct one.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: from
+          in: query
+          description: Start of the period. Defaults to 30 days ago.
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          description: End of the period. Defaults to now.
+          schema:
+            type: string
+            format: date-time
+        - name: limit
+          in: query
+          description: Page size. Clamped to 1000.
+          schema:
+            type: integer
+            default: 100
+            minimum: 1
+            maximum: 1000
+        - name: cursor
+          in: query
+          description: The `next_cursor` from the previous page.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: One page, with a running balance continuous across pages.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Statement'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /healthz:
+    get:
+      tags: [health]
+      summary: Liveness probe
+      operationId: getHealthz
+      description: |
+        Checks nothing on purpose. Liveness asks "is this process wedged?", and
+        answering it with a database ping means one slow query restarts every
+        replica at once. Dependency health belongs in readiness.
+      responses:
+        '200':
+          description: The process is running.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, const: ok }
+
+  /readyz:
+    get:
+      tags: [health]
+      summary: Readiness probe
+      operationId: getReadyz
+      description: Reports whether this instance can serve traffic, naming any dependency that failed.
+      responses:
+        '200':
+          description: Ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Readiness'
+        '503':
+          description: Not ready. The `checks` map names what failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Readiness'
+
+components:
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        A UUID naming this logical operation.
+
+        A UUID rather than any opaque string, because keys share one namespace:
+        a client picking `order-1` would collide with a different client that
+        picked the same obvious value, and the second would be handed the
+        first's response.
+
+        Retry semantics, in the order they are decided:
+
+        | Condition | Result |
+        |---|---|
+        | Same key, same body, original completed | `201` replay with `Idempotent-Replay: true` |
+        | Same key, same body, original still running | `409` with `Retry-After` |
+        | Same key, **different** body | `422` |
+        | Same key, replay record expired (24h) | `409` -- refused, never re-executed |
+
+        The fingerprint covers the canonical request body (RFC 8785) plus the
+        method and route, so a key reused across two endpoints is a `422` rather
+        than a wrong answer. Two bodies that differ only in whitespace, key
+        order or number formatting are the same request.
+      schema:
+        type: string
+        format: uuid
+
+  headers:
+    IdempotentReplay:
+      description: Present and `true` when this response was replayed from a stored record rather than freshly executed.
+      schema:
+        type: string
+        const: "true"
+
+  schemas:
+    Money:
+      type: object
+      description: |
+        An exact amount in the minor units of one currency. `amount` is a
+        STRING of minor units, never a JSON number -- see the API description
+        for why. `scale` is the ISO-4217 exponent and affects presentation only;
+        it never enters arithmetic.
+      required: [amount, currency]
+      properties:
+        amount:
+          type: string
+          pattern: '^-?\d+$'
+          description: Minor units as a decimal string. 1250 with scale 2 is 12.50.
+          examples: ["1250"]
+        currency:
+          type: string
+          pattern: '^[A-Z]{3}$'
+          examples: [INR]
+        scale:
+          type: integer
+          minimum: 0
+          maximum: 4
+          description: Where the decimal point goes. Rejected if it disagrees with the currency.
+          examples: [2]
+
+    Direction:
+      type: string
+      enum: [DEBIT, CREDIT]
+      description: Which side of the journal an entry falls on. Sign lives here, never in the amount.
+
+    TransactionType:
+      type: string
+      enum: [TRANSFER, PAYIN, PAYOUT, FEE, FX, REVERSAL, ADJUSTMENT]
+      description: |
+        `FX` is accepted by the schema but not reachable through this API yet:
+        posting spans a single currency until exchange-rate handling exists.
+        `REVERSAL` is produced by the reverse endpoint, not submitted.
+
+    TransactionStatus:
+      type: string
+      enum: [PENDING, POSTED, REVERSED]
+
+    EntryRequest:
+      type: object
+      required: [account_id, direction, amount]
+      properties:
+        account_id: { type: string, format: uuid }
+        direction: { $ref: '#/components/schemas/Direction' }
+        amount: { $ref: '#/components/schemas/Money' }
+      additionalProperties: false
+
+    PostTransactionRequest:
+      type: object
+      required: [type, entries]
+      description: |
+        Unknown fields are rejected. A client sending `ammount` has made a typo
+        that would otherwise post a zero-amount transaction, and in a ledger the
+        silent interpretation of a misspelled field is a defect.
+      properties:
+        type: { $ref: '#/components/schemas/TransactionType' }
+        external_ref:
+          type: string
+          description: The caller's own reference, for support lookups.
+        metadata:
+          type: object
+          description: Arbitrary JSON, carried and never interpreted.
+          additionalProperties: true
+        entries:
+          type: array
+          minItems: 2
+          description: Must sum to zero within a currency; all entries share one currency.
+          items: { $ref: '#/components/schemas/EntryRequest' }
+      additionalProperties: false
+
+    ReverseTransactionRequest:
+      type: object
+      required: [reason]
+      description: |
+        The reason is required, not documentation. A reversal is the only way
+        history is ever corrected, so an unexplained one is an audit hole.
+      properties:
+        reason:
+          type: string
+          minLength: 1
+          examples: ["chargeback: gateway reference gw_8f2a41"]
+      additionalProperties: false
+
+    Entry:
+      type: object
+      required: [id, account_id, direction, amount, entry_seq, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        account_id: { type: string, format: uuid }
+        direction: { $ref: '#/components/schemas/Direction' }
+        amount: { $ref: '#/components/schemas/Money' }
+        entry_seq:
+          type: integer
+          description: Position within the transaction, numbered from zero in submission order.
+        created_at: { type: string, format: date-time }
+
+    Transaction:
+      type: object
+      required: [id, type, status, created_at, entries]
+      properties:
+        id: { type: string, format: uuid }
+        type: { $ref: '#/components/schemas/TransactionType' }
+        status: { $ref: '#/components/schemas/TransactionStatus' }
+        idempotency_key: { type: string, format: uuid }
+        external_ref: { type: string }
+        metadata:
+          type: object
+          additionalProperties: true
+        created_at: { type: string, format: date-time }
+        posted_at:
+          type: string
+          format: date-time
+          description: Set exactly when the transaction leaves PENDING.
+        entries:
+          type: array
+          items: { $ref: '#/components/schemas/Entry' }
+
+    Balance:
+      type: object
+      required: [account_id, available, version, updated_at]
+      properties:
+        account_id: { type: string, format: uuid }
+        available: { $ref: '#/components/schemas/Money' }
+        pending: { $ref: '#/components/schemas/Money' }
+        version:
+          type: integer
+          format: int64
+          description: |
+            Monotonic per account, bumped on every balance change. Consumers of
+            the event stream use it to discard a redelivered event, since outbox
+            delivery is at-least-once.
+        updated_at: { type: string, format: date-time }
+
+    BalanceAsOf:
+      type: object
+      required: [account_id, as_of, balance]
+      properties:
+        account_id: { type: string, format: uuid }
+        as_of:
+          type: string
+          format: date-time
+          description: Echoed back, because the answer is bounded-stale and it must be clear which question was answered.
+        balance: { $ref: '#/components/schemas/Money' }
+
+    StatementLine:
+      type: object
+      required: [entry, signed, running_balance]
+      properties:
+        entry: { $ref: '#/components/schemas/Entry' }
+        signed:
+          allOf: [{ $ref: '#/components/schemas/Money' }]
+          description: |
+            The entry amount in this account's own direction: positive when it
+            increases what the account holds, whatever the account's type. This
+            is the only place in the API where a negative amount is legal.
+        running_balance:
+          allOf: [{ $ref: '#/components/schemas/Money' }]
+          description: The balance immediately after this entry, counted from `opening`.
+
+    Statement:
+      type: object
+      required: [account_id, currency, from, to, opening, closing, lines, next_cursor]
+      properties:
+        account_id: { type: string, format: uuid }
+        currency: { type: string }
+        from: { type: string, format: date-time }
+        to: { type: string, format: date-time }
+        opening:
+          allOf: [{ $ref: '#/components/schemas/Money' }]
+          description: |
+            The balance immediately before this page's first line -- not before
+            the requested period. On page three it is page two's closing
+            balance, so running totals stay continuous across pages.
+        closing: { $ref: '#/components/schemas/Money' }
+        lines:
+          type: array
+          items: { $ref: '#/components/schemas/StatementLine' }
+        next_cursor:
+          type: [string, 'null']
+          description: Null on the last page. Opaque; pass it back as `cursor`.
+
+    Readiness:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [ready, not ready]
+        checks:
+          type: object
+          description: Dependency name to `ok` or the failure message.
+          additionalProperties: { type: string }
+
+    ProblemType:
+      type: string
+      description: |
+        The complete set of machine-readable failure identifiers, without the
+        `https://ledger-core.invalid/problems/` prefix. This list is the
+        contract: switch on it rather than on `title` or `detail`, which are
+        prose and may be reworded without notice.
+
+        `TestOpenAPI_DocumentsEveryProblemType` fails the build if the service
+        can emit an identifier that does not appear here, so the list cannot
+        silently fall behind the code.
+      enum:
+        - account-not-found
+        - account-not-postable
+        - already-reversed
+        - amount-overflow
+        - canceled
+        - currency-mismatch
+        - idempotency-key-expired
+        - idempotency-key-reused
+        - insufficient-funds
+        - internal
+        - invalid-currency
+        - invalid-entry
+        - invalid-idempotency-key
+        - invalid-transaction-type
+        - malformed-body
+        - missing-idempotency-key
+        - mixed-currency
+        - request-in-progress
+        - reversal-reason-required
+        - scale-mismatch
+        - timeout
+        - too-few-entries
+        - transaction-not-found
+        - transaction-not-posted
+        - unbalanced-transaction
+
+    Problem:
+      type: object
+      description: RFC 9457 problem detail. Every error response uses this shape.
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          format: uri
+          description: |
+            Stable, machine-readable identifier for the failure. Switch on this
+            rather than on `title` or `detail`, both of which are prose and may
+            be reworded. It names the problem and is not expected to resolve.
+          examples: ["https://ledger-core.invalid/problems/insufficient-funds"]
+        title: { type: string }
+        status: { type: integer }
+        detail:
+          type: string
+          description: The specific cause, naming the account or entry at fault. Omitted on 5xx.
+        instance: { type: string }
+        request_id:
+          type: string
+          description: Correlates this response with the server's logs and traces.
+
+  responses:
+    BadRequest:
+      description: |
+        The request could not be processed as sent: a missing or non-UUID
+        `Idempotency-Key`, a body that is not JSON, or a reversal with no reason.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    NotFound:
+      description: No such account or transaction.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    Conflict:
+      description: |
+        A live idempotency lease holds this key (`Retry-After` says when it
+        frees), or the key already created a transaction whose stored response
+        has expired, or the transaction is already reversed.
+      headers:
+        Retry-After:
+          description: Seconds to wait. Derived from the remaining lease, never a fixed guess.
+          schema: { type: integer, minimum: 1 }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    UnprocessableEntity:
+      description: |
+        The request was understood and refused: the transaction does not
+        balance, an account has insufficient funds, or this idempotency key was
+        already used with a different body.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    InternalError:
+      description: |
+        Something failed on our side. `detail` is omitted deliberately -- a
+        constraint or table name in a public error body is free reconnaissance.
+        Quote `request_id` when reporting it.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    Unavailable:
+      description: |
+        The request exceeded its deadline and was abandoned, so its outcome is
+        unknown. Retry with the SAME idempotency key: if the transaction did in
+        fact commit, the retry replays it rather than posting a second one.
+      headers:
+        Retry-After:
+          schema: { type: integer, minimum: 1 }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }

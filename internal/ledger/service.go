@@ -101,6 +101,14 @@ type Recorder func(ctx context.Context, tx Tx, posted *Transaction) error
 // with no key has nothing to write. Making them one struct means the broken
 // combination cannot be expressed.
 type Idempotent struct {
+	// PrincipalID names the caller this key is scoped to. It travels
+	// separately from TransactionRequest.PrincipalID because the two answer
+	// different questions -- this one picks which idempotency_keys row gets
+	// completed, that one stamps who the ledger attributes the transaction to
+	// -- even though both are set from the same authenticated caller on every
+	// HTTP request today. See docs/DECISIONS.md D24.
+	PrincipalID string
+
 	// Key is a reservation this caller already holds in IN_PROGRESS. The
 	// service does not acquire it; by the time a request reaches here, the HTTP
 	// layer has already resolved replay, conflict and in-progress.
@@ -114,6 +122,11 @@ type Idempotent struct {
 // whole before anything touches the database, so a malformed request never
 // takes a row lock.
 type TransactionRequest struct {
+	// PrincipalID attributes this transaction to an authenticated caller.
+	// Empty for internal callers with no principal -- sagas stamp it from
+	// their own saga.Instance.PrincipalID; nothing else does yet.
+	PrincipalID string
+
 	Type        TransactionType
 	ExternalRef *string
 	Metadata    map[string]any
@@ -319,6 +332,7 @@ func (s *Service) PostTransaction(ctx context.Context, req TransactionRequest) (
 		header := &Transaction{
 			ID:             txID,
 			IdempotencyKey: req.IdempotencyKey,
+			PrincipalID:    req.PrincipalID,
 			Type:           req.Type,
 			Status:         TransactionStatusPosted,
 			ExternalRef:    req.ExternalRef,
@@ -398,6 +412,7 @@ func completeIdempotency(ctx context.Context, tx Tx, idem *Idempotent, header *T
 	}
 
 	return tx.CompleteIdempotency(ctx, idempotency.Completion{
+		PrincipalID:    idem.PrincipalID,
 		Key:            idem.Key,
 		ResponseStatus: status,
 		ResponseBody:   body,
@@ -531,6 +546,7 @@ func (s *Service) reverse(ctx context.Context, txID uuid.UUID, reason string, id
 		if idem != nil {
 			key := idem.Key
 			header.IdempotencyKey = &key
+			header.PrincipalID = idem.PrincipalID
 		}
 		if err := tx.InsertTransaction(ctx, header); err != nil {
 			return err

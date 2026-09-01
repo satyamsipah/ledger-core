@@ -16,6 +16,7 @@ import (
 var expectedTables = []string{
 	"account_balances",
 	"accounts",
+	"api_keys",
 	"balance_projections",
 	"idempotency_keys",
 	"journal_entries",

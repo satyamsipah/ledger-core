@@ -160,13 +160,24 @@ type JournalEntry struct {
 type Transaction struct {
 	ID             uuid.UUID
 	IdempotencyKey *string
-	Type           TransactionType
-	Status         TransactionStatus
-	ExternalRef    *string
-	Metadata       map[string]any
-	CreatedAt      time.Time
-	PostedAt       *time.Time
-	Entries        []JournalEntry
+
+	// PrincipalID is the authenticated caller this transaction was posted for.
+	// Empty for transactions with no principal to attribute -- seed data, and
+	// anything posted before authentication existed -- mirroring the same ''
+	// sentinel idempotency_keys.principal_id and saga_instances.principal_id
+	// use for the identical reason: the column is NOT NULL, because NULL would
+	// silently exempt those rows from the composite uniqueness this exists to
+	// provide (Postgres never treats two NULLs as equal). See D24 for why
+	// transactions_idempotency_key_key is scoped by this column too, not
+	// merely idempotency_keys.
+	PrincipalID string
+	Type        TransactionType
+	Status      TransactionStatus
+	ExternalRef *string
+	Metadata    map[string]any
+	CreatedAt   time.Time
+	PostedAt    *time.Time
+	Entries     []JournalEntry
 }
 
 // Balance is an account's position as held by the synchronous balance row.

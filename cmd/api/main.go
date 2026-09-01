@@ -13,6 +13,7 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/satyamsipah/ledger-core/internal/auth/pgauth"
 	"github.com/satyamsipah/ledger-core/internal/config"
 	"github.com/satyamsipah/ledger-core/internal/db"
 	ledgerhttp "github.com/satyamsipah/ledger-core/internal/http"
@@ -105,6 +106,8 @@ func run() error {
 	// any moment -- manufacturing exactly the ambiguity the saga design works
 	// to avoid. The gateway client is therefore not wired here at all: this
 	// process has no reason to hold one.
+	authStore := pgauth.New(pool.Pool, cfg.Postgres.QueryTimeout)
+
 	sagaStore := pgsaga.New(pool.Pool, cfg.Postgres.QueryTimeout)
 	payoutStarter := payout.New(sagaStore, ledgerService, nil, logger, metrics, payout.Config{
 		WorkerID:    cfg.Saga.WorkerID,
@@ -121,6 +124,7 @@ func run() error {
 		Payout:           payoutStarter,
 		Sagas:            sagaStore,
 		TrustedProxyHops: cfg.HTTP.TrustedProxyHops,
+		Auth:             authStore,
 	})
 
 	apiServer := ledgerhttp.NewServer("api", cfg.HTTP, router, logger)

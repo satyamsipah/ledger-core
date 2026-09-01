@@ -29,7 +29,7 @@ const maxSagaListLimit = 1000
 // orchestrator's job, and a handler that advanced a saga would do it inside a
 // request whose client can disconnect halfway.
 type PayoutService interface {
-	Start(ctx context.Context, p payout.Payload, idempotencyKey *string) (*saga.Instance, error)
+	Start(ctx context.Context, p payout.Payload, principalID string, idempotencyKey *string) (*saga.Instance, error)
 }
 
 // SagaReader reads saga state for the dashboard.
@@ -52,6 +52,10 @@ type SagaReader interface {
 // resulting ambiguity is precisely what this phase exists to avoid creating.
 func handleStartPayout(service PayoutService) nethttp.HandlerFunc {
 	return func(w nethttp.ResponseWriter, r *nethttp.Request) {
+		// requireAuth has already run on this route (wired in router.go), so
+		// the principal a saga is scoped to is never the caller's to assert.
+		principalID := principalFrom(r.Context())
+
 		// The same key rules as every other write route, through the same
 		// parser: a payout that accepted a differently-shaped key would be a
 		// second contract for clients to learn.
@@ -60,7 +64,8 @@ func handleStartPayout(service PayoutService) nethttp.HandlerFunc {
 		// machinery completes a key inside the ledger's transaction, and
 		// starting a saga has no ledger transaction to complete it in --
 		// nothing has moved yet. saga_instances.idempotency_key carries it
-		// instead, on the row the saga actually creates.
+		// instead, on the row the saga actually creates, scoped by
+		// principal_id alongside it -- see docs/DECISIONS.md D24.
 		key, err := idempotency.ParseKey(r.Header.Get(idempotencyHeader))
 		if err != nil {
 			writeProblem(w, r, err)
@@ -79,7 +84,7 @@ func handleStartPayout(service PayoutService) nethttp.HandlerFunc {
 			return
 		}
 
-		instance, err := service.Start(r.Context(), payload, &key)
+		instance, err := service.Start(r.Context(), payload, principalID, &key)
 		if err != nil {
 			writeProblem(w, r, err)
 			return

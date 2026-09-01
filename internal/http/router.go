@@ -54,6 +54,12 @@ type Deps struct {
 	// TrustedProxyHops configures clientIP. Zero -- the default -- trusts
 	// nothing in X-Forwarded-For and always uses the raw socket peer. See D19.
 	TrustedProxyHops int
+
+	// Auth authenticates every write route. nil in a process that serves only
+	// health and metrics, or that has not been wired for it -- in which case
+	// the routes it would gate are not registered at all, matching how Ledger
+	// and Idempotency being nil already 404s rather than panics.
+	Auth AuthService
 }
 
 // NewRouter assembles the public API.
@@ -103,10 +109,16 @@ func NewMux(deps Deps) chi.Router {
 	r.Route("/v1", func(r chi.Router) {
 		// Starting a payout requires an Idempotency-Key like every other write,
 		// but not the idempotency MIDDLEWARE: that completes a key inside the
-		// ledger's transaction, and a saga has no ledger transaction at the
-		// moment it is created. saga_instances.idempotency_key dedupes instead.
-		if deps.Payout != nil {
-			r.Post("/payouts", handleStartPayout(deps.Payout))
+		// ledger's transaction, and a saga has no ledger transaction to complete
+		// it in -- nothing has moved yet. saga_instances.idempotency_key dedupes
+		// instead.
+		//
+		// requireAuth wraps it regardless, and must run BEFORE the handler
+		// reads principalFrom(r.Context()) -- see docs/DECISIONS.md D24. Every
+		// write route in this function follows the same ordering: auth first,
+		// then whatever dedupe mechanism that route uses.
+		if deps.Payout != nil && deps.Auth != nil {
+			r.With(requireAuth(deps.Auth)).Post("/payouts", handleStartPayout(deps.Payout))
 		}
 		if deps.Sagas != nil {
 			r.Route("/sagas", func(r chi.Router) {
@@ -115,7 +127,7 @@ func NewMux(deps Deps) chi.Router {
 			})
 		}
 
-		if deps.Ledger == nil || deps.Idempotency == nil {
+		if deps.Ledger == nil || deps.Idempotency == nil || deps.Auth == nil {
 			return
 		}
 
@@ -125,9 +137,9 @@ func NewMux(deps Deps) chi.Router {
 			// client forgets under exactly the conditions -- timeouts, retries,
 			// a partial outage -- that make it matter, and the first time that
 			// happens it is a duplicate payment rather than a lesson.
-			r.With(requireIdempotency(deps.Idempotency, deps.Logger)).
+			r.With(requireAuth(deps.Auth), requireIdempotency(deps.Idempotency, deps.Logger)).
 				Post("/", handlePostTransaction(deps.Ledger))
-			r.With(requireIdempotency(deps.Idempotency, deps.Logger)).
+			r.With(requireAuth(deps.Auth), requireIdempotency(deps.Idempotency, deps.Logger)).
 				Post("/{id}/reverse", handleReverseTransaction(deps.Ledger))
 		})
 

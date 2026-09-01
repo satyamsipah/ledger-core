@@ -36,6 +36,7 @@ func (o *Orchestrator) reserve(ctx context.Context, in *saga.Instance, p Payload
 	amount := ledger.MustNewMoney(p.AmountMinor, p.Currency)
 
 	_, err = o.ledger.PostTransaction(ctx, ledger.TransactionRequest{
+		PrincipalID:    in.PrincipalID,
 		Type:           ledger.TransactionTypePayout,
 		ExternalRef:    externalRef(p),
 		IdempotencyKey: &key,
@@ -293,6 +294,7 @@ func (o *Orchestrator) settle(ctx context.Context, in *saga.Instance, p Payload)
 	}
 
 	_, err = o.ledger.PostTransaction(ctx, ledger.TransactionRequest{
+		PrincipalID:    in.PrincipalID,
 		Type:           ledger.TransactionTypePayout,
 		ExternalRef:    externalRef(p),
 		IdempotencyKey: &key,

@@ -376,7 +376,7 @@ func TestIdempotency_CrashBeforeCompletionLeavesNoTransaction(t *testing.T) {
 	// The retry. Its lease has to expire first, which is what the short lease on
 	// this manager is for; then the same key executes cleanly and exactly once.
 	require.Eventually(t, func() bool {
-		won, err := store.Reclaim(ctx, key, idempotency.DefaultLease)
+		won, err := store.Reclaim(ctx, "", key, idempotency.DefaultLease)
 		return err == nil && won
 	}, 10*time.Second, 200*time.Millisecond, "the abandoned lease must become reclaimable")
 
@@ -417,18 +417,18 @@ func TestIdempotency_LeaseIsOnlyReclaimableOnceExpired(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, won)
 
-	reclaimed, err := store.Reclaim(ctx, key, idempotency.DefaultLease)
+	reclaimed, err := store.Reclaim(ctx, "", key, idempotency.DefaultLease)
 	require.NoError(t, err)
 	assert.False(t, reclaimed, "a live lease must not be reclaimable")
 
 	require.Eventually(t, func() bool {
-		reclaimed, err := store.Reclaim(ctx, key, 30*time.Second)
+		reclaimed, err := store.Reclaim(ctx, "", key, 30*time.Second)
 		return err == nil && reclaimed
 	}, 10*time.Second, 200*time.Millisecond, "an expired lease must become reclaimable")
 
 	// And only once: the winner pushed the deadline into the future, so a second
 	// reclaimer re-evaluates the guard and finds nothing to take.
-	again, err := store.Reclaim(ctx, key, idempotency.DefaultLease)
+	again, err := store.Reclaim(ctx, "", key, idempotency.DefaultLease)
 	require.NoError(t, err)
 	assert.False(t, again, "only one reclaimer may win a given lease")
 }
@@ -464,7 +464,7 @@ func TestIdempotency_ConcurrentReclaimersProduceOneWinner(t *testing.T) {
 	for range goroutines {
 		group.Go(func() error {
 			<-start
-			won, err := store.Reclaim(groupCtx, key, 30*time.Second)
+			won, err := store.Reclaim(groupCtx, "", key, 30*time.Second)
 			if err != nil {
 				return err
 			}
@@ -515,7 +515,7 @@ func TestIdempotency_ReleaseCannotRemoveACompletedRecord(t *testing.T) {
 	_, err = service.PostTransaction(ctx, request)
 	require.NoError(t, err)
 
-	require.NoError(t, store.Release(ctx, key), "release must not error on a completed record")
+	require.NoError(t, store.Release(ctx, "", key), "release must not error on a completed record")
 
 	status, transactionID, found := idempotencyRecord(t, ctx, sharedPool, key)
 	require.True(t, found, "releasing a COMPLETED record must be a no-op, not a delete")
@@ -560,7 +560,7 @@ func TestIdempotency_CompletingALostLeaseAbortsTheTransaction(t *testing.T) {
 	request.Idempotency = &ledger.Idempotent{
 		Key: key,
 		Render: func(tx *ledger.Transaction) (int, []byte, error) {
-			require.NoError(t, store.Fail(ctx, key, 422, []byte(`{"error":"taken"}`)))
+			require.NoError(t, store.Fail(ctx, "", key, 422, []byte(`{"error":"taken"}`)))
 			return 201, []byte(`{"transaction_id":"` + tx.ID.String() + `"}`), nil
 		},
 	}

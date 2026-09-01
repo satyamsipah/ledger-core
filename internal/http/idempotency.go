@@ -35,9 +35,10 @@ var idempotencyContextKey = &contextKey{name: "idempotency"}
 
 // idemState is the reservation this request holds, carried to the handler.
 type idemState struct {
-	key     string
-	manager *idempotency.Manager
-	logger  *slog.Logger
+	principalID string
+	key         string
+	manager     *idempotency.Manager
+	logger      *slog.Logger
 
 	// settled records that the key already reached a terminal state, so the
 	// deferred rejection path does not release a record the ledger transaction
@@ -66,6 +67,11 @@ type idemState struct {
 func requireIdempotency(manager *idempotency.Manager, logger *slog.Logger) func(nethttp.Handler) nethttp.Handler {
 	return func(next nethttp.Handler) nethttp.Handler {
 		return nethttp.HandlerFunc(func(w nethttp.ResponseWriter, r *nethttp.Request) {
+			// requireAuth runs first on every route this wraps, so the
+			// namespace a key is reserved in is never the caller's to assert --
+			// see docs/DECISIONS.md D24.
+			principalID := principalFrom(r.Context())
+
 			key, err := idempotency.ParseKey(r.Header.Get(idempotencyHeader))
 			if err != nil {
 				writeProblem(w, r, err)
@@ -88,6 +94,7 @@ func requireIdempotency(manager *idempotency.Manager, logger *slog.Logger) func(
 			}
 
 			record, disposition, err := manager.Acquire(r.Context(), idempotency.Reservation{
+				PrincipalID: principalID,
 				Key:         key,
 				Fingerprint: fingerprint,
 				Method:      r.Method,
@@ -103,7 +110,7 @@ func requireIdempotency(manager *idempotency.Manager, logger *slog.Logger) func(
 				return
 			}
 
-			state := &idemState{key: key, manager: manager, logger: logger}
+			state := &idemState{principalID: principalID, key: key, manager: manager, logger: logger}
 			ctx := context.WithValue(r.Context(), idempotencyContextKey, state)
 
 			// The body was consumed to fingerprint it, so the handler gets a
@@ -205,7 +212,7 @@ func (s *idemState) reject(ctx context.Context, err error, status int, body []by
 	ctx = context.WithoutCancel(ctx)
 
 	if isDeterministic(err) {
-		if failErr := s.manager.Fail(ctx, s.key, status, body); failErr != nil {
+		if failErr := s.manager.Fail(ctx, s.principalID, s.key, status, body); failErr != nil {
 			s.logger.WarnContext(ctx, "could not record idempotent failure",
 				slog.String("idempotency_key", s.key),
 				slog.String("error", failErr.Error()))
@@ -215,7 +222,7 @@ func (s *idemState) reject(ctx context.Context, err error, status int, body []by
 
 	// Best-effort. A release that never runs leaves a lease that expires on its
 	// own, which costs a delay and nothing else.
-	if releaseErr := s.manager.Release(ctx, s.key); releaseErr != nil {
+	if releaseErr := s.manager.Release(ctx, s.principalID, s.key); releaseErr != nil {
 		s.logger.WarnContext(ctx, "could not release idempotency key",
 			slog.String("idempotency_key", s.key),
 			slog.String("error", releaseErr.Error()))

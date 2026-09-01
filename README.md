@@ -11,12 +11,13 @@ written yet does something unanticipated.
 
 ## Status
 
-**Security fix, ahead of Phase 6: D19 (spoofable client IP) is closed**, three
-phases after it was first flagged and deliberately left open rather than
-guessed at. `internal/http/clientip.go` replaces chi's deprecated `RealIP`
-with a bounded trusted-hop parser of `X-Forwarded-For`, defaulting to trusting
-nothing -- correct for this service's actual deployment today. See D19 in
-[docs/DECISIONS.md](docs/DECISIONS.md).
+**Security fix, ahead of Phase 6: D19 (spoofable client IP) and D24
+(unauthenticated, globally-shared idempotency namespace) are closed**, three
+phases after they were first flagged and deliberately left open rather than
+guessed at. Every write route now requires `Authorization: Bearer <key>`, and
+every idempotency key — ledger-level and saga-level — is scoped to the
+principal that presented it. See [Authentication](#authentication) and D19/D24
+in [docs/DECISIONS.md](docs/DECISIONS.md).
 
 **Phase 5 complete: multi-step, multi-party money movement that stays correct
 when a step fails halfway.** A marketplace payout debits a customer wallet into
@@ -110,6 +111,9 @@ cmd/reconciler      scheduled invariant checks against data at rest
 cmd/saga-orchestrator  claim loop + timeout sweeper driving payout sagas
 cmd/mock-gateway    LOCAL ONLY: a real payment gateway stand-in with
                     injectable failure, latency and two flavours of hang
+cmd/issue-api-key   one-shot: mints one API key for one principal, then exits
+internal/auth       API key authentication; hashed at rest, never stored raw
+internal/auth/pgauth  the api_keys statements
 internal/ledger     double-entry domain: Money, entries, ledger.Service
 internal/ledger/pgledger  the PostgreSQL repository: locking and SQL
 internal/idempotency  request de-duplication (invariant 5)
@@ -238,16 +242,23 @@ the router in both directions — every registered route must be documented and
 every documented path must exist. A specification nobody validates rots, and the
 drift is discovered by a client integrating against a path that is gone.
 
-| Method | Path | Idempotency-Key |
-|---|---|---|
-| `POST` | `/v1/transactions` | required |
-| `POST` | `/v1/transactions/{id}/reverse` | required |
-| `GET` | `/v1/accounts/{id}/balance` | — |
-| `GET` | `/v1/accounts/{id}/statement` | — |
-| `POST` | `/v1/payouts` | required |
-| `GET` | `/v1/sagas` | — |
-| `GET` | `/v1/sagas/{id}` | — |
-| `GET` | `/healthz`, `/readyz` | — |
+| Method | Path | Auth | Idempotency-Key |
+|---|---|---|---|
+| `POST` | `/v1/transactions` | required | required |
+| `POST` | `/v1/transactions/{id}/reverse` | required | required |
+| `GET` | `/v1/accounts/{id}/balance` | — | — |
+| `GET` | `/v1/accounts/{id}/statement` | — | — |
+| `POST` | `/v1/payouts` | required | required |
+| `GET` | `/v1/sagas` | — | — |
+| `GET` | `/v1/sagas/{id}` | — | — |
+| `GET` | `/healthz`, `/readyz` | — | — |
+
+Every write route requires `Authorization: Bearer <key>`. Issue one with
+`cmd/issue-api-key -principal <id>` (a one-shot CLI, in the shape of `migrate`
+and `kafka-init` — not an admin API, since this service has none yet). The key
+is printed once and is never stored anywhere; `api_keys.key_hash` is a SHA-256
+digest, the same shape idempotency fingerprints already use, for the same
+reason. See [Authentication](#authentication).
 
 `POST /v1/payouts` answers **202, not 201**: no money has moved when it returns.
 Its `Idempotency-Key` dedupes the whole saga rather than a single transaction,
@@ -267,6 +278,40 @@ obvious which question was answered. Statements are keyset-paginated with an
 opaque cursor; the position is a `(created_at, id)` pair because timestamps tie,
 and a client that could see both fields would eventually build its own and skip
 rows.
+
+## Authentication
+
+`internal/auth` closes docs/DECISIONS.md D24: every idempotency key, and every
+saga's own dedupe, is scoped to the caller who presented it, and there is no
+way to be "the caller who presented it" without a secret this service issued.
+
+```bash
+go run ./cmd/issue-api-key -principal acme-corp
+# principal: acme-corp
+# key:       lk_live_9f2a...
+#
+# This key is shown once and is not recoverable. Store it now.
+```
+
+The key is checked into nothing and stored nowhere as plaintext — `api_keys.key_hash`
+is a SHA-256 digest, the same shape `idempotency_keys.request_fingerprint`
+already uses. Authentication is one indexed lookup by that hash; there is no
+byte-by-byte comparison of a secret against attacker input for a timing side
+channel to measure.
+
+**Deliberately not here:** key rotation, listing, an admin API, expiry, scope.
+`cmd/issue-api-key` is the entire provisioning surface — a one-shot CLI in the
+shape of `migrate` and `kafka-init` — because those are real admin-dashboard
+features, and building them to close a namespace-collision bug would be later
+work borrowing this fix's authority. Revocation works today
+(`UPDATE api_keys SET status = 'REVOKED', revoked_at = now() ...`); only the
+API for it is absent.
+
+**What this does not provide: authorization.** An authenticated principal may
+read or post against any account — there is no per-principal ownership check
+on `accounts`. Closing that is real Phase 6 design work (which accounts a
+principal owns, single- or multi-tenant, how it interacts with sharding's
+`parent_account_id`) and is out of scope for what D24 needed. See D47.
 
 ## Idempotency
 

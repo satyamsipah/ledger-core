@@ -653,13 +653,13 @@ func (t *txn) InsertTransaction(ctx context.Context, transaction *ledger.Transac
 	}
 
 	err = t.tx.QueryRow(ctx, `
-		INSERT INTO transactions (id, idempotency_key, transaction_type, status,
-		                          external_ref, metadata, posted_at)
-		VALUES ($1, $2, $3, $4, $5, $6,
-		        CASE WHEN $4 = 'PENDING' THEN NULL ELSE now() END)
+		INSERT INTO transactions (id, idempotency_key, principal_id, transaction_type,
+		                          status, external_ref, metadata, posted_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7,
+		        CASE WHEN $5 = 'PENDING' THEN NULL ELSE now() END)
 		RETURNING created_at, posted_at`,
-		transaction.ID, transaction.IdempotencyKey, transaction.Type, transaction.Status,
-		transaction.ExternalRef, metadata).
+		transaction.ID, transaction.IdempotencyKey, transaction.PrincipalID, transaction.Type,
+		transaction.Status, transaction.ExternalRef, metadata).
 		Scan(&transaction.CreatedAt, &transaction.PostedAt)
 	if err != nil {
 		return fmt.Errorf("insert transaction %s: %w", transaction.ID, mapError(err))

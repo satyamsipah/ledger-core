@@ -29,6 +29,8 @@ type Config struct {
 	Ledger        Ledger
 	Kafka         Kafka
 	Outbox        Outbox
+	Saga          Saga
+	Gateway       Gateway
 	Redis         Redis
 	Observability Observability
 }
@@ -63,6 +65,63 @@ type Ledger struct {
 
 	SweepInterval time.Duration
 	SweepBatch    int
+}
+
+// Saga configures the orchestrator's claim loop, its leases, and how patient it
+// is before giving up on a step.
+type Saga struct {
+	// WorkerID identifies this replica in saga_instances.lease_owner. Defaults
+	// to the hostname, which in a container is the container id -- exactly what
+	// an operator needs to find the process that was driving a stuck saga.
+	WorkerID string
+
+	// ClaimInterval is how often the claim loop looks for runnable sagas.
+	ClaimInterval time.Duration
+	ClaimBatch    int
+
+	// Lease is how long a claim holds a saga before another replica may take
+	// it. Sized above StepTimeout so a replica that is merely slow is not
+	// overtaken by one that assumes it died.
+	Lease time.Duration
+
+	// StepTimeout is how long one step may take before the sweeper treats it as
+	// stuck. It bounds a step, not the saga: a saga that has been alive for an
+	// hour is fine as long as each step finished.
+	StepTimeout time.Duration
+
+	// MaxStepAttempts caps retries of a FORWARD step.
+	MaxStepAttempts int
+
+	// MaxCompensationAttempts caps retries of a COMPENSATION, and is
+	// deliberately larger than MaxStepAttempts.
+	//
+	// The asymmetry is the point. Giving up on a forward step is cheap -- the
+	// saga compensates and the customer is untouched. Giving up on a
+	// compensation strands real money in a suspense account and pages a human.
+	// The two failures are not comparable, so their budgets are not equal.
+	MaxCompensationAttempts int
+
+	// SweepInterval is how often stuck sagas are looked for. Below Lease, so a
+	// saga abandoned by a dead replica is found promptly once its lease lapses.
+	SweepInterval time.Duration
+}
+
+// Gateway configures the external payment gateway client.
+type Gateway struct {
+	URL string
+
+	// Timeout bounds a payment submission. Generous, because this call can
+	// create a charge and a timeout here leaves an ambiguity a human may have
+	// to resolve.
+	Timeout time.Duration
+
+	// ProbeTimeout bounds the resolution query. Short, because a probe cannot
+	// create anything, so giving up early costs nothing but another attempt.
+	ProbeTimeout time.Duration
+
+	// MaxProbes is how many inconclusive probes a saga endures before it is
+	// escalated to NEEDS_MANUAL_REVIEW rather than guessed at.
+	MaxProbes int
 }
 
 // HTTP configures the public API listener. Every timeout is explicit because a
@@ -185,6 +244,22 @@ func Load(service string) (Config, error) {
 			ConnectURL:    env("OUTBOX_CONNECT_URL", "http://localhost:8083"),
 			ConnectorName: env("OUTBOX_CONNECTOR_NAME", "ledger-outbox"),
 		},
+		Saga: Saga{
+			WorkerID:                env("SAGA_WORKER_ID", defaultWorkerID()),
+			ClaimInterval:           envDuration("SAGA_CLAIM_INTERVAL", 250*time.Millisecond, fail),
+			ClaimBatch:              envInt("SAGA_CLAIM_BATCH", 50, fail),
+			Lease:                   envDuration("SAGA_LEASE", 60*time.Second, fail),
+			StepTimeout:             envDuration("SAGA_STEP_TIMEOUT", 30*time.Second, fail),
+			MaxStepAttempts:         envInt("SAGA_MAX_STEP_ATTEMPTS", 5, fail),
+			MaxCompensationAttempts: envInt("SAGA_MAX_COMPENSATION_ATTEMPTS", 8, fail),
+			SweepInterval:           envDuration("SAGA_SWEEP_INTERVAL", 10*time.Second, fail),
+		},
+		Gateway: Gateway{
+			URL:          env("GATEWAY_URL", "http://localhost:8090"),
+			Timeout:      envDuration("GATEWAY_TIMEOUT", 10*time.Second, fail),
+			ProbeTimeout: envDuration("GATEWAY_PROBE_TIMEOUT", 5*time.Second, fail),
+			MaxProbes:    envInt("GATEWAY_MAX_PROBES", 6, fail),
+		},
 		Redis: Redis{
 			Addr: env("REDIS_ADDR", "localhost:6379"),
 			DB:   envInt("REDIS_DB", 0, fail),
@@ -220,6 +295,37 @@ func Load(service string) (Config, error) {
 	// retry. The two would then contend for the same accounts, and the loser
 	// would abort on ErrLeaseLost -- correct, but a self-inflicted failure that
 	// looks exactly like a real one in the logs.
+	// A step deadline shorter than the gateway's own timeout would declare a
+	// call stuck while it is still legitimately outstanding, and the sweeper
+	// would start probing a payment whose original response is about to arrive.
+	// Harmless but wasteful, and it makes every slow-but-healthy gateway look
+	// like an ambiguity in the metrics.
+	if cfg.Saga.StepTimeout <= cfg.Gateway.Timeout {
+		fail("%sSAGA_STEP_TIMEOUT (%s) must exceed %sGATEWAY_TIMEOUT (%s)",
+			envPrefix, cfg.Saga.StepTimeout, envPrefix, cfg.Gateway.Timeout)
+	}
+	// A lease shorter than a step would let a replica still working a step be
+	// overtaken by one that assumed it died. Both would then drive the same
+	// saga, and the slower one's guarded transition would fail -- correct, but
+	// a self-inflicted race that looks like a real one.
+	if cfg.Saga.Lease <= cfg.Saga.StepTimeout {
+		fail("%sSAGA_LEASE (%s) must exceed %sSAGA_STEP_TIMEOUT (%s)",
+			envPrefix, cfg.Saga.Lease, envPrefix, cfg.Saga.StepTimeout)
+	}
+	// The sweeper must run more often than a lease lasts, or a saga abandoned
+	// by a dead replica waits for the sweep rather than for the lease.
+	if cfg.Saga.SweepInterval >= cfg.Saga.Lease {
+		fail("%sSAGA_SWEEP_INTERVAL (%s) must be shorter than %sSAGA_LEASE (%s)",
+			envPrefix, cfg.Saga.SweepInterval, envPrefix, cfg.Saga.Lease)
+	}
+	if cfg.Saga.MaxCompensationAttempts < cfg.Saga.MaxStepAttempts {
+		fail("%sSAGA_MAX_COMPENSATION_ATTEMPTS (%d) must be at least %sSAGA_MAX_STEP_ATTEMPTS (%d): "+
+			"abandoning a compensation strands money, abandoning a forward step does not",
+			envPrefix, cfg.Saga.MaxCompensationAttempts, envPrefix, cfg.Saga.MaxStepAttempts)
+	}
+	if cfg.Gateway.MaxProbes < 1 {
+		fail("%sGATEWAY_MAX_PROBES must be at least 1, got %d", envPrefix, cfg.Gateway.MaxProbes)
+	}
 	if cfg.Ledger.IdempotencyLease <= cfg.Postgres.QueryTimeout {
 		fail("%sIDEMPOTENCY_LEASE (%s) must exceed %sPOSTGRES_QUERY_TIMEOUT (%s)",
 			envPrefix, cfg.Ledger.IdempotencyLease, envPrefix, cfg.Postgres.QueryTimeout)
@@ -336,4 +442,18 @@ func envLogLevel(key string, fallback slog.Level, fail func(string, ...any)) slo
 		return fallback
 	}
 	return level
+}
+
+// defaultWorkerID names this replica in saga_instances.lease_owner.
+//
+// The hostname, which in a container is the container id: when a saga is found
+// stuck holding a lease, the first question is which process was driving it,
+// and a value that answers that without a lookup is worth more than a prettier
+// one that does not.
+func defaultWorkerID() string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		return "unknown-worker"
+	}
+	return host
 }

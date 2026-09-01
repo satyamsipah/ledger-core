@@ -30,6 +30,7 @@ import (
 	"github.com/satyamsipah/ledger-core/internal/idempotency"
 	"github.com/satyamsipah/ledger-core/internal/ledger"
 	"github.com/satyamsipah/ledger-core/internal/observability"
+	"github.com/satyamsipah/ledger-core/internal/saga/pgsaga"
 )
 
 // newAPI stands up the real router over the real database.
@@ -718,12 +719,18 @@ func TestOpenAPI_MatchesTheRegisteredRoutes(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	service, _ := newRetryingLedgerService(t, sharedPool, false)
+	// Payout and Sagas are supplied so the saga routes are registered: this
+	// test compares the spec against what is actually mounted, so a dependency
+	// left nil here would silently exempt its routes from the comparison.
+	orchestrator, _, _ := newOrchestrator(t, sharedPool, "http://gateway.invalid", nil)
 	mux := ledgerhttp.NewMux(ledgerhttp.Deps{
 		Service:     "test",
 		Logger:      logger,
 		Metrics:     observability.NewMetrics("test"),
 		Ledger:      service,
 		Idempotency: newIdempotencyManager(t, sharedPool, idempotency.DefaultLease),
+		Payout:      orchestrator,
+		Sagas:       pgsaga.New(sharedPool, 30*time.Second),
 	})
 
 	registered := map[string]struct{}{}

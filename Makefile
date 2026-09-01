@@ -9,18 +9,20 @@ MIGRATE      := $(COMPOSE) run --rm migrate -path=/migrations -database='$(MIGRA
 N ?= 1
 
 .DEFAULT_GOAL := help
-.PHONY: help up down logs migrate-up migrate-down seed rebuild test test-race lint loadtest build fmt tidy psql
+.PHONY: help up down logs migrate-up migrate-down seed rebuild test test-race lint loadtest build fmt tidy psql gateway-behaviour sagas-stuck
 
 help: ## List available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
 		| awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
 
-up: ## Start the whole stack (postgres, redpanda, connect, redis, api, outbox-publisher, projector) and apply migrations
+up: ## Start the whole stack (postgres, redpanda, connect, redis, api, outbox-publisher, projector, saga-orchestrator, mock-gateway) and apply migrations
 	$(COMPOSE) up --build -d
 	@echo "api               http://localhost:8080/healthz"
 	@echo "api metrics       http://localhost:9090/metrics"
 	@echo "outbox-publisher  http://localhost:9091/healthz  (health+metrics share one port; no separate app port)"
 	@echo "projector         http://localhost:9093/healthz  (health+metrics share one port; no separate app port)"
+	@echo "saga-orchestrator http://localhost:9094/healthz  (health+metrics share one port; no separate app port)"
+	@echo "mock-gateway      http://localhost:8090/healthz  (LOCAL ONLY; holds payments in memory)"
 	@echo "connect           http://localhost:8083/connectors"
 
 rebuild: ## Recompute balances from journal_entries and diff against the live projection
@@ -71,3 +73,12 @@ lint: ## Run golangci-lint
 
 loadtest: ## Run the k6 load profile against a running stack
 	k6 run test/load/smoke.js
+
+gateway-behaviour: ## Set the mock gateway's behaviour, e.g. make gateway-behaviour BEHAVIOUR='{"outcome":"decline"}'
+	@curl -sS -X POST http://localhost:8090/control/behaviour \
+		-H 'Content-Type: application/json' \
+		-d '$(or $(BEHAVIOUR),{"outcome":"succeed"})' \
+		&& echo "gateway behaviour set to $(or $(BEHAVIOUR),{\"outcome\":\"succeed\"})"
+
+sagas-stuck: ## List sagas awaiting manual review
+	@curl -sS 'http://localhost:8080/v1/sagas?status=NEEDS_MANUAL_REVIEW'

@@ -43,6 +43,13 @@ type Deps struct {
 	// misconfigured process 404s rather than panicking on the first request.
 	Ledger      LedgerService
 	Idempotency *idempotency.Manager
+
+	// Payout and Sagas are nil in a process that does not expose the saga
+	// surface. Registered independently of the ledger routes, because starting
+	// a payout and reading saga state are separate capabilities: a read-only
+	// dashboard backend gets Sagas without Payout.
+	Payout PayoutService
+	Sagas  SagaReader
 }
 
 // NewRouter assembles the public API.
@@ -92,6 +99,20 @@ func NewMux(deps Deps) chi.Router {
 	r.Get("/readyz", handleReady(deps.Checkers, deps.Logger))
 
 	r.Route("/v1", func(r chi.Router) {
+		// Starting a payout requires an Idempotency-Key like every other write,
+		// but not the idempotency MIDDLEWARE: that completes a key inside the
+		// ledger's transaction, and a saga has no ledger transaction at the
+		// moment it is created. saga_instances.idempotency_key dedupes instead.
+		if deps.Payout != nil {
+			r.Post("/payouts", handleStartPayout(deps.Payout))
+		}
+		if deps.Sagas != nil {
+			r.Route("/sagas", func(r chi.Router) {
+				r.Get("/", handleListSagas(deps.Sagas))
+				r.Get("/{id}", handleGetSaga(deps.Sagas))
+			})
+		}
+
 		if deps.Ledger == nil || deps.Idempotency == nil {
 			return
 		}

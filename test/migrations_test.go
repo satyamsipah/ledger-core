@@ -21,6 +21,8 @@ var expectedTables = []string{
 	"journal_entries",
 	"outbox",
 	"processed_events",
+	"saga_instances",
+	"saga_steps",
 	"transactions",
 }
 

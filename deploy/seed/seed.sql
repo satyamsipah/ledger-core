@@ -27,6 +27,15 @@ VALUES
     ('01920000-0000-7000-8000-000000000003', 'fee-revenue-inr',
      'REVENUE', 'CREDIT', 'INR', NULL, FALSE, 'ACTIVE'),
 
+    -- Where a payout's funds wait between leaving a customer's wallet and
+    -- reaching the merchant. Distinct from gateway-suspense-inr above, which
+    -- is the INBOUND side, and unlike it this one must NOT allow negative: a
+    -- settlement may only pay out what a reserve actually put in, and an
+    -- overdrawable payout suspense would let a bug pay a merchant from
+    -- nowhere. The saga's semantic lock is this account holding the money.
+    ('01920000-0000-7000-8000-000000000005', 'payout-suspense-inr',
+     'LIABILITY', 'CREDIT', 'INR', NULL, FALSE, 'ACTIVE'),
+
     -- Sub-unit residue from currency conversion. Small, and it must land
     -- somewhere or FX transactions cannot balance to the paisa.
     ('01920000-0000-7000-8000-000000000004', 'fx-rounding-inr',

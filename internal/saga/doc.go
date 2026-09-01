@@ -7,5 +7,10 @@
 // is append-only, so "undo" is not available at any layer, and a saga that
 // assumes otherwise will corrupt the ledger rather than fail loudly.
 //
-// Phase 1 reserves the package. The orchestrator arrives in Phase 3.
+// This package holds the state machine's vocabulary and its persistence port,
+// and deliberately imports nothing from internal/ledger. That is what lets
+// internal/ledger import THIS package to expose AdvanceSaga on its Tx port, so
+// a saga's state transition commits in the same database transaction as the
+// money it describes. The orchestrator that drives the machine lives in
+// internal/saga/payout, which may import both.
 package saga

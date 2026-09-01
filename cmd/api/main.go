@@ -21,6 +21,8 @@ import (
 	"github.com/satyamsipah/ledger-core/internal/ledger"
 	"github.com/satyamsipah/ledger-core/internal/ledger/pgledger"
 	"github.com/satyamsipah/ledger-core/internal/observability"
+	"github.com/satyamsipah/ledger-core/internal/saga/payout"
+	"github.com/satyamsipah/ledger-core/internal/saga/pgsaga"
 )
 
 const serviceName = "api"
@@ -97,6 +99,18 @@ func run() error {
 		cfg.Ledger.SweepInterval, cfg.Ledger.SweepBatch,
 	)
 
+	// The API starts sagas and reads them; it never drives one. Driving is
+	// cmd/saga-orchestrator's job, because a step advanced inside a request
+	// would tie a customer's money to an HTTP connection that can be cut at
+	// any moment -- manufacturing exactly the ambiguity the saga design works
+	// to avoid. The gateway client is therefore not wired here at all: this
+	// process has no reason to hold one.
+	sagaStore := pgsaga.New(pool.Pool, cfg.Postgres.QueryTimeout)
+	payoutStarter := payout.New(sagaStore, ledgerService, nil, logger, metrics, payout.Config{
+		WorkerID:    cfg.Saga.WorkerID,
+		StepTimeout: cfg.Saga.StepTimeout,
+	})
+
 	router := ledgerhttp.NewRouter(ledgerhttp.Deps{
 		Service:     serviceName,
 		Logger:      logger,
@@ -104,6 +118,8 @@ func run() error {
 		Checkers:    []ledgerhttp.Checker{pool},
 		Ledger:      ledgerService,
 		Idempotency: idempotencyManager,
+		Payout:      payoutStarter,
+		Sagas:       sagaStore,
 	})
 
 	apiServer := ledgerhttp.NewServer("api", cfg.HTTP, router, logger)

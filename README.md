@@ -11,7 +11,16 @@ written yet does something unanticipated.
 
 ## Status
 
-**Phase 4 complete: events out of Postgres, without losing or inventing one.**
+**Phase 5 complete: multi-step, multi-party money movement that stays correct
+when a step fails halfway.** A marketplace payout debits a customer wallet into
+platform suspense, calls an external payment gateway, and settles to the
+merchant and to fee revenue — compensating with a reversing transaction if any
+of that fails. The orchestrator drives itself from durable Postgres state, every
+step commits its ledger entries and its saga transition in one COMMIT, and an
+*unknown* gateway outcome is resolved by asking the gateway rather than by
+guessing. See [Sagas](#sagas).
+
+**Phase 4: events out of Postgres, without losing or inventing one.**
 Every write still lands in `outbox` inside the same transaction as the journal
 (invariant 6), and now two independent publishers can carry it to Kafka —
 Debezium reading the write-ahead log (the default) or a polling publisher this
@@ -27,9 +36,9 @@ including the topic layout, the connector, the publisher and the projector.
 
 Three gaps are open and worth knowing about before deploying this anywhere
 real: the client IP is spoofable (D19), idempotency keys share one namespace
-with no authentication behind them (D24), and `SagaStepCompleted` is a
-declared event type with no orchestrator behind it yet — `internal/saga` is
-still the Phase 1 stub. All recorded in
+with no authentication behind them (D24) — which `saga_instances.idempotency_key`
+now inherits — and a saga in `NEEDS_MANUAL_REVIEW` has no in-product resolution
+path, so an operator fixes it by hand (D43). All recorded in
 [docs/DECISIONS.md](docs/DECISIONS.md) rather than papered over.
 
 ## Quick start
@@ -37,7 +46,8 @@ still the Phase 1 stub. All recorded in
 Requires Docker and Go 1.25+.
 
 ```bash
-make up      # postgres, redpanda, kafka-connect, redis, api, outbox-publisher, projector
+make up      # postgres, redpanda, kafka-connect, redis, api, outbox-publisher,
+             # projector, saga-orchestrator, mock-gateway
 make seed    # load the development chart of accounts
 ```
 
@@ -90,6 +100,9 @@ cmd/projector       Kafka consumer maintaining the read-side balance
                     projection; -rebuild recomputes it from journal_entries
                     and diffs against the live one
 cmd/reconciler      scheduled invariant checks against data at rest
+cmd/saga-orchestrator  claim loop + timeout sweeper driving payout sagas
+cmd/mock-gateway    LOCAL ONLY: a real payment gateway stand-in with
+                    injectable failure, latency and two flavours of hang
 internal/ledger     double-entry domain: Money, entries, ledger.Service
 internal/ledger/pgledger  the PostgreSQL repository: locking and SQL
 internal/idempotency  request de-duplication (invariant 5)
@@ -101,7 +114,13 @@ internal/outbox/publish  the Publisher interface, and both implementations:
                     publish/polling, publish/debezium
 internal/kafka      topic names, partition counts, explicit per-topic config
 internal/projector  consumes and applies events, dedupes by event_id, rebuilds
-internal/saga       multi-step orchestration with compensating transactions
+internal/saga       saga vocabulary and persistence port; imports no ledger,
+                    so internal/ledger can import it and offer AdvanceSaga
+internal/saga/pgsaga  the saga_instances/saga_steps statements, including the
+                    step commit that runs inside the ledger transaction
+internal/saga/payout  the marketplace payout state machine and orchestrator
+internal/gateway    external payment gateway client; three-valued outcome
+internal/gateway/mock  the mock server behind cmd/mock-gateway
 internal/http       router, middleware, health, server lifecycle
 internal/db         pgx pool, query-timeout conventions, 40001/40P01 retrier
 internal/config     environment configuration
@@ -218,7 +237,16 @@ drift is discovered by a client integrating against a path that is gone.
 | `POST` | `/v1/transactions/{id}/reverse` | required |
 | `GET` | `/v1/accounts/{id}/balance` | — |
 | `GET` | `/v1/accounts/{id}/statement` | — |
+| `POST` | `/v1/payouts` | required |
+| `GET` | `/v1/sagas` | — |
+| `GET` | `/v1/sagas/{id}` | — |
 | `GET` | `/healthz`, `/readyz` | — |
+
+`POST /v1/payouts` answers **202, not 201**: no money has moved when it returns.
+Its `Idempotency-Key` dedupes the whole saga rather than a single transaction,
+and it is carried by `saga_instances.idempotency_key` rather than by the
+idempotency middleware — that machinery completes a key inside the ledger's
+transaction, and a saga has no ledger transaction at the moment it is created.
 
 Errors are RFC 9457 `application/problem+json`. The `type` URI is the
 machine-readable discriminator and the thing to switch on; `title` and `detail`
@@ -437,6 +465,142 @@ disagreement. `-accounts` scopes it to specific accounts, which is both a
 real operational need (a targeted investigation into one customer's balance)
 and what makes the check usable against a database other tests also touch.
 
+## Sagas
+
+A marketplace payout spans an external payment gateway, so it cannot be one
+database transaction. What it is instead is three steps, a compensation, and a
+defined answer for the case where the gateway's outcome is unknown.
+
+### Three steps, not five
+
+The business description names five movements. Two of them cannot be separate
+steps: a transaction carrying only "debit the customer wallet" sums to a
+non-zero value and the deferred balance trigger rejects it at `COMMIT`.
+Invariant 1 is not something a saga gets to step around.
+
+| Step | Ledger movement | Compensation |
+|---|---|---|
+| `RESERVE` | DEBIT wallet / CREDIT platform suspense | reverse it |
+| `GATEWAY` | none — the external call | none; resolved by probe, not undone |
+| `SETTLE` | DEBIT suspense / CREDIT merchant / CREDIT fee revenue | reverse it |
+
+### The state machine
+
+```
+  POST /v1/payouts
+        |
+        v
+   [ PENDING ] --reserve--> [ RESERVED ] --intent--> [ GATEWAY_PENDING ]
+        |                                              |     ^      |
+        | insufficient funds                     200 OK|     |probe |declined
+        v                                              v     |      v
+   [ FAILED ]                              [ GATEWAY_SUCCEEDED ]  [ GATEWAY_FAILED ]
+   nothing moved                                       |                 |
+   nothing to undo                              settle |                 v
+                                                       v          [ COMPENSATING ]
+                                               [ COMPLETED ]             |
+                                                                         v
+                                                                  [ COMPENSATED ]
+                                                                  every balance
+                                                                  exactly restored
+
+  probes exhausted, or compensation exhausted  -->  [ NEEDS_MANUAL_REVIEW ]
+                                                    money held in suspense;
+                                                    event + metric + log + API
+```
+
+Every value of `status` is a **settled** state. There is deliberately no
+`RESERVING` or `SETTLING`: a step commits its journal entries and its transition
+together, so no crash can leave a saga describing itself as halfway through
+something. In-flight-ness is a lease (`lease_owner`, `lease_expires_at`), the
+same shape `idempotency_keys` uses, resting on the same property — a lapsed
+lease is proof its owner committed nothing.
+
+### The step and the money commit together
+
+`ledger.Tx` gained `CommitSagaStep` and `ApplyPendingDelta`, and
+`ledger.TransactionRequest` gained a `Record` hook. A forward step's journal
+entries, balance updates, `pending_minor` movement, saga transition, audit row
+and outbox event are one `COMMIT`. That is D20's argument with higher stakes:
+there, a lost bookkeeping write duplicated a response; here it would re-run a
+debit against a customer's wallet.
+
+Consequence: **the saga never writes a `PENDING` transaction header.** This
+closes the gap carried since Phase 1 — a `transactions` row reaching `POSTED`
+with zero entries — by never taking that path.
+
+### What actually stops a double-spend
+
+Not `pending_minor`. `account_balances_no_overdraft_check` is
+`allow_negative OR available_minor >= 0` and does not mention that column, so a
+hold written only there is invisible to the constraint and stops nothing.
+
+The guard is the **suspense debit itself**: once the wallet is debited, a second
+payout is refused by invariant 4's existing `CHECK` under the existing row lock —
+the ordinary write path's protection, reused unchanged.
+`pending_minor` on the suspense account says how much of what is sitting there
+belongs to an unfinished saga, which is what makes the intermediate state
+self-describing rather than merely visible. It also gives a reconciliation
+invariant: `suspense.pending_minor` must equal the summed amount of every
+non-terminal saga.
+
+### An unknown gateway outcome
+
+A timeout, a severed connection and an orchestrator crash mid-call are
+indistinguishable from this side, and all three mean the same thing: a payment
+may or may not exist. The saga does **nothing** — it sits in `GATEWAY_PENDING`
+and the sweeper probes until it gets a conclusive answer.
+
+Assuming failure refunds a customer whose money really left. Assuming success
+pays a merchant for a payment that never happened. Waiting is affordable because
+the money is in a named suspense account — taken from the customer, not given to
+the merchant, owned by nobody and lost by nobody for as long as it lasts.
+
+Three things make asking possible: the gateway key is `<saga_id>:GATEWAY`, a
+pure function of the saga id and therefore recomputable after any crash; the
+intent row and the move to `GATEWAY_PENDING` are committed *before* the call
+goes out; and resolution is a `GET`, which cannot itself create a payment.
+
+### When it gives up
+
+After `LEDGER_GATEWAY_MAX_PROBES` inconclusive probes, or
+`LEDGER_SAGA_MAX_COMPENSATION_ATTEMPTS` failed compensations, the saga stops in
+`NEEDS_MANUAL_REVIEW`. It is never silently dropped: a `SagaNeedsManualReview`
+event goes to `ledger.events.saga`, `ledger_saga_manual_review_total`
+increments, an ERROR line is logged, and it is listed by
+`GET /v1/sagas?status=NEEDS_MANUAL_REVIEW`.
+
+Automatic resolution is refused on purpose. A compensation that burned its whole
+budget failed for a reason the orchestrator does not understand, and the only
+automatic fixes available — force-posting with `allow_negative`, or an
+`ADJUSTMENT` — mint money no business event justifies. A ledger that can silently
+repair itself is one whose balances are no longer evidence of anything. See D43.
+
+### Running it
+
+```bash
+curl -X POST localhost:8080/v1/payouts \
+  -H "Idempotency-Key: $(uuidgen)" -H 'Content-Type: application/json' \
+  -d '{"customer_wallet_id":"01920000-0000-7000-8000-000000000011",
+       "platform_suspense_id":"01920000-0000-7000-8000-000000000005",
+       "merchant_payable_id":"01920000-0000-7000-8000-000000000021",
+       "fee_revenue_id":"01920000-0000-7000-8000-000000000003",
+       "amount":{"amount":"20000","currency":"INR","scale":2},
+       "fee":{"amount":"500","currency":"INR","scale":2}}'
+```
+
+Returns **202**, not 201: no money has moved yet. Poll `GET /v1/sagas/{id}` for
+the outcome and the full attempt history.
+
+To drive the failure paths against the running stack:
+
+```bash
+make gateway-behaviour BEHAVIOUR='{"outcome":"decline"}'   # compensation
+make gateway-behaviour BEHAVIOUR='{"hang":"after"}'        # ambiguity
+docker compose -f deploy/docker-compose.yml pause mock-gateway
+make sagas-stuck                                           # the triage list
+```
+
 ## Tests
 
 No mocks for database behaviour — every test runs against real PostgreSQL via
@@ -533,6 +697,38 @@ stopped and restarted via `container.Stop()`/`Start()`, because its custom
 entrypoint waits on a lifecycle hook that only runs during the original
 `Run()` — `docker pause`/`unpause` sidesteps the problem rather than working
 around it.
+
+Phase 5 adds the saga failure paths. Every failure below is a real one — a real
+unanswered HTTP request, a real killed database backend, a real frozen account —
+because `.claude/rules/testing.md` requires failure tests to kill things rather
+than flip a boolean, and names the gateway specifically. The orchestrator has no
+test-only branch; its one seam is `WithCrashHook`, exported and kept off
+`Config` so ordinary configuration cannot reach it.
+
+- `TestSagaPayout_GatewayFailureCompensatesToTheExactPreSagaState` — every
+  balance, including the pending hold, restored to the unit
+- `TestSagaPayout_AmbiguousGatewayOutcomeIsResolvedByQueryNotByGuess` — three
+  sub-cases against a genuinely hanging gateway: the payment really succeeded
+  (settle, and do not refund it), it never happened (compensate), and the
+  gateway is killed so it can never say (manual review). The first two are
+  indistinguishable to the caller and opposite in fact
+- `TestSagaPayout_CompensationExhaustionNeedsManualReview` — the wallet is
+  frozen between reserve and compensation, which makes the reversal genuinely
+  impossible; asserts the escalation, the alert event, the metric, and that the
+  money is still held rather than invented back
+- `TestSagaPayout_CrashMidFlightResumesExactlyOnce` — `pg_terminate_backend`
+  inside the settle transaction, after its entries are inserted and before the
+  saga advances. Asserts the rollback, then that a second orchestrator settles
+  exactly once and the gateway was charged exactly once
+- `TestSagaPayout_ConcurrentSagasOnOneWalletCannotDoubleSpend` — 100 sagas
+  against a wallet that can afford 40, driven by 8 concurrent orchestrator
+  replicas; exactly 40 complete, 60 are refused, the wallet lands on exactly
+  zero and every hold is released
+
+The three central guarantees were also checked by mutation: guessing on an
+ambiguous outcome, forgetting to release the hold, and dropping the
+compare-and-set guard from the state transition each make the corresponding test
+fail. A test that cannot fail is not evidence.
 
 ## Documentation
 

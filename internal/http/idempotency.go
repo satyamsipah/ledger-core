@@ -129,7 +129,7 @@ func readBody(w nethttp.ResponseWriter, r *nethttp.Request) ([]byte, error) {
 		if errors.As(err, &tooLarge) {
 			return nil, fmt.Errorf("request body exceeds %d bytes: %w", maxBodyBytes, idempotency.ErrMalformedBody)
 		}
-		return nil, fmt.Errorf("read request body: %v: %w", err, idempotency.ErrMalformedBody)
+		return nil, fmt.Errorf("read request body: %w: %w", err, idempotency.ErrMalformedBody)
 	}
 
 	return body, nil

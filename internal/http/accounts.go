@@ -39,7 +39,7 @@ func handleGetBalance(service LedgerService) nethttp.HandlerFunc {
 		if raw := r.URL.Query().Get("as_of"); raw != "" {
 			at, err := time.Parse(time.RFC3339, raw)
 			if err != nil {
-				writeProblem(w, r, fmt.Errorf("as_of %q is not an RFC 3339 timestamp: %v: %w",
+				writeProblem(w, r, fmt.Errorf("as_of %q is not an RFC 3339 timestamp: %w: %w",
 					raw, err, ledger.ErrInvalidEntry))
 				return
 			}
@@ -99,7 +99,7 @@ func handleGetStatement(service LedgerService) nethttp.HandlerFunc {
 		if raw := r.URL.Query().Get("from"); raw != "" {
 			from, err := time.Parse(time.RFC3339, raw)
 			if err != nil {
-				writeProblem(w, r, fmt.Errorf("from %q is not an RFC 3339 timestamp: %v: %w",
+				writeProblem(w, r, fmt.Errorf("from %q is not an RFC 3339 timestamp: %w: %w",
 					raw, err, ledger.ErrInvalidEntry))
 				return
 			}
@@ -108,7 +108,7 @@ func handleGetStatement(service LedgerService) nethttp.HandlerFunc {
 		if raw := r.URL.Query().Get("to"); raw != "" {
 			to, err := time.Parse(time.RFC3339, raw)
 			if err != nil {
-				writeProblem(w, r, fmt.Errorf("to %q is not an RFC 3339 timestamp: %v: %w",
+				writeProblem(w, r, fmt.Errorf("to %q is not an RFC 3339 timestamp: %w: %w",
 					raw, err, ledger.ErrInvalidEntry))
 				return
 			}
@@ -118,7 +118,7 @@ func handleGetStatement(service LedgerService) nethttp.HandlerFunc {
 		if raw := r.URL.Query().Get("limit"); raw != "" {
 			limit, err := strconv.Atoi(raw)
 			if err != nil {
-				writeProblem(w, r, fmt.Errorf("limit %q is not an integer: %v: %w",
+				writeProblem(w, r, fmt.Errorf("limit %q is not an integer: %w: %w",
 					raw, err, ledger.ErrInvalidEntry))
 				return
 			}

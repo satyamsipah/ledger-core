@@ -605,6 +605,11 @@ func routeToShards(ctx context.Context, tx Tx, entries []EntryRequest) ([]EntryR
 
 	chosen := make(map[uuid.UUID]uuid.UUID, len(shards))
 	for accountID, ids := range shards {
+		// math/rand rather than crypto/rand: this spreads write contention
+		// across shards, and predicting which shard a payment lands on reveals
+		// nothing an attacker could use. Every shard is an equally valid home
+		// for the entry.
+		//nolint:gosec // G404: shard selection is load balancing, not a secret.
 		chosen[accountID] = ids[rand.IntN(len(ids))]
 	}
 

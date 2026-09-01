@@ -3,6 +3,7 @@ package idempotency
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -73,7 +74,7 @@ type canonicalObject struct {
 func parseValue(decoder *json.Decoder) (any, error) {
 	token, err := decoder.Token()
 	if err != nil {
-		return nil, fmt.Errorf("canonicalize: %v: %w", err, ErrMalformedBody)
+		return nil, fmt.Errorf("canonicalize: %w: %w", err, ErrMalformedBody)
 	}
 	return parseFromToken(decoder, token)
 }
@@ -94,7 +95,7 @@ func parseFromToken(decoder *json.Decoder, token json.Token) (any, error) {
 		for decoder.More() {
 			keyToken, err := decoder.Token()
 			if err != nil {
-				return nil, fmt.Errorf("canonicalize object key: %v: %w", err, ErrMalformedBody)
+				return nil, fmt.Errorf("canonicalize object key: %w: %w", err, ErrMalformedBody)
 			}
 			key, ok := keyToken.(string)
 			if !ok {
@@ -112,7 +113,7 @@ func parseFromToken(decoder *json.Decoder, token json.Token) (any, error) {
 			object.values[key] = value
 		}
 		if _, err := decoder.Token(); err != nil { // consume '}'
-			return nil, fmt.Errorf("canonicalize: %v: %w", err, ErrMalformedBody)
+			return nil, fmt.Errorf("canonicalize: %w: %w", err, ErrMalformedBody)
 		}
 		return object, nil
 
@@ -130,7 +131,7 @@ func parseFromToken(decoder *json.Decoder, token json.Token) (any, error) {
 			items = append(items, value)
 		}
 		if _, err := decoder.Token(); err != nil { // consume ']'
-			return nil, fmt.Errorf("canonicalize: %v: %w", err, ErrMalformedBody)
+			return nil, fmt.Errorf("canonicalize: %w: %w", err, ErrMalformedBody)
 		}
 		return items, nil
 
@@ -269,7 +270,7 @@ func writeString(out *bytes.Buffer, s string) {
 func writeNumber(out *bytes.Buffer, number json.Number) error {
 	f, err := strconv.ParseFloat(number.String(), 64)
 	if err != nil {
-		return fmt.Errorf("canonicalize number %q: %v: %w", number.String(), err, ErrMalformedBody)
+		return fmt.Errorf("canonicalize number %q: %w: %w", number.String(), err, ErrMalformedBody)
 	}
 
 	// ECMAScript renders both zeroes as "0"; -0 and 0 are the same value to ==,
@@ -333,4 +334,9 @@ func writeNumber(out *bytes.Buffer, number json.Number) error {
 	return nil
 }
 
-func errorIsEOF(err error) bool { return err == io.EOF }
+// errorIsEOF reports whether the decoder reached a clean end of input.
+//
+// errors.Is rather than ==, so an io.EOF that some future decoder wraps is
+// still recognised as the end of the document rather than misread as trailing
+// content.
+func errorIsEOF(err error) bool { return errors.Is(err, io.EOF) }

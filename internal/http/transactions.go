@@ -148,13 +148,19 @@ func writeStored(w nethttp.ResponseWriter, t *ledger.Transaction) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
+	// body is the output of json.Marshal over a struct this package defines,
+	// served as application/json, which is set immediately above. There is no
+	// HTML context for the taint analysis to be worried about, and the bytes
+	// are the ones already stored for replay -- re-encoding them here is what
+	// would make the two responses drift.
+	//nolint:gosec // G705: JSON response, not an HTML one; Content-Type is set.
 	_, _ = w.Write(body)
 }
 
 // decodeJSON strictly decodes a request body.
 //
-// DisallowUnknownFields on purpose: a client sending {"ammount": ...} has made
-// a typo that would otherwise post a zero-amount transaction, and in a ledger
+// DisallowUnknownFields on purpose: a client that misspells an amount field has
+// made a typo that would otherwise post a zero-amount transaction, and in a ledger
 // the silent interpretation of a misspelled field is a defect rather than a
 // convenience. It also matches the fingerprint's strictness, so a body that
 // canonicalizes cleanly and a body that decodes cleanly are the same set.
@@ -163,7 +169,7 @@ func decodeJSON(r io.Reader, into any) error {
 	decoder.DisallowUnknownFields()
 
 	if err := decoder.Decode(into); err != nil {
-		return fmt.Errorf("decode request body: %v: %w", err, idempotency.ErrMalformedBody)
+		return fmt.Errorf("decode request body: %w: %w", err, idempotency.ErrMalformedBody)
 	}
 	return nil
 }

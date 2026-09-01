@@ -43,7 +43,7 @@ func (r postTransactionRequest) toDomain() (ledger.TransactionRequest, error) {
 	for i, e := range r.Entries {
 		accountID, err := uuid.Parse(e.AccountID)
 		if err != nil {
-			return ledger.TransactionRequest{}, fmt.Errorf("entry %d: account_id %q is not a UUID: %v: %w",
+			return ledger.TransactionRequest{}, fmt.Errorf("entry %d: account_id %q is not a UUID: %w: %w",
 				i, e.AccountID, err, ledger.ErrInvalidEntry)
 		}
 		entries[i] = ledger.EntryRequest{

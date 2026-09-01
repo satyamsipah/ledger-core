@@ -58,37 +58,58 @@ func newAPI(t *testing.T, lease time.Duration) *httptest.Server {
 	return server
 }
 
-func post(t *testing.T, server *httptest.Server, path, key, body string) (*nethttp.Response, []byte) {
+// apiResponse is the part of a response a test needs, captured after the body
+// has been read and closed.
+//
+// A struct rather than the *http.Response itself, because handing back a
+// response whose body is already closed invites a use-after-close in a caller
+// that reasonably assumes it still owns it. Keeping the field name StatusCode
+// means an assertion reads exactly as it would against net/http.
+type apiResponse struct {
+	StatusCode int
+	Header     nethttp.Header
+}
+
+// do issues one request and drains it, returning the status, the headers and
+// the body.
+func do(t *testing.T, ctx context.Context, server *httptest.Server, method, path, key, body string) (apiResponse, []byte) {
 	t.Helper()
 
-	request, err := nethttp.NewRequest(nethttp.MethodPost, server.URL+path, strings.NewReader(body))
+	var reader io.Reader
+	if body != "" {
+		reader = strings.NewReader(body)
+	}
+
+	// NewRequestWithContext rather than NewRequest: CLAUDE.md threads a context
+	// through every call, and a test that opted out would be the one place a
+	// hung request could not be cancelled.
+	request, err := nethttp.NewRequestWithContext(ctx, method, server.URL+path, reader)
 	require.NoError(t, err)
-	request.Header.Set("Content-Type", "application/json")
+	if body != "" {
+		request.Header.Set("Content-Type", "application/json")
+	}
 	if key != "" {
 		request.Header.Set("Idempotency-Key", key)
 	}
 
 	response, err := server.Client().Do(request)
 	require.NoError(t, err)
-	defer response.Body.Close()
+	defer func() { require.NoError(t, response.Body.Close()) }()
 
 	payload, err := io.ReadAll(response.Body)
 	require.NoError(t, err)
 
-	return response, payload
+	return apiResponse{StatusCode: response.StatusCode, Header: response.Header}, payload
 }
 
-func get(t *testing.T, server *httptest.Server, path string) (*nethttp.Response, []byte) {
+func post(t *testing.T, ctx context.Context, server *httptest.Server, path, key, body string) (apiResponse, []byte) {
 	t.Helper()
+	return do(t, ctx, server, nethttp.MethodPost, path, key, body)
+}
 
-	response, err := server.Client().Get(server.URL + path)
-	require.NoError(t, err)
-	defer response.Body.Close()
-
-	payload, err := io.ReadAll(response.Body)
-	require.NoError(t, err)
-
-	return response, payload
+func get(t *testing.T, ctx context.Context, server *httptest.Server, path string) (apiResponse, []byte) {
+	t.Helper()
+	return do(t, ctx, server, nethttp.MethodGet, path, "", "")
 }
 
 func transferBody(from, to uuid.UUID, minor int64) string {
@@ -123,7 +144,7 @@ func TestAPI_PostTransaction(t *testing.T) {
 	from := newAccount(t, ctx, sharedPool, "INR", true)
 	to := newTypedAccount(t, ctx, sharedPool, ledger.AccountTypeLiability, "INR", false)
 
-	response, payload := post(t, server, "/v1/transactions", uuid.NewString(), transferBody(from, to, 2500))
+	response, payload := post(t, ctx, server, "/v1/transactions", uuid.NewString(), transferBody(from, to, 2500))
 
 	require.Equal(t, nethttp.StatusCreated, response.StatusCode, "body: %s", payload)
 	assert.Equal(t, "application/json", response.Header.Get("Content-Type"))
@@ -172,10 +193,10 @@ func TestAPI_ReplayReturnsTheStoredResponseByteForByte(t *testing.T) {
 	key := uuid.NewString()
 	body := transferBody(from, to, 900)
 
-	first, firstPayload := post(t, server, "/v1/transactions", key, body)
+	first, firstPayload := post(t, ctx, server, "/v1/transactions", key, body)
 	require.Equal(t, nethttp.StatusCreated, first.StatusCode, "body: %s", firstPayload)
 
-	second, secondPayload := post(t, server, "/v1/transactions", key, body)
+	second, secondPayload := post(t, ctx, server, "/v1/transactions", key, body)
 	require.Equal(t, nethttp.StatusCreated, second.StatusCode, "a replay keeps the original status code")
 	assert.Equal(t, "true", second.Header.Get("Idempotent-Replay"))
 	assert.Equal(t, string(firstPayload), string(secondPayload))
@@ -184,7 +205,7 @@ func TestAPI_ReplayReturnsTheStoredResponseByteForByte(t *testing.T) {
 	// rather than executing. This is the half of the contract that a stricter
 	// byte-comparison fingerprint would break.
 	reformatted := strings.ReplaceAll(strings.ReplaceAll(body, "\n", " "), "\t", "")
-	third, thirdPayload := post(t, server, "/v1/transactions", key, reformatted)
+	third, thirdPayload := post(t, ctx, server, "/v1/transactions", key, reformatted)
 	assert.Equal(t, "true", third.Header.Get("Idempotent-Replay"),
 		"whitespace is not part of a request's identity")
 	assert.Equal(t, string(firstPayload), string(thirdPayload))
@@ -202,14 +223,14 @@ func TestAPI_IdempotencyKeyErrors(t *testing.T) {
 	to := newTypedAccount(t, ctx, sharedPool, ledger.AccountTypeLiability, "INR", false)
 
 	t.Run("should reject a write with no key", func(t *testing.T) {
-		response, payload := post(t, server, "/v1/transactions", "", transferBody(from, to, 100))
+		response, payload := post(t, ctx, server, "/v1/transactions", "", transferBody(from, to, 100))
 		assert.Equal(t, nethttp.StatusBadRequest, response.StatusCode)
 		assert.Equal(t, "missing-idempotency-key", problemType(t, payload))
 		assert.Equal(t, "application/problem+json", response.Header.Get("Content-Type"))
 	})
 
 	t.Run("should reject a key that is not a UUID", func(t *testing.T) {
-		response, payload := post(t, server, "/v1/transactions", "order-1", transferBody(from, to, 100))
+		response, payload := post(t, ctx, server, "/v1/transactions", "order-1", transferBody(from, to, 100))
 		assert.Equal(t, nethttp.StatusBadRequest, response.StatusCode)
 		assert.Equal(t, "invalid-idempotency-key", problemType(t, payload))
 	})
@@ -217,10 +238,10 @@ func TestAPI_IdempotencyKeyErrors(t *testing.T) {
 	t.Run("should reject the same key with a mutated body", func(t *testing.T) {
 		key := uuid.NewString()
 
-		first, payload := post(t, server, "/v1/transactions", key, transferBody(from, to, 700))
+		first, payload := post(t, ctx, server, "/v1/transactions", key, transferBody(from, to, 700))
 		require.Equal(t, nethttp.StatusCreated, first.StatusCode, "body: %s", payload)
 
-		second, payload := post(t, server, "/v1/transactions", key, transferBody(from, to, 800))
+		second, payload := post(t, ctx, server, "/v1/transactions", key, transferBody(from, to, 800))
 		assert.Equal(t, nethttp.StatusUnprocessableEntity, second.StatusCode)
 		assert.Equal(t, "idempotency-key-reused", problemType(t, payload))
 
@@ -263,7 +284,7 @@ func TestAPI_SameKeyUnderConcurrencyPostsOnce(t *testing.T) {
 	for range goroutines {
 		group.Go(func() error {
 			<-start
-			response, payload := post(t, server, "/v1/transactions", key, body)
+			response, payload := post(t, ctx, server, "/v1/transactions", key, body)
 
 			mu.Lock()
 			defer mu.Unlock()
@@ -320,7 +341,7 @@ func TestAPI_TransientRejectionReleasesTheKey(t *testing.T) {
 	key := uuid.NewString()
 	body := transferBody(wallet, sink, 5000)
 
-	response, payload := post(t, server, "/v1/transactions", key, body)
+	response, payload := post(t, ctx, server, "/v1/transactions", key, body)
 	require.Equal(t, nethttp.StatusUnprocessableEntity, response.StatusCode)
 	assert.Equal(t, "insufficient-funds", problemType(t, payload))
 
@@ -330,10 +351,10 @@ func TestAPI_TransientRejectionReleasesTheKey(t *testing.T) {
 	// Fund the wallet, then retry the identical request under the same key. It
 	// must now succeed rather than replay the earlier refusal.
 	funder := newAccount(t, ctx, sharedPool, "INR", true)
-	fund, fundPayload := post(t, server, "/v1/transactions", uuid.NewString(), transferBody(funder, wallet, 9000))
+	fund, fundPayload := post(t, ctx, server, "/v1/transactions", uuid.NewString(), transferBody(funder, wallet, 9000))
 	require.Equal(t, nethttp.StatusCreated, fund.StatusCode, "body: %s", fundPayload)
 
-	retry, retryPayload := post(t, server, "/v1/transactions", key, body)
+	retry, retryPayload := post(t, ctx, server, "/v1/transactions", key, body)
 	assert.Equal(t, nethttp.StatusCreated, retry.StatusCode,
 		"the same key must be usable once the transient condition clears: %s", retryPayload)
 
@@ -364,7 +385,7 @@ func TestAPI_DeterministicRejectionIsCachedAndReplayed(t *testing.T) {
 		]
 	}`, from, to)
 
-	first, firstPayload := post(t, server, "/v1/transactions", key, unbalanced)
+	first, firstPayload := post(t, ctx, server, "/v1/transactions", key, unbalanced)
 	require.Equal(t, nethttp.StatusUnprocessableEntity, first.StatusCode)
 	assert.Equal(t, "unbalanced-transaction", problemType(t, firstPayload))
 
@@ -372,7 +393,7 @@ func TestAPI_DeterministicRejectionIsCachedAndReplayed(t *testing.T) {
 	require.True(t, found, "a deterministic rejection must be recorded")
 	assert.Equal(t, "FAILED", status)
 
-	second, secondPayload := post(t, server, "/v1/transactions", key, unbalanced)
+	second, secondPayload := post(t, ctx, server, "/v1/transactions", key, unbalanced)
 	assert.Equal(t, nethttp.StatusUnprocessableEntity, second.StatusCode)
 	assert.Equal(t, "true", second.Header.Get("Idempotent-Replay"))
 	assert.Equal(t, "application/problem+json", second.Header.Get("Content-Type"),
@@ -390,7 +411,7 @@ func TestAPI_ReverseTransaction(t *testing.T) {
 	from := newAccount(t, ctx, sharedPool, "INR", true)
 	to := newTypedAccount(t, ctx, sharedPool, ledger.AccountTypeLiability, "INR", false)
 
-	_, payload := post(t, server, "/v1/transactions", uuid.NewString(), transferBody(from, to, 3300))
+	_, payload := post(t, ctx, server, "/v1/transactions", uuid.NewString(), transferBody(from, to, 3300))
 	var posted struct {
 		ID string `json:"id"`
 	}
@@ -399,7 +420,7 @@ func TestAPI_ReverseTransaction(t *testing.T) {
 	key := uuid.NewString()
 	path := "/v1/transactions/" + posted.ID + "/reverse"
 
-	response, reversalPayload := post(t, server, path, key, `{"reason":"chargeback"}`)
+	response, reversalPayload := post(t, ctx, server, path, key, `{"reason":"chargeback"}`)
 	require.Equal(t, nethttp.StatusCreated, response.StatusCode, "body: %s", reversalPayload)
 
 	var reversal struct {
@@ -411,14 +432,14 @@ func TestAPI_ReverseTransaction(t *testing.T) {
 	assert.Equal(t, posted.ID, reversal.Metadata["reverses_transaction_id"])
 
 	// The reversal replays like any other write.
-	replay, replayPayload := post(t, server, path, key, `{"reason":"chargeback"}`)
+	replay, replayPayload := post(t, ctx, server, path, key, `{"reason":"chargeback"}`)
 	assert.Equal(t, "true", replay.Header.Get("Idempotent-Replay"))
 	assert.Equal(t, string(reversalPayload), string(replayPayload))
 
 	// A different key against an already-reversed transaction is a conflict,
 	// not a second reversal. Two reversals would each balance perfectly on
 	// their own, so the balance invariant would never notice the double refund.
-	conflict, conflictPayload := post(t, server, path, uuid.NewString(), `{"reason":"again"}`)
+	conflict, conflictPayload := post(t, ctx, server, path, uuid.NewString(), `{"reason":"again"}`)
 	assert.Equal(t, nethttp.StatusConflict, conflict.StatusCode)
 	assert.Equal(t, "already-reversed", problemType(t, conflictPayload))
 
@@ -439,12 +460,12 @@ func TestAPI_BalanceAndStatement(t *testing.T) {
 
 	const posts = 5
 	for range posts {
-		response, payload := post(t, server, "/v1/transactions", uuid.NewString(), transferBody(from, to, 200))
+		response, payload := post(t, ctx, server, "/v1/transactions", uuid.NewString(), transferBody(from, to, 200))
 		require.Equal(t, nethttp.StatusCreated, response.StatusCode, "body: %s", payload)
 	}
 
 	t.Run("should report the synchronous balance", func(t *testing.T) {
-		response, payload := get(t, server, "/v1/accounts/"+to.String()+"/balance")
+		response, payload := get(t, ctx, server, "/v1/accounts/"+to.String()+"/balance")
 		require.Equal(t, nethttp.StatusOK, response.StatusCode, "body: %s", payload)
 
 		var balance struct {
@@ -462,7 +483,7 @@ func TestAPI_BalanceAndStatement(t *testing.T) {
 		// RFC3339Nano, not RFC3339: second precision would truncate the
 		// instant back past entries stamped microseconds ago, and the query
 		// would correctly report a balance from before they were written.
-		response, payload := get(t, server,
+		response, payload := get(t, ctx, server,
 			"/v1/accounts/"+to.String()+"/balance?as_of="+
 				url.QueryEscape(time.Now().UTC().Format(time.RFC3339Nano)))
 		require.Equal(t, nethttp.StatusOK, response.StatusCode, "body: %s", payload)
@@ -495,7 +516,7 @@ func TestAPI_BalanceAndStatement(t *testing.T) {
 				path += "&cursor=" + cursor
 			}
 
-			response, payload := get(t, server, path)
+			response, payload := get(t, ctx, server, path)
 			require.Equal(t, nethttp.StatusOK, response.StatusCode, "body: %s", payload)
 
 			var page struct {
@@ -537,13 +558,13 @@ func TestAPI_BalanceAndStatement(t *testing.T) {
 	})
 
 	t.Run("should reject a tampered cursor", func(t *testing.T) {
-		response, payload := get(t, server, "/v1/accounts/"+to.String()+"/statement?cursor=not-a-cursor")
+		response, payload := get(t, ctx, server, "/v1/accounts/"+to.String()+"/statement?cursor=not-a-cursor")
 		assert.Equal(t, nethttp.StatusUnprocessableEntity, response.StatusCode)
 		assert.Equal(t, "invalid-entry", problemType(t, payload))
 	})
 
 	t.Run("should 404 an account that does not exist", func(t *testing.T) {
-		response, payload := get(t, server, "/v1/accounts/"+uuid.NewString()+"/balance")
+		response, payload := get(t, ctx, server, "/v1/accounts/"+uuid.NewString()+"/balance")
 		assert.Equal(t, nethttp.StatusNotFound, response.StatusCode)
 		assert.Equal(t, "account-not-found", problemType(t, payload))
 	})
@@ -560,7 +581,7 @@ func newAccountWithHistory(t *testing.T, ctx context.Context, server *httptest.S
 	account := newTypedAccount(t, ctx, sharedPool, ledger.AccountTypeLiability, "INR", false)
 
 	for range n {
-		response, payload := post(t, server, "/v1/transactions", uuid.NewString(), transferBody(funder, account, 100))
+		response, payload := post(t, ctx, server, "/v1/transactions", uuid.NewString(), transferBody(funder, account, 100))
 		require.Equal(t, nethttp.StatusCreated, response.StatusCode, "body: %s", payload)
 	}
 
@@ -641,7 +662,7 @@ func TestAPI_MalformedRequests(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			response, payload := post(t, server, "/v1/transactions", uuid.NewString(), tc.body)
+			response, payload := post(t, ctx, server, "/v1/transactions", uuid.NewString(), tc.body)
 			assert.Equal(t, tc.wantStatus, response.StatusCode, "body: %s", payload)
 			assert.Equal(t, tc.wantProblem, problemType(t, payload))
 			assert.Equal(t, "application/problem+json", response.Header.Get("Content-Type"))
@@ -653,11 +674,12 @@ func TestAPI_MalformedRequests(t *testing.T) {
 
 func TestAPI_Health(t *testing.T) {
 	t.Parallel()
+	ctx := context.Background()
 
 	server := newAPI(t, idempotency.DefaultLease)
 
 	for _, path := range []string{"/healthz", "/readyz"} {
-		response, payload := get(t, server, path)
+		response, payload := get(t, ctx, server, path)
 		assert.Equal(t, nethttp.StatusOK, response.StatusCode, "%s body: %s", path, payload)
 	}
 }

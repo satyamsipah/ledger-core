@@ -131,6 +131,7 @@ func (r *Retrier) Do(ctx context.Context, operation string, fn func(context.Cont
 		// Checked before sleeping rather than after: if the budget is already
 		// spent there is no point waiting to discover it, and the caller gets
 		// the database's own error instead of a context deadline that hides it.
+		//
 		// Both errors are wrapped, not just the database one. A caller has to be
 		// able to tell "the budget ran out mid-contention" from "this kept
 		// aborting through every attempt": the first is a capacity problem and
@@ -186,6 +187,12 @@ func (r *Retrier) backoff(attempt int) time.Duration {
 	if window > r.maxBackoff || window <= 0 { // <= 0 catches the shift overflowing
 		window = r.maxBackoff
 	}
+	// math/rand rather than crypto/rand, deliberately. This value decides when
+	// to retry, not what a secret is: an attacker who predicts it learns the
+	// millisecond a transaction will be retried at, which is worth nothing.
+	// crypto/rand would cost a syscall per retry on the contention path and can
+	// fail, which would turn a backoff into an error.
+	//nolint:gosec // G404: jitter is not a security primitive; see above.
 	return time.Duration(rand.Int64N(int64(window) + 1))
 }
 

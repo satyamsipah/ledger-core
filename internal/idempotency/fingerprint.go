@@ -106,7 +106,7 @@ func ParseKey(raw string) (string, error) {
 	}
 	parsed, err := uuid.Parse(raw)
 	if err != nil {
-		return "", fmt.Errorf("idempotency key %q: %v: %w", raw, err, ErrInvalidKey)
+		return "", fmt.Errorf("idempotency key %q: %w: %w", raw, err, ErrInvalidKey)
 	}
 	return parsed.String(), nil
 }

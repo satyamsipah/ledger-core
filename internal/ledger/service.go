@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand/v2"
 	"sort"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/satyamsipah/ledger-core/internal/idempotency"
 	"github.com/satyamsipah/ledger-core/internal/outbox"
 )
 
@@ -45,15 +47,57 @@ type EntryRequest struct {
 	Amount    Money
 }
 
+// ResponseRenderer turns a transaction that is about to commit into the exact
+// HTTP response a later retry will be handed.
+//
+// It is a callback, and the inversion is deliberate. The response has to be
+// durable at the same instant the journal entries are, which means it must be
+// produced *before* COMMIT -- so the usual middleware shape, where the response
+// is captured after the handler returns, cannot supply it. Rendering is an HTTP
+// concern and stays in the HTTP layer; the transaction boundary is a service
+// concern and stays here. A callback is the honest way to have both.
+//
+// It runs inside the database transaction, so it must not perform I/O.
+type ResponseRenderer func(*Transaction) (status int, body []byte, err error)
+
+// Idempotent binds a request to an idempotency key that has already been
+// reserved by the caller.
+//
+// Key and Render travel together because neither is useful alone: a key with no
+// renderer would leave the record IN_PROGRESS over a committed transaction --
+// precisely the state the design guarantees is unreachable -- and a renderer
+// with no key has nothing to write. Making them one struct means the broken
+// combination cannot be expressed.
+type Idempotent struct {
+	// Key is a reservation this caller already holds in IN_PROGRESS. The
+	// service does not acquire it; by the time a request reaches here, the HTTP
+	// layer has already resolved replay, conflict and in-progress.
+	Key string
+
+	// Render produces the response stored with the transaction.
+	Render ResponseRenderer
+}
+
 // TransactionRequest is a complete transaction to post. It is validated as a
 // whole before anything touches the database, so a malformed request never
 // takes a row lock.
 type TransactionRequest struct {
-	Type           TransactionType
+	Type        TransactionType
+	ExternalRef *string
+	Metadata    map[string]any
+	Entries     []EntryRequest
+
+	// IdempotencyKey populates transactions.idempotency_key, whose partial
+	// unique index is the database's own defence of invariant 5. It is set from
+	// Idempotency.Key when that is present, and may be set alone by internal
+	// callers that want the column populated without a replay record.
 	IdempotencyKey *string
-	ExternalRef    *string
-	Metadata       map[string]any
-	Entries        []EntryRequest
+
+	// Idempotency, when set, completes the reserved key inside the same
+	// database transaction as the journal entries. This is the mechanism behind
+	// invariant 5; see internal/idempotency for why the atomicity is the whole
+	// guarantee.
+	Idempotency *Idempotent
 }
 
 // Service posts and reverses transactions and answers balance questions.
@@ -84,16 +128,36 @@ func (s *Service) PostTransaction(ctx context.Context, req TransactionRequest) (
 		return nil, err
 	}
 
+	// The key reaches the transactions row whichever way the caller supplied it,
+	// so transactions_idempotency_key_key -- the defence that owes nothing to
+	// this package's correctness -- is armed either way.
+	if req.Idempotency != nil {
+		key := req.Idempotency.Key
+		req.IdempotencyKey = &key
+	}
+
+	// Generated once, OUTSIDE any retry the caller may have wrapped around this
+	// call, and reused by every attempt. A fresh id per attempt would be simpler
+	// and is wrong in one specific way: if an attempt ever did commit and was
+	// then reported as aborted, a second id would post the money twice, where a
+	// reused one collides on the primary key and says so.
 	txID, err := uuid.NewV7()
 	if err != nil {
 		return nil, fmt.Errorf("generate transaction id: %w", err)
 	}
 
-	accountIDs := sortedAccountIDs(req.Entries)
-
 	var posted *Transaction
 	err = s.repo.InTx(ctx, func(ctx context.Context, tx Tx) error {
-		accounts, err := lockAndValidate(ctx, tx, accountIDs, req.Entries)
+		// Routing happens first, inside the transaction and before any lock,
+		// because the accounts that get locked are the ones it picks.
+		entryRequests, err := routeToShards(ctx, tx, req.Entries)
+		if err != nil {
+			return err
+		}
+
+		accountIDs := sortedAccountIDs(entryRequests)
+
+		accounts, err := lockAndValidate(ctx, tx, accountIDs, entryRequests)
 		if err != nil {
 			return err
 		}
@@ -110,7 +174,7 @@ func (s *Service) PostTransaction(ctx context.Context, req TransactionRequest) (
 			return err
 		}
 
-		entries, err := buildEntries(txID, req.Entries)
+		entries, err := buildEntries(txID, entryRequests)
 		if err != nil {
 			return err
 		}
@@ -128,6 +192,15 @@ func (s *Service) PostTransaction(ctx context.Context, req TransactionRequest) (
 			return err
 		}
 
+		// Last, and inside this transaction. Everything the response describes
+		// is now present in this transaction's snapshot, so the stored body is
+		// a description of state that either becomes durable with it or
+		// disappears with it. There is no third outcome, and that absence is
+		// invariant 5.
+		if err := completeIdempotency(ctx, tx, req.Idempotency, header); err != nil {
+			return err
+		}
+
 		posted = header
 		return nil
 	})
@@ -136,6 +209,35 @@ func (s *Service) PostTransaction(ctx context.Context, req TransactionRequest) (
 	}
 
 	return posted, nil
+}
+
+// completeIdempotency renders the response and writes the terminal record,
+// inside the caller's transaction.
+//
+// Rendering happens here rather than after COMMIT because a response rendered
+// afterwards would have to be stored afterwards, and a store afterwards is a
+// second transaction -- which is the failure this whole phase is built to make
+// unreachable. The cost is that Render runs while account row locks are held,
+// so it must not do I/O; the ResponseRenderer doc comment says so.
+func completeIdempotency(ctx context.Context, tx Tx, idem *Idempotent, header *Transaction) error {
+	if idem == nil {
+		return nil
+	}
+	if idem.Render == nil {
+		return fmt.Errorf("idempotency key %s: %w", idem.Key, ErrMissingRenderer)
+	}
+
+	status, body, err := idem.Render(header)
+	if err != nil {
+		return fmt.Errorf("render response for transaction %s: %w", header.ID, err)
+	}
+
+	return tx.CompleteIdempotency(ctx, idempotency.Completion{
+		Key:            idem.Key,
+		ResponseStatus: status,
+		ResponseBody:   body,
+		TransactionID:  header.ID,
+	})
 }
 
 // ReverseTransaction undoes a posted transaction by writing a new one whose
@@ -151,6 +253,27 @@ func (s *Service) PostTransaction(ctx context.Context, req TransactionRequest) (
 // moves money back out of the receiving account, and that account may have
 // spent it. The caller has to resolve that, and no amount of retrying will.
 func (s *Service) ReverseTransaction(ctx context.Context, txID uuid.UUID, reason string) (*Transaction, error) {
+	return s.reverse(ctx, txID, reason, nil)
+}
+
+// ReverseTransactionIdempotent reverses a transaction under a reserved
+// idempotency key.
+//
+// A reversal needs idempotency at least as much as a posting does, and arguably
+// more: the status transition already makes a second reversal fail loudly, but
+// it fails with ErrAlreadyReversed, which a retrying client cannot distinguish
+// from "somebody else reversed this behind my back". Replaying the original
+// response answers the question the retry was actually asking.
+func (s *Service) ReverseTransactionIdempotent(
+	ctx context.Context,
+	txID uuid.UUID,
+	reason string,
+	idem *Idempotent,
+) (*Transaction, error) {
+	return s.reverse(ctx, txID, reason, idem)
+}
+
+func (s *Service) reverse(ctx context.Context, txID uuid.UUID, reason string, idem *Idempotent) (*Transaction, error) {
 	if reason == "" {
 		return nil, ErrReversalReasonRequired
 	}
@@ -189,6 +312,14 @@ func (s *Service) ReverseTransaction(ctx context.Context, txID uuid.UUID, reason
 		// opposite directions. Because a reversal is a per-leg mirror it stays
 		// correct for a multi-currency transaction too, each currency balancing
 		// on its own exactly as it did originally.
+		//
+		// NOT re-routed through routeToShards, and that is load-bearing rather
+		// than an omission. The original's entries already name physical
+		// accounts -- the shards its money actually went to -- so mirroring
+		// them takes the money back out of those same shards. Routing a
+		// reversal afresh would pick shards at random and could drive one
+		// negative while a sibling held the funds, turning a correction into an
+		// insufficient-funds failure on an account that plainly has the money.
 		mirrored := make([]EntryRequest, len(original.Entries))
 		for i, e := range original.Entries {
 			mirrored[i] = EntryRequest{
@@ -215,6 +346,10 @@ func (s *Service) ReverseTransaction(ctx context.Context, txID uuid.UUID, reason
 			Status:   TransactionStatusPosted,
 			Metadata: metadata,
 		}
+		if idem != nil {
+			key := idem.Key
+			header.IdempotencyKey = &key
+		}
 		if err := tx.InsertTransaction(ctx, header); err != nil {
 			return err
 		}
@@ -240,6 +375,10 @@ func (s *Service) ReverseTransaction(ctx context.Context, txID uuid.UUID, reason
 		}
 
 		if err := appendTransactionEvent(ctx, tx, EventTypeTransactionReversed, header, balances, &txID, reason); err != nil {
+			return err
+		}
+
+		if err := completeIdempotency(ctx, tx, idem, header); err != nil {
 			return err
 		}
 
@@ -427,6 +566,62 @@ func sortedAccountIDs(entries []EntryRequest) []uuid.UUID {
 		return ids[i].String() < ids[j].String()
 	})
 	return ids
+}
+
+// routeToShards rewrites entries naming a sharded account to name one of its
+// shards instead.
+//
+// # WHY RANDOM, AND WHY ONE SHARD PER ACCOUNT PER TRANSACTION
+//
+// Random because the goal is to spread row-lock contention evenly, and any
+// deterministic key would cluster. Hashing on the counterparty account, for
+// instance, sends every payment from one busy merchant to the same shard --
+// which is the original problem with extra steps. Random has no such structure
+// to be unlucky about.
+//
+// One shard per logical account per transaction, because a transaction touching
+// the same account twice would otherwise take two shard locks for one logical
+// movement: twice the lock footprint, and two balance rows moved where the
+// aggregation in applyEntries expects one.
+//
+// # WHAT THIS COSTS
+//
+// A debit is checked against the chosen shard's balance, not the logical total,
+// so a sharded account can refuse a debit it could plainly afford -- see
+// migration 000012 and D24. Safety survives (every shard is non-negative, so
+// their sum is), liveness does not. That is why sharding is only correct on
+// accounts whose traffic is effectively one-directional.
+func routeToShards(ctx context.Context, tx Tx, entries []EntryRequest) ([]EntryRequest, error) {
+	shards, err := tx.ResolveShards(ctx, sortedAccountIDs(entries))
+	if err != nil {
+		return nil, err
+	}
+	if len(shards) == 0 {
+		// Nothing here is sharded, which is the overwhelmingly common case.
+		// Returning the caller's slice untouched keeps the ordinary posting
+		// path free of any allocation this feature added.
+		return entries, nil
+	}
+
+	chosen := make(map[uuid.UUID]uuid.UUID, len(shards))
+	for accountID, ids := range shards {
+		// math/rand rather than crypto/rand: this spreads write contention
+		// across shards, and predicting which shard a payment lands on reveals
+		// nothing an attacker could use. Every shard is an equally valid home
+		// for the entry.
+		//nolint:gosec // G404: shard selection is load balancing, not a secret.
+		chosen[accountID] = ids[rand.IntN(len(ids))]
+	}
+
+	routed := make([]EntryRequest, len(entries))
+	for i, e := range entries {
+		routed[i] = e
+		if shard, ok := chosen[e.AccountID]; ok {
+			routed[i].AccountID = shard
+		}
+	}
+
+	return routed, nil
 }
 
 // lockAndValidate takes the row locks and checks everything that depends on

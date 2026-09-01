@@ -6,6 +6,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/satyamsipah/ledger-core/internal/idempotency"
 	"github.com/satyamsipah/ledger-core/internal/outbox"
 )
 
@@ -42,6 +43,19 @@ type Repository interface {
 // method here assumes the caller already holds the relevant row locks, which
 // LockAccounts is what provides.
 type Tx interface {
+	// ResolveShards maps each sharded account among ids to its shard accounts.
+	//
+	// Unsharded accounts are absent from the result rather than mapped to
+	// themselves, so the overwhelmingly common case -- nothing is sharded --
+	// is an empty map and a fast path rather than a rewrite of every entry.
+	//
+	// Called inside the transaction and before any lock is taken, because the
+	// ids that get locked are the ones this returns. Shard membership changes
+	// only through an explicit admin operation, so reading it at READ COMMITTED
+	// is safe: a shard cannot vanish under a transaction that has since locked
+	// it.
+	ResolveShards(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID][]uuid.UUID, error)
+
 	// LockAccounts takes the row locks that serialise concurrent posting, and
 	// returns each account together with its current balance.
 	//
@@ -74,6 +88,19 @@ type Tx interface {
 
 	// AppendEvent writes the outbox row that carries this change to Kafka.
 	AppendEvent(ctx context.Context, e outbox.Event) error
+
+	// CompleteIdempotency moves the request's idempotency key to COMPLETED,
+	// carrying the response that a retry will be handed.
+	//
+	// Its presence on THIS interface rather than on a store of its own is the
+	// design, not a shortcut. Every method here runs in one database
+	// transaction, so declaring the completion alongside InsertEntries is what
+	// makes "the key and the journal commit together" a property of the type
+	// rather than a convention someone has to remember. Writing it through a
+	// pool instead is the exact bug this phase exists to prevent: the money
+	// commits, the completion does not, and the retry -- correctly reasoning
+	// that IN_PROGRESS means no commit -- posts it a second time.
+	CompleteIdempotency(ctx context.Context, c idempotency.Completion) error
 }
 
 // LockedAccount is an account and its balance, read under the row locks taken

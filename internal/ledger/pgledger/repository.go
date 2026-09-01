@@ -22,6 +22,9 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/satyamsipah/ledger-core/internal/db"
+	"github.com/satyamsipah/ledger-core/internal/idempotency"
+	"github.com/satyamsipah/ledger-core/internal/idempotency/pgidem"
 	"github.com/satyamsipah/ledger-core/internal/ledger"
 	"github.com/satyamsipah/ledger-core/internal/outbox"
 )
@@ -32,10 +35,43 @@ var (
 	_ ledger.Tx         = (*txn)(nil)
 )
 
+// advisoryLockClass namespaces this service's advisory locks.
+//
+// The two-argument form of pg_advisory_xact_lock exists precisely so that
+// unrelated subsystems can share a database without colliding in a lock space
+// that is global to it. A single-argument lock keyed on an account hash would
+// be one careless hash collision away from blocking on some other component's
+// lock, and the resulting wait would be invisible in every query plan.
+const advisoryLockClass = 0x4C454447 // "LEDG"
+
 // Repository is the PostgreSQL-backed ledger repository.
 type Repository struct {
-	pool    *pgxpool.Pool
-	timeout time.Duration
+	pool          *pgxpool.Pool
+	timeout       time.Duration
+	retrier       *db.Retrier
+	advisoryLocks bool
+}
+
+// Option configures a Repository.
+type Option func(*Repository)
+
+// WithRetrier installs a retrier for aborted transactions. Without one a
+// repository still works and simply surfaces 40001 and 40P01 to the caller,
+// which is the Phase 2 behaviour.
+func WithRetrier(retrier *db.Retrier) Option {
+	return func(r *Repository) { r.retrier = retrier }
+}
+
+// WithAdvisoryLocks turns on per-account advisory locking.
+//
+// ALL OR NOTHING, PER PROCESS. Advisory locks live in a lock space entirely
+// separate from row locks, so a deployment where some write paths take them and
+// others do not has two independent lock orderings instead of the single global
+// one D11 depends on -- and two orderings is exactly the shape a deadlock needs.
+// The flag is therefore read once at startup and applied to every write path,
+// never per request.
+func WithAdvisoryLocks(enabled bool) Option {
+	return func(r *Repository) { r.advisoryLocks = enabled }
 }
 
 // New builds a repository over an existing pool.
@@ -43,9 +79,17 @@ type Repository struct {
 // The timeout bounds each logical operation rather than each statement: a
 // posting transaction that holds account row locks past its budget is blocking
 // every other writer touching those accounts, so the deadline that matters is
-// the one on the whole unit of work, not on its individual round trips.
-func New(pool *pgxpool.Pool, timeout time.Duration) *Repository {
-	return &Repository{pool: pool, timeout: timeout}
+// the one on the whole unit of work, not on its individual round trips. A
+// retried transaction is still one logical operation, so the budget covers
+// every attempt rather than resetting for each -- otherwise a five-attempt
+// retry would quietly consume five times the deadline the HTTP layer believes
+// it granted.
+func New(pool *pgxpool.Pool, timeout time.Duration, opts ...Option) *Repository {
+	r := &Repository{pool: pool, timeout: timeout}
+	for _, opt := range opts {
+		opt(r)
+	}
+	return r
 }
 
 // InTx runs fn inside one READ COMMITTED transaction.
@@ -74,10 +118,26 @@ func New(pool *pgxpool.Pool, timeout time.Duration) *Repository {
 // database itself, which enforces the overdraft CHECK and the balance trigger
 // unconditionally. A path that forgets produces a loud constraint violation,
 // not a quietly wrong balance.
+//
+// RETRIES, AND WHY THEY DO NOT CONTRADICT ANY OF THE ABOVE: the retrier only
+// re-runs 40001 and 40P01, the two aborts PostgreSQL guarantees rolled back
+// nothing. Under this isolation level and locking strategy neither should
+// occur, which is the point -- ledger_db_tx_retries_total is how "should not
+// occur" gets measured instead of assumed. See internal/db/retry.go.
 func (r *Repository) InTx(ctx context.Context, fn func(context.Context, ledger.Tx) error) error {
 	ctx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
 
+	if r.retrier == nil {
+		return r.runTx(ctx, fn)
+	}
+	return r.retrier.Do(ctx, "ledger_tx", func(ctx context.Context) error {
+		return r.runTx(ctx, fn)
+	})
+}
+
+// runTx is one attempt: begin, run, commit.
+func (r *Repository) runTx(ctx context.Context, fn func(context.Context, ledger.Tx) error) error {
 	pgTx, err := r.pool.BeginTx(ctx, pgx.TxOptions{
 		IsoLevel:   pgx.ReadCommitted,
 		AccessMode: pgx.ReadWrite,
@@ -91,7 +151,7 @@ func (r *Repository) InTx(ctx context.Context, fn func(context.Context, ledger.T
 	// connection to be destroyed rather than returned to the pool.
 	defer func() { _ = pgTx.Rollback(context.WithoutCancel(ctx)) }()
 
-	if err := fn(ctx, &txn{tx: pgTx}); err != nil {
+	if err := fn(ctx, &txn{tx: pgTx, advisoryLocks: r.advisoryLocks}); err != nil {
 		return err
 	}
 
@@ -118,11 +178,28 @@ func (r *Repository) GetBalance(ctx context.Context, accountID uuid.UUID) (ledge
 		updatedAt      time.Time
 		currency       string
 	)
+	// The physical CTE is what makes sharding invisible to every read: an
+	// ordinary account resolves to itself, a sharded one resolves to itself
+	// plus its shards, and the aggregate below is correct for both without a
+	// branch. One join deep, which is why nested sharding is forbidden.
+	//
+	// SUM(version) rather than MAX, and it is not an approximation. Each
+	// shard's version only ever increases by one per write, so their sum is
+	// monotonic and advances by exactly one per logical write -- which is the
+	// property the projector needs in order to discard a redelivered event. MAX
+	// would stall whenever a write landed on a shard that was behind.
 	err := r.pool.QueryRow(ctx, `
-		SELECT ab.available_minor, ab.pending_minor, ab.version, ab.updated_at, a.currency
-		  FROM account_balances ab
-		  JOIN accounts a ON a.id = ab.account_id
-		 WHERE ab.account_id = $1`, accountID).
+		WITH physical AS (
+		    SELECT id FROM accounts WHERE id = $1
+		    UNION ALL
+		    SELECT id FROM accounts WHERE parent_account_id = $1
+		)
+		SELECT SUM(ab.available_minor), SUM(ab.pending_minor),
+		       SUM(ab.version), MAX(ab.updated_at), a.currency
+		  FROM physical p
+		  JOIN account_balances ab ON ab.account_id = p.id
+		  JOIN accounts a ON a.id = $1
+		 GROUP BY a.currency`, accountID).
 		Scan(&availableMinor, &pendingMinor, &version, &updatedAt, &currency)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ledger.Balance{}, fmt.Errorf("account %s: %w", accountID, ledger.ErrAccountNotFound)
@@ -175,6 +252,11 @@ func (r *Repository) GetBalanceAsOf(ctx context.Context, accountID uuid.UUID, at
 		WITH acct AS (
 		    SELECT id, currency, normal_balance FROM accounts WHERE id = $1
 		),
+		physical AS (
+		    SELECT id FROM accounts WHERE id = $1
+		    UNION ALL
+		    SELECT id FROM accounts WHERE parent_account_id = $1
+		),
 		baseline AS (
 		    SELECT 0::bigint                                       AS balance_minor,
 		           '-infinity'::timestamptz                        AS through_at,
@@ -187,7 +269,7 @@ func (r *Repository) GetBalanceAsOf(ctx context.Context, accountID uuid.UUID, at
 		  FROM acct a
 		  CROSS JOIN baseline b
 		  LEFT JOIN journal_entries je
-		         ON je.account_id = a.id
+		         ON je.account_id IN (SELECT id FROM physical)
 		        AND (je.created_at, je.id) > (b.through_at, b.through_id)
 		        AND je.created_at <= $2
 		 GROUP BY a.currency, b.balance_minor`, accountID, at).
@@ -229,12 +311,17 @@ func (r *Repository) GetStatement(ctx context.Context, q ledger.StatementQuery) 
 		WITH acct AS (
 		    SELECT id, currency, normal_balance FROM accounts WHERE id = $1
 		),
+		physical AS (
+		    SELECT id FROM accounts WHERE id = $1
+		    UNION ALL
+		    SELECT id FROM accounts WHERE parent_account_id = $1
+		),
 		opening AS (
 		    SELECT COALESCE(SUM(CASE WHEN je.direction = a.normal_balance
 		                             THEN je.amount_minor ELSE -je.amount_minor END), 0) AS balance_minor
 		      FROM acct a
 		      LEFT JOIN journal_entries je
-		             ON je.account_id = a.id
+		             ON je.account_id IN (SELECT id FROM physical)
 		            AND (je.created_at, je.id) <= ($2, $3)
 		),
 		page AS (
@@ -243,7 +330,7 @@ func (r *Repository) GetStatement(ctx context.Context, q ledger.StatementQuery) 
 		           CASE WHEN je.direction = a.normal_balance
 		                THEN je.amount_minor ELSE -je.amount_minor END AS signed_minor
 		      FROM acct a
-		      JOIN journal_entries je ON je.account_id = a.id
+		      JOIN journal_entries je ON je.account_id IN (SELECT id FROM physical)
 		     WHERE (je.created_at, je.id) > ($2, $3)
 		       AND je.created_at <= $4
 		     ORDER BY je.created_at, je.id
@@ -363,7 +450,98 @@ func (r *Repository) GetStatement(ctx context.Context, q ledger.StatementQuery) 
 
 // txn implements ledger.Tx against one pgx transaction.
 type txn struct {
-	tx pgx.Tx
+	tx            pgx.Tx
+	advisoryLocks bool
+}
+
+// takeAdvisoryLocks locks each account in the advisory lock space before any
+// row lock is taken, when the feature is enabled.
+//
+// WHAT THIS BUYS, STATED HONESTLY: with the ordered row locking of D11 already
+// in place, this does not remove contention -- it moves where writers queue.
+// The gain is that they queue *earlier*: pg_advisory_xact_lock is a hash-table
+// entry, so a blocked writer stops before touching the heap, before the
+// visibility checks on accounts and account_balances, and before the buffer
+// pins those take. On an extremely hot account that shortens the critical
+// section by the cost of the reads the losers no longer perform. It is a
+// second-order effect and it is measured rather than assumed; see
+// docs/DECISIONS.md D25 for the benchmark that decides whether to enable it.
+//
+// A batch rather than one statement over unnest(), and the reason is the same
+// caveat D11 records about ORDER BY: relying on the order in which PostgreSQL
+// evaluates a function across the rows of a projection is relying on a plan
+// shape, not on anything guaranteed. Statements in a batch execute in the order
+// they were queued, which is a guarantee, and they still cost one round trip.
+// ids is already in ascending order, which is what keeps this ordering the same
+// one the row locks use.
+func (t *txn) takeAdvisoryLocks(ctx context.Context, ids []uuid.UUID) error {
+	if !t.advisoryLocks || len(ids) == 0 {
+		return nil
+	}
+
+	batch := &pgx.Batch{}
+	for _, id := range ids {
+		// hashtext rather than a Go-side hash, so the key depends only on the
+		// account id and stays identical across processes and language runtimes.
+		// Collisions cost throughput -- two unrelated accounts sharing a queue --
+		// and never correctness, because the row locks are still the thing that
+		// actually serialises the write.
+		batch.Queue(`SELECT pg_advisory_xact_lock($1::int, hashtext($2::text))`,
+			advisoryLockClass, id.String())
+	}
+
+	results := t.tx.SendBatch(ctx, batch)
+	for range ids {
+		if _, err := results.Exec(); err != nil {
+			_ = results.Close()
+			return fmt.Errorf("take advisory account locks: %w", mapError(err))
+		}
+	}
+	if err := results.Close(); err != nil {
+		return fmt.Errorf("close advisory account lock batch: %w", mapError(err))
+	}
+	return nil
+}
+
+// ResolveShards returns the shard accounts of every sharded id among ids.
+//
+// Only children are returned, never the parent itself. A sharded parent may
+// still hold a balance from before it was split -- ledger_shard_account
+// deliberately does not move it -- and that balance is counted in the logical
+// total, but routing new writes onto the parent would put 1/(n+1) of the
+// traffic back on the single row this feature exists to relieve.
+//
+// The empty result is the fast path and the common one: an installation with no
+// sharded accounts pays one indexed lookup that matches nothing, and no entry
+// is rewritten.
+func (t *txn) ResolveShards(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID][]uuid.UUID, error) {
+	rows, err := t.tx.Query(ctx, `
+		SELECT parent_account_id, id
+		  FROM accounts
+		 WHERE parent_account_id = ANY($1::uuid[])
+		   AND status = 'ACTIVE'
+		 ORDER BY parent_account_id, shard_index`, ids)
+	if err != nil {
+		return nil, fmt.Errorf("resolve account shards: %w", mapError(err))
+	}
+	defer rows.Close()
+
+	var shards map[uuid.UUID][]uuid.UUID
+	for rows.Next() {
+		var parent, shard uuid.UUID
+		if err := rows.Scan(&parent, &shard); err != nil {
+			return nil, fmt.Errorf("scan account shard: %w", err)
+		}
+		if shards == nil {
+			shards = make(map[uuid.UUID][]uuid.UUID, 1)
+		}
+		shards[parent] = append(shards[parent], shard)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("resolve account shards: %w", mapError(err))
+	}
+
+	return shards, nil
 }
 
 // LockAccounts takes the row locks that serialise concurrent posting.
@@ -400,6 +578,13 @@ type txn struct {
 // constraint reads the copy would let the two disagree without anything
 // noticing.
 func (t *txn) LockAccounts(ctx context.Context, ids []uuid.UUID) ([]ledger.LockedAccount, error) {
+	// Before the row locks, never after, and in the same ascending id order.
+	// A second lock space entered in a different order than the first is how a
+	// deadlock gets built out of two individually correct orderings.
+	if err := t.takeAdvisoryLocks(ctx, ids); err != nil {
+		return nil, err
+	}
+
 	rows, err := t.tx.Query(ctx, `
 		SELECT a.id, a.currency, a.account_type, a.normal_balance, a.status,
 		       ab.allow_negative, ab.available_minor, ab.pending_minor, ab.version
@@ -687,6 +872,16 @@ func (t *txn) AppendEvent(ctx context.Context, e outbox.Event) error {
 	return outbox.Append(ctx, t.tx, e)
 }
 
+// CompleteIdempotency marks the request's key COMPLETED inside the caller's
+// transaction, which is what keeps invariant 5 true without a second write.
+//
+// Delegated to pgidem for the same reason AppendEvent delegates to outbox: the
+// statement belongs with the table it owns, and what belongs here is the fact
+// that it is issued against t.tx and not against a pool.
+func (t *txn) CompleteIdempotency(ctx context.Context, c idempotency.Completion) error {
+	return pgidem.Complete(ctx, t.tx, c)
+}
+
 func marshalMetadata(metadata map[string]any) ([]byte, error) {
 	if len(metadata) == 0 {
 		// The column is NOT NULL DEFAULT '{}'; sending an explicit empty object
@@ -729,6 +924,18 @@ func mapError(err error) error {
 	case pgerrcode.RestrictViolation:
 		if strings.Contains(pgErr.Message, "append-only") {
 			return fmt.Errorf("%s: %w", pgErr.Message, ledger.ErrImmutableJournal)
+		}
+
+	case pgerrcode.UniqueViolation:
+		if pgErr.ConstraintName == "transactions_idempotency_key_key" {
+			// The database's own defence of invariant 5, and the only one that
+			// owes nothing to internal/idempotency being correct. It normally
+			// stays silent because the idempotency record catches a duplicate
+			// first; reaching it means the record was swept while the key it
+			// describes lived on, which is exactly what a retry arriving after
+			// the 24-hour TTL looks like. Closes the Phase 2 gap that left this
+			// surfacing as a raw unique_violation.
+			return fmt.Errorf("%s: %w", pgErr.Message, ledger.ErrDuplicateIdempotencyKey)
 		}
 
 	case pgerrcode.ForeignKeyViolation:

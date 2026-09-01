@@ -26,9 +26,42 @@ type Config struct {
 	Service       string
 	HTTP          HTTP
 	Postgres      Postgres
+	Ledger        Ledger
 	Kafka         Kafka
 	Redis         Redis
 	Observability Observability
+}
+
+// Ledger configures the write path's concurrency behaviour and the idempotency
+// lifetimes.
+type Ledger struct {
+	// AdvisoryLocks turns on per-account pg_advisory_xact_lock before the row
+	// locks. Off by default, and it is a PROCESS-WIDE switch rather than a
+	// per-request one: advisory locks are a separate lock space, so a
+	// deployment where only some write paths take them has two lock orderings
+	// instead of the single global one that makes deadlock unconstructible.
+	AdvisoryLocks bool
+
+	// MaxTxAttempts caps retries of transactions PostgreSQL aborted with 40001
+	// or 40P01. Those two alone: every other error is either ambiguous about
+	// whether it committed, or deterministic. See internal/db/retry.go.
+	MaxTxAttempts    int
+	RetryBaseBackoff time.Duration
+	RetryMaxBackoff  time.Duration
+
+	// IdempotencyTTL is how long a replay record survives. It bounds storage
+	// only -- the key itself stays reserved permanently by
+	// transactions_idempotency_key_key, so expiry can never permit a second
+	// transaction, only refuse a replay.
+	IdempotencyTTL time.Duration
+
+	// IdempotencyLease is how long one in-flight request may hold a key before
+	// another may reclaim it. Sized above the Postgres query timeout so a live
+	// request is never reclaimed out from under itself.
+	IdempotencyLease time.Duration
+
+	SweepInterval time.Duration
+	SweepBatch    int
 }
 
 // HTTP configures the public API listener. Every timeout is explicit because a
@@ -108,6 +141,16 @@ func Load(service string) (Config, error) {
 			ConnectTimeout:  envDuration("POSTGRES_CONNECT_TIMEOUT", 5*time.Second, fail),
 			QueryTimeout:    envDuration("POSTGRES_QUERY_TIMEOUT", 3*time.Second, fail),
 		},
+		Ledger: Ledger{
+			AdvisoryLocks:    envBool("LEDGER_ADVISORY_LOCKS", false, fail),
+			MaxTxAttempts:    envInt("LEDGER_MAX_TX_ATTEMPTS", 5, fail),
+			RetryBaseBackoff: envDuration("LEDGER_RETRY_BASE_BACKOFF", 5*time.Millisecond, fail),
+			RetryMaxBackoff:  envDuration("LEDGER_RETRY_MAX_BACKOFF", 250*time.Millisecond, fail),
+			IdempotencyTTL:   envDuration("IDEMPOTENCY_TTL", 24*time.Hour, fail),
+			IdempotencyLease: envDuration("IDEMPOTENCY_LEASE", 30*time.Second, fail),
+			SweepInterval:    envDuration("IDEMPOTENCY_SWEEP_INTERVAL", 5*time.Minute, fail),
+			SweepBatch:       envInt("IDEMPOTENCY_SWEEP_BATCH", 1000, fail),
+		},
 		Kafka: Kafka{
 			Brokers:       envList("KAFKA_BROKERS", []string{"localhost:9092"}),
 			ConsumerGroup: env("KAFKA_CONSUMER_GROUP", "ledger-"+service),
@@ -138,6 +181,23 @@ func Load(service string) (Config, error) {
 	if cfg.HTTP.Addr == cfg.Observability.MetricsAddr {
 		fail("%sHTTP_ADDR and %sMETRICS_ADDR must differ; metrics are not exposed publicly",
 			envPrefix, envPrefix)
+	}
+	if cfg.Ledger.MaxTxAttempts < 1 {
+		fail("%sLEDGER_MAX_TX_ATTEMPTS must be at least 1, got %d", envPrefix, cfg.Ledger.MaxTxAttempts)
+	}
+	// A lease shorter than the transaction budget would let a request still
+	// holding account row locks be declared abandoned and reclaimed by its own
+	// retry. The two would then contend for the same accounts, and the loser
+	// would abort on ErrLeaseLost -- correct, but a self-inflicted failure that
+	// looks exactly like a real one in the logs.
+	if cfg.Ledger.IdempotencyLease <= cfg.Postgres.QueryTimeout {
+		fail("%sIDEMPOTENCY_LEASE (%s) must exceed %sPOSTGRES_QUERY_TIMEOUT (%s)",
+			envPrefix, cfg.Ledger.IdempotencyLease, envPrefix, cfg.Postgres.QueryTimeout)
+	}
+	if cfg.Ledger.IdempotencyLease > cfg.Ledger.IdempotencyTTL {
+		fail("%sIDEMPOTENCY_LEASE (%s) must not exceed %sIDEMPOTENCY_TTL (%s); "+
+			"idempotency_keys_lease_within_ttl_check would reject the reservation",
+			envPrefix, cfg.Ledger.IdempotencyLease, envPrefix, cfg.Ledger.IdempotencyTTL)
 	}
 
 	if len(errs) > 0 {
@@ -177,6 +237,22 @@ func envInt(key string, fallback int, fail func(string, ...any)) int {
 		return fallback
 	}
 	v, err := strconv.Atoi(raw)
+	if err != nil {
+		fail("%s%s: %v", envPrefix, key, err)
+		return fallback
+	}
+	return v
+}
+
+// envBool parses a boolean, rejecting anything strconv does not recognise
+// rather than treating it as false. A typo in LEDGER_ADVISORY_LOCKS silently
+// meaning "off" is how a feature flag stops being a feature flag.
+func envBool(key string, fallback bool, fail func(string, ...any)) bool {
+	raw := env(key, "")
+	if raw == "" {
+		return fallback
+	}
+	v, err := strconv.ParseBool(raw)
 	if err != nil {
 		fail("%s%s: %v", envPrefix, key, err)
 		return fallback

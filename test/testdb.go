@@ -10,7 +10,10 @@ package test
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -26,8 +29,12 @@ import (
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
 
+	"github.com/satyamsipah/ledger-core/internal/db"
+	"github.com/satyamsipah/ledger-core/internal/idempotency"
+	"github.com/satyamsipah/ledger-core/internal/idempotency/pgidem"
 	"github.com/satyamsipah/ledger-core/internal/ledger"
 	"github.com/satyamsipah/ledger-core/internal/ledger/pgledger"
+	"github.com/satyamsipah/ledger-core/internal/observability"
 	"github.com/satyamsipah/ledger-core/migrations"
 )
 
@@ -37,6 +44,15 @@ const (
 	dbUser        = "ledger"
 	dbPassword    = "ledger"
 )
+
+// sharedDSN is set by TestMain and kept so that a test needing a connection of
+// its own -- one it can name, and therefore one it can have PostgreSQL
+// terminate mid-transaction -- can open it against the same container.
+//
+// It lives in this file rather than beside sharedPool in main_test.go because
+// newNamedPool below reads it, and a non-test file cannot see identifiers
+// declared in a _test.go one.
+var sharedDSN string
 
 // startPostgres brings up a container and returns its DSN. The container is
 // torn down when the test (or TestMain, via the returned func) finishes.
@@ -120,6 +136,214 @@ func newPool(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 // spurious failures and hide whatever the test was actually looking for.
 func newLedgerService(pool *pgxpool.Pool) *ledger.Service {
 	return ledger.NewService(pgledger.New(pool, 30*time.Second))
+}
+
+// newRetryingLedgerService builds a service with the retrier installed, and
+// returns the metrics registry so a test can read the retry counters back.
+//
+// The counters are the point rather than a bonus: "the ordered locking makes
+// deadlocks unconstructible" is a claim, and a contention test that does not
+// look at ledger_db_tx_retries_total{sqlstate="40P01"} cannot tell a system
+// where deadlocks never happen from one where they happen and are silently
+// retried away.
+func newRetryingLedgerService(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	advisoryLocks bool,
+) (*ledger.Service, *observability.Metrics) {
+	t.Helper()
+
+	metrics := observability.NewMetrics("test")
+	retrier := db.NewRetrier(slog.New(slog.NewTextHandler(io.Discard, nil)), metrics, 5, 0, 0)
+
+	repo := pgledger.New(pool, 30*time.Second,
+		pgledger.WithRetrier(retrier),
+		pgledger.WithAdvisoryLocks(advisoryLocks))
+
+	return ledger.NewService(repo), metrics
+}
+
+// counterValue sums a counter vector across the label sets matching want.
+//
+// Read out of the registry rather than tracked alongside it, so the number the
+// test reports is the number an operator would see on a dashboard. A test
+// counting retries in its own variable would still pass if the metric were
+// never incremented.
+func counterValue(t *testing.T, metrics *observability.Metrics, name string, want map[string]string) float64 {
+	t.Helper()
+
+	families, err := metrics.Registry().Gather()
+	require.NoError(t, err, "gather metrics")
+
+	var total float64
+	for _, family := range families {
+		if family.GetName() != name {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			labels := map[string]string{}
+			for _, pair := range metric.GetLabel() {
+				labels[pair.GetName()] = pair.GetValue()
+			}
+			matches := true
+			for key, value := range want {
+				if labels[key] != value {
+					matches = false
+					break
+				}
+			}
+			if matches {
+				total += metric.GetCounter().GetValue()
+			}
+		}
+	}
+	return total
+}
+
+// shardAccount splits an account into n shards via the migration's own
+// function, so the test exercises the code path an operator would use rather
+// than a hand-rolled set of INSERTs that could drift from it.
+func shardAccount(t *testing.T, ctx context.Context, pool *pgxpool.Pool, accountID uuid.UUID, n int) []uuid.UUID {
+	t.Helper()
+
+	_, err := pool.Exec(ctx, `SELECT ledger_shard_account($1, $2)`, accountID, n)
+	require.NoError(t, err, "shard account %s into %d", accountID, n)
+
+	rows, err := pool.Query(ctx, `
+		SELECT id FROM accounts WHERE parent_account_id = $1 ORDER BY shard_index`, accountID)
+	require.NoError(t, err)
+	defer rows.Close()
+
+	var shards []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		require.NoError(t, rows.Scan(&id))
+		shards = append(shards, id)
+	}
+	require.NoError(t, rows.Err())
+	require.Len(t, shards, n, "sharding must create exactly n shards")
+
+	return shards
+}
+
+// shardsTouched counts how many of an account's shards actually received
+// journal entries. A sharding implementation that routed everything to one
+// shard would pass every balance assertion and buy nothing, so the spread is
+// asserted directly.
+func shardsTouched(t *testing.T, ctx context.Context, pool *pgxpool.Pool, parentID uuid.UUID) int {
+	t.Helper()
+
+	var touched int
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT count(DISTINCT je.account_id)
+		  FROM journal_entries je
+		  JOIN accounts a ON a.id = je.account_id
+		 WHERE a.parent_account_id = $1`, parentID).Scan(&touched))
+
+	return touched
+}
+
+// newIdempotencyStore builds a store over the shared pool.
+func newIdempotencyStore(pool *pgxpool.Pool) *pgidem.Store {
+	return pgidem.New(pool, 30*time.Second)
+}
+
+// newIdempotencyManager builds a manager with the cache switched off.
+//
+// NoopCache rather than a fake: the cache is a read-through in front of
+// Postgres and the system is specified to be correct without it, so every test
+// here asserts the behaviour of the source of truth. A cache that changed any
+// outcome below would be a bug in the cache, and one these tests should not be
+// able to hide.
+func newIdempotencyManager(t *testing.T, pool *pgxpool.Pool, lease time.Duration) *idempotency.Manager {
+	t.Helper()
+	return idempotency.NewManager(
+		newIdempotencyStore(pool),
+		idempotency.NoopCache{},
+		observability.NewMetrics("test"),
+		idempotency.DefaultTTL,
+		lease,
+	)
+}
+
+// newNamedPool opens a single-connection pool tagged with an application_name.
+//
+// One connection and a name, because that is what makes a backend addressable:
+// a test can then have PostgreSQL terminate this exact connection, mid
+// transaction, from another session. Killing a connection out of the shared
+// pool would be a coin flip over which test's work died.
+func newNamedPool(ctx context.Context, t *testing.T, appName string) *pgxpool.Pool {
+	t.Helper()
+
+	cfg, err := pgxpool.ParseConfig(sharedDSN)
+	require.NoError(t, err, "parse dsn for named pool")
+	cfg.MaxConns = 1
+	cfg.MinConns = 1
+	cfg.ConnConfig.RuntimeParams["application_name"] = appName
+
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	require.NoError(t, err, "open named pool")
+	t.Cleanup(pool.Close)
+
+	return pool
+}
+
+// terminateBackend kills the backend running under appName, returning whether
+// it found one.
+//
+// pg_terminate_backend rather than a flag or an injected error: the rule in
+// .claude/rules/testing.md is that failure tests kill things, and the failure
+// this models -- a process or connection dying with a ledger transaction open
+// -- has to be a real severed connection for the assertion to mean anything.
+// A simulated error would exercise Go's error handling and say nothing about
+// whether PostgreSQL rolled the transaction back.
+func terminateBackend(ctx context.Context, t *testing.T, pool *pgxpool.Pool, appName string) bool {
+	t.Helper()
+
+	var killed int
+	err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		  FROM (
+		      SELECT pg_terminate_backend(pid)
+		        FROM pg_stat_activity
+		       WHERE application_name = $1
+		         AND pid <> pg_backend_pid()
+		  ) AS terminated`, appName).Scan(&killed)
+	require.NoError(t, err, "terminate backend %s", appName)
+
+	return killed > 0
+}
+
+// idempotencyRecord reads a record straight from the table, bypassing the
+// store, so an assertion about stored state cannot be satisfied by a bug in the
+// code that reads it.
+func idempotencyRecord(t *testing.T, ctx context.Context, pool *pgxpool.Pool, key string) (status string, transactionID *uuid.UUID, found bool) {
+	t.Helper()
+
+	err := pool.QueryRow(ctx, `
+		SELECT status, transaction_id FROM idempotency_keys WHERE key = $1`, key).
+		Scan(&status, &transactionID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil, false
+	}
+	require.NoError(t, err, "read idempotency record")
+
+	return status, transactionID, true
+}
+
+// countTransactionsWithKey counts transactions carrying an idempotency key.
+// This is the assertion invariant 5 actually makes, and it is deliberately made
+// against the transactions table rather than against idempotency_keys: the
+// promise is about how many transactions exist, not about how many records
+// describe them.
+func countTransactionsWithKey(t *testing.T, ctx context.Context, pool *pgxpool.Pool, key string) int {
+	t.Helper()
+
+	var count int
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*) FROM transactions WHERE idempotency_key = $1`, key).Scan(&count))
+
+	return count
 }
 
 // newAccount inserts an ACTIVE asset account, returning the id.

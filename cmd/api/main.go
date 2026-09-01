@@ -16,6 +16,10 @@ import (
 	"github.com/satyamsipah/ledger-core/internal/config"
 	"github.com/satyamsipah/ledger-core/internal/db"
 	ledgerhttp "github.com/satyamsipah/ledger-core/internal/http"
+	"github.com/satyamsipah/ledger-core/internal/idempotency"
+	"github.com/satyamsipah/ledger-core/internal/idempotency/pgidem"
+	"github.com/satyamsipah/ledger-core/internal/ledger"
+	"github.com/satyamsipah/ledger-core/internal/ledger/pgledger"
 	"github.com/satyamsipah/ledger-core/internal/observability"
 )
 
@@ -63,11 +67,43 @@ func run() error {
 
 	metrics := observability.NewMetrics(serviceName)
 
+	// The retrier re-runs only 40001 and 40P01, the two aborts PostgreSQL
+	// guarantees rolled back nothing. Advisory locking is a process-wide switch
+	// rather than a per-request one, because a second lock space entered by only
+	// some write paths would replace one global lock ordering with two.
+	retrier := db.NewRetrier(logger, metrics,
+		cfg.Ledger.MaxTxAttempts, cfg.Ledger.RetryBaseBackoff, cfg.Ledger.RetryMaxBackoff)
+
+	repository := pgledger.New(pool.Pool, cfg.Postgres.QueryTimeout,
+		pgledger.WithRetrier(retrier),
+		pgledger.WithAdvisoryLocks(cfg.Ledger.AdvisoryLocks))
+
+	ledgerService := ledger.NewService(repository)
+
+	// NoopCache: Redis is deliberately absent. Correctness never depended on it,
+	// and the cache hit-rate counter is what will decide whether the dependency
+	// is worth taking on. See docs/DECISIONS.md D22.
+	idempotencyManager := idempotency.NewManager(
+		pgidem.New(pool.Pool, cfg.Postgres.QueryTimeout),
+		idempotency.NoopCache{},
+		metrics,
+		cfg.Ledger.IdempotencyTTL,
+		cfg.Ledger.IdempotencyLease,
+	)
+
+	sweeper := idempotency.NewSweeper(
+		pgidem.New(pool.Pool, cfg.Postgres.QueryTimeout),
+		logger, metrics,
+		cfg.Ledger.SweepInterval, cfg.Ledger.SweepBatch,
+	)
+
 	router := ledgerhttp.NewRouter(ledgerhttp.Deps{
-		Service:  serviceName,
-		Logger:   logger,
-		Metrics:  metrics,
-		Checkers: []ledgerhttp.Checker{pool},
+		Service:     serviceName,
+		Logger:      logger,
+		Metrics:     metrics,
+		Checkers:    []ledgerhttp.Checker{pool},
+		Ledger:      ledgerService,
+		Idempotency: idempotencyManager,
 	})
 
 	apiServer := ledgerhttp.NewServer("api", cfg.HTTP, router, logger)
@@ -83,6 +119,11 @@ func run() error {
 	group, groupCtx := errgroup.WithContext(ctx)
 	group.Go(func() error { return apiServer.Run(groupCtx) })
 	group.Go(func() error { return metricsServer.Run(groupCtx) })
+	// Every replica sweeps. There is no leader election on purpose: the delete
+	// uses FOR UPDATE SKIP LOCKED, so replicas divide the work rather than
+	// queue behind each other, and no rolling deploy has a window with nobody
+	// sweeping. See internal/idempotency/sweeper.go.
+	group.Go(func() error { return sweeper.Run(groupCtx) })
 
 	if err := group.Wait(); err != nil && !errors.Is(err, context.Canceled) {
 		return err

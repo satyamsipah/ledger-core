@@ -16,6 +16,7 @@ import (
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
+	"github.com/satyamsipah/ledger-core/internal/idempotency"
 	"github.com/satyamsipah/ledger-core/internal/observability"
 )
 
@@ -36,6 +37,12 @@ type Deps struct {
 	Logger   *slog.Logger
 	Metrics  *observability.Metrics
 	Checkers []Checker
+
+	// Ledger and Idempotency are nil in a process that serves only health and
+	// metrics. The /v1 routes are registered only when both are present, so a
+	// misconfigured process 404s rather than panicking on the first request.
+	Ledger      LedgerService
+	Idempotency *idempotency.Manager
 }
 
 // NewRouter assembles the public API.
@@ -45,6 +52,27 @@ type Deps struct {
 // metrics/logging pair innermost so they observe the handler's real status
 // rather than one rewritten by an outer layer.
 func NewRouter(deps Deps) nethttp.Handler {
+	// otelhttp wraps the whole router so the server span covers middleware too;
+	// a span that starts inside the handler cannot show you time lost in
+	// middleware, which is exactly where surprises live.
+	return otelhttp.NewHandler(NewMux(deps), "http.server",
+		otelhttp.WithSpanNameFormatter(func(_ string, r *nethttp.Request) string {
+			if route := chi.RouteContext(r.Context()); route != nil && route.RoutePattern() != "" {
+				return r.Method + " " + route.RoutePattern()
+			}
+			return r.Method
+		}),
+	)
+}
+
+// NewMux builds the router without the tracing wrapper.
+//
+// Exported so the OpenAPI conformance test can walk the registered routes with
+// chi.Walk and compare them against api/openapi.yaml in both directions. That
+// matters more than it looks: a specification nobody checks is a specification
+// that drifts, and the drift is discovered by a client integrating against a
+// path that no longer exists.
+func NewMux(deps Deps) chi.Router {
 	r := chi.NewRouter()
 
 	r.Use(chimiddleware.RequestID)
@@ -63,20 +91,30 @@ func NewRouter(deps Deps) nethttp.Handler {
 	r.Get("/healthz", handleLive())
 	r.Get("/readyz", handleReady(deps.Checkers, deps.Logger))
 
-	// Phase 1 exposes no ledger endpoints. /v1 exists so the versioning
-	// decision is made now, while it is free, rather than after the first
-	// client has hardcoded an unversioned path.
-	r.Route("/v1", func(r chi.Router) {})
+	r.Route("/v1", func(r chi.Router) {
+		if deps.Ledger == nil || deps.Idempotency == nil {
+			return
+		}
 
-	// otelhttp wraps the whole router so the server span covers middleware too;
-	// a span that starts inside the handler cannot show you time lost in
-	// middleware, which is exactly where surprises live.
-	return otelhttp.NewHandler(r, "http.server",
-		otelhttp.WithSpanNameFormatter(func(_ string, r *nethttp.Request) string {
-			if route := chi.RouteContext(r.Context()); route != nil && route.RoutePattern() != "" {
-				return r.Method + " " + route.RoutePattern()
-			}
-			return r.Method
-		}),
-	)
+		r.Route("/transactions", func(r chi.Router) {
+			// Idempotency wraps only the write routes, and it is REQUIRED on
+			// them rather than optional. An optional idempotency key is one a
+			// client forgets under exactly the conditions -- timeouts, retries,
+			// a partial outage -- that make it matter, and the first time that
+			// happens it is a duplicate payment rather than a lesson.
+			r.With(requireIdempotency(deps.Idempotency, deps.Logger)).
+				Post("/", handlePostTransaction(deps.Ledger))
+			r.With(requireIdempotency(deps.Idempotency, deps.Logger)).
+				Post("/{id}/reverse", handleReverseTransaction(deps.Ledger))
+		})
+
+		// Reads take no key: they create nothing, so there is nothing for a
+		// retry to duplicate.
+		r.Route("/accounts", func(r chi.Router) {
+			r.Get("/{id}/balance", handleGetBalance(deps.Ledger))
+			r.Get("/{id}/statement", handleGetStatement(deps.Ledger))
+		})
+	})
+
+	return r
 }

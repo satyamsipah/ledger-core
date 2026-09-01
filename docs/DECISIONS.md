@@ -414,48 +414,71 @@ reversing it removes the trigger. Deleting balance rows on the way down would
 discard live balances for every account created while it was installed, which is
 data loss dressed up as a rollback.
 
-### D19. `chi middleware.RealIP` is a known vulnerability, deliberately left in place
+### D19. Client IP: bounded trusted-hop parsing replaces `chi middleware.RealIP`
 
-**Not decided.** Deferred to Phase 3, when the HTTP gateway design specifies what
-sits in front of this service.
+**Decided, resolving the gap this entry carried since Phase 1.** The deferral's
+own reasoning was sound at the time — getting this right needs a real topology,
+and guessing one and encoding the guess as a security control is how these
+holes are created — but three phases is long enough for "we don't know the
+topology yet" to become indistinguishable from "we never will," and the actual
+fix does not require knowing it after all. It requires being **honest** about
+not knowing it, which is a different and answerable problem.
 
-`internal/http/router.go` uses `chi`'s `middleware.RealIP`, which upstream has
-deprecated as a security issue rather than merely as an old API
-(GHSA-3fxj-6jh8-hvhx, GHSA-rjr7-jggh-pgcp, GHSA-9g5q-2w5x-hmxf). It overwrites
-`r.RemoteAddr` from the leftmost `X-Forwarded-For` value, or from
-`True-Client-IP` / `X-Real-IP`, **whether or not the infrastructure in front
-actually sets those headers**. Every one of them is client-controlled, so with
-no trusted proxy stripping them, any caller can assert any source address.
+**What was wrong, restated for the record.** `chi`'s `middleware.RealIP`
+(deprecated upstream as a security issue: GHSA-3fxj-6jh8-hvhx,
+GHSA-rjr7-jggh-pgcp, GHSA-9g5q-2w5x-hmxf) overwrote `r.RemoteAddr` from the
+leftmost `X-Forwarded-For` entry or from `X-Real-IP`, **unconditionally** —
+whether or not anything in front of this service actually set those headers.
+Every one of them is client-controlled by default, so any caller could assert
+any source address, evading an IP-based control and attributing its own traffic
+to someone else's address in the same motion.
 
-**Why this matters here specifically.** `r.RemoteAddr` is what the request log
-records, and it is what per-IP rate limiting and fraud signals will read once
-they exist. A spoofable client IP means an attacker can both evade an IP-based
-limit and attribute their own requests to somebody else's address in the audit
-trail — and an audit trail that can be written by the party being audited is
-worse than none, because it is trusted.
+**The fix: `internal/http/clientip.go`, a bounded trusted-hop parser of
+`X-Forwarded-For`, configured by `LEDGER_TRUSTED_PROXY_HOPS` (default `0`).**
+Each proxy between a client and this service appends the address it received
+the request *from* to the right of the header. With `hops` proxies this
+deployment actually trusts, the real client address sits exactly `hops`
+positions from the right; anything further left was written by the client
+itself or by an untrusted hop. `hops=0` — today's actual deployment, nothing
+sits in front of this service — means the header is **ignored outright** and
+the resolved address is always the raw TCP peer, which a caller cannot forge
+without controlling the network path itself. That is what makes `0` a safe
+default rather than a placeholder: it closes the vulnerability without
+asserting a topology that does not exist.
 
-**Why it is not fixed in this phase.** The correct behaviour is not a library
-choice, it is a deployment fact. Getting it right means either trusting exactly
-the *n* rightmost hops of `X-Forwarded-For`, where *n* is the number of proxies
-actually in the path, or trusting one specific header that one specific load
-balancer is known to set and to strip from inbound requests. Both require
-knowing the topology — which reverse proxy or load balancer, how many hops,
-whether the service is ever reachable directly — and that is exactly what the
-Phase 3 gateway design has to pin down. Picking a header now would mean guessing
-the topology and encoding the guess as a security control, which is how these
-holes are created in the first place.
+**`X-Real-IP` and `True-Client-IP` are no longer read, at any hop count.**
+Both are single-value headers with no chaining semantics: trusting one means
+trusting that a specific proxy unconditionally *overwrites* whatever the
+client sent, a claim this code has no way to verify from where it sits.
+`X-Forwarded-For`'s comma-separated chain is the one signal whose trustworthy
+prefix is actually computable from a hop count, which is why it is the only
+header this bounds. This is a strictly narrower trust surface than `RealIP`
+had, not merely a reimplementation of it.
 
-**Status:** the call site carries a scoped `//nolint:staticcheck` pointing back
-at this entry, so CI is green and a real regression elsewhere is still visible —
-a permanently red required job stops being a signal within about a week, and the
-next genuine failure hides inside it.
+**Rejected: dropping IP trust entirely, with no replacement and no config
+knob.** `r.RemoteAddr` would always be the raw socket peer, correct in every
+deployment this service runs in today. Rejected because it reproduces the
+exact shape of gap this entry already went through once: the day a real
+reverse proxy is placed in front of this service, someone has to come back and
+touch this code again rather than set an environment variable. A config knob
+that defaults to the safe answer costs nothing today and removes that future
+trip entirely.
 
-The cost of that is honest: the reminder is now a comment rather than a failing
-build, and comments are easier to walk past. Two things carry it instead. The
-suppression is on the single line, so it expires the moment the middleware is
-touched. And **until the trust model is chosen, `r.RemoteAddr` must not be
-treated as trustworthy** — not for rate limiting, not for fraud signals, not for
-audit. Anything built on it before Phase 3 inherits the spoofability.
+**Consequence: `remote_addr` is now logged.** The request logger
+(`internal/http/middleware.go`) previously recorded no client address at all —
+the promise that `r.RemoteAddr` "is what the request log records" was aspirational,
+not actual. It is safe to make good on now: every value reaching the logger has
+already passed through `clientIP`, so it is either the unforgeable TCP peer or
+an address a configured, trusted hop actually vouched for, never raw client
+input.
+
+**Verification.** `TestClientIP_IgnoresSpoofedHeadersByDefault` sends
+`X-Forwarded-For`, `X-Real-IP` and `True-Client-IP` all carrying a spoofed
+address at `hops=0` and asserts the resolved address is the real TCP peer — the
+exact scenario `chi.RealIP` got wrong. `TestClientIP_TrustsExactlyTheConfiguredHopCount`
+covers one and two trusted hops, a chain shorter than the configured hop
+count (falls back to the socket peer rather than guessing), a missing header,
+and a trusted entry that fails to parse as an address.
 
 ### Known gaps carried into Phase 3
 
@@ -1548,8 +1571,6 @@ path — so backlog must be judged from the topic, not from that column.
 
 ### Known gaps carried into Phase 6
 
-- **The client IP is still spoofable (D19).** Unchanged, now two phases overdue.
-  Nothing added here reads `r.RemoteAddr`.
 - **The idempotency key namespace is still global and unauthenticated (D24).**
   `saga_instances.idempotency_key` inherits it exactly: anyone who guesses
   another caller's key can read that caller's saga, which now includes account

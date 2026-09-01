@@ -133,6 +133,14 @@ type HTTP struct {
 	WriteTimeout    time.Duration
 	IdleTimeout     time.Duration
 	ShutdownTimeout time.Duration
+
+	// TrustedProxyHops is how many rightmost X-Forwarded-For entries clientIP
+	// (D19) treats as written by infrastructure this deployment vouches for.
+	// Zero -- the default -- means nothing is trusted and the header is
+	// ignored outright, which is correct for today's actual deployment
+	// (nothing sits in front of this service) and safe for any deployment this
+	// value has not been explicitly set for.
+	TrustedProxyHops int
 }
 
 // Postgres configures the connection pool. QueryTimeout is the default budget
@@ -208,11 +216,12 @@ func Load(service string) (Config, error) {
 		Env:     env("ENV", "local"),
 		Service: service,
 		HTTP: HTTP{
-			Addr:            env("HTTP_ADDR", ":8080"),
-			ReadTimeout:     envDuration("HTTP_READ_TIMEOUT", 5*time.Second, fail),
-			WriteTimeout:    envDuration("HTTP_WRITE_TIMEOUT", 10*time.Second, fail),
-			IdleTimeout:     envDuration("HTTP_IDLE_TIMEOUT", 60*time.Second, fail),
-			ShutdownTimeout: envDuration("HTTP_SHUTDOWN_TIMEOUT", 15*time.Second, fail),
+			Addr:             env("HTTP_ADDR", ":8080"),
+			ReadTimeout:      envDuration("HTTP_READ_TIMEOUT", 5*time.Second, fail),
+			WriteTimeout:     envDuration("HTTP_WRITE_TIMEOUT", 10*time.Second, fail),
+			IdleTimeout:      envDuration("HTTP_IDLE_TIMEOUT", 60*time.Second, fail),
+			ShutdownTimeout:  envDuration("HTTP_SHUTDOWN_TIMEOUT", 15*time.Second, fail),
+			TrustedProxyHops: envInt("TRUSTED_PROXY_HOPS", 0, fail),
 		},
 		Postgres: Postgres{
 			DSN:             env("POSTGRES_DSN", "postgres://ledger:ledger@localhost:5432/ledger?sslmode=disable"),
@@ -289,6 +298,9 @@ func Load(service string) (Config, error) {
 	}
 	if cfg.Ledger.MaxTxAttempts < 1 {
 		fail("%sLEDGER_MAX_TX_ATTEMPTS must be at least 1, got %d", envPrefix, cfg.Ledger.MaxTxAttempts)
+	}
+	if cfg.HTTP.TrustedProxyHops < 0 {
+		fail("%sTRUSTED_PROXY_HOPS must not be negative, got %d", envPrefix, cfg.HTTP.TrustedProxyHops)
 	}
 	// A lease shorter than the transaction budget would let a request still
 	// holding account row locks be declared abandoned and reclaimed by its own

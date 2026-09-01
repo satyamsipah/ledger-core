@@ -50,6 +50,10 @@ type Deps struct {
 	// dashboard backend gets Sagas without Payout.
 	Payout PayoutService
 	Sagas  SagaReader
+
+	// TrustedProxyHops configures clientIP. Zero -- the default -- trusts
+	// nothing in X-Forwarded-For and always uses the raw socket peer. See D19.
+	TrustedProxyHops int
 }
 
 // NewRouter assembles the public API.
@@ -83,14 +87,12 @@ func NewMux(deps Deps) chi.Router {
 	r := chi.NewRouter()
 
 	r.Use(chimiddleware.RequestID)
-	// RealIP trusts client-controlled headers, so the address it writes into
-	// r.RemoteAddr is spoofable until something in front strips them. Suppressed
-	// rather than fixed because the correct behaviour depends on the deployment
-	// topology -- which proxy, how many hops -- and that is settled by the Phase 3
-	// gateway design. Do not treat r.RemoteAddr as trustworthy for rate limiting,
-	// fraud signals, or audit until then. See docs/DECISIONS.md D19.
-	//nolint:staticcheck // SA1019: deliberate, tracked as a known gap in D19.
-	r.Use(chimiddleware.RealIP)
+	// clientIP replaces chi's deprecated RealIP with a bounded trusted-hop
+	// parser of X-Forwarded-For. TrustedProxyHops defaults to 0 -- nothing sits
+	// in front of this service today -- which means every forwarded-for header
+	// is ignored outright and r.RemoteAddr is the raw, unforgeable TCP peer.
+	// See docs/DECISIONS.md D19.
+	r.Use(clientIP(deps.TrustedProxyHops))
 	r.Use(recoverer(deps.Logger))
 	r.Use(requestLogger(deps.Logger))
 	r.Use(requestMetrics(deps.Metrics))

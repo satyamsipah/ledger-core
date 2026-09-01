@@ -112,14 +112,15 @@ func run() error {
 	})
 
 	router := ledgerhttp.NewRouter(ledgerhttp.Deps{
-		Service:     serviceName,
-		Logger:      logger,
-		Metrics:     metrics,
-		Checkers:    []ledgerhttp.Checker{pool},
-		Ledger:      ledgerService,
-		Idempotency: idempotencyManager,
-		Payout:      payoutStarter,
-		Sagas:       sagaStore,
+		Service:          serviceName,
+		Logger:           logger,
+		Metrics:          metrics,
+		Checkers:         []ledgerhttp.Checker{pool},
+		Ledger:           ledgerService,
+		Idempotency:      idempotencyManager,
+		Payout:           payoutStarter,
+		Sagas:            sagaStore,
+		TrustedProxyHops: cfg.HTTP.TrustedProxyHops,
 	})
 
 	apiServer := ledgerhttp.NewServer("api", cfg.HTTP, router, logger)

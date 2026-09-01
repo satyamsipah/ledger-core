@@ -11,6 +11,13 @@ written yet does something unanticipated.
 
 ## Status
 
+**Security fix, ahead of Phase 6: D19 (spoofable client IP) is closed**, three
+phases after it was first flagged and deliberately left open rather than
+guessed at. `internal/http/clientip.go` replaces chi's deprecated `RealIP`
+with a bounded trusted-hop parser of `X-Forwarded-For`, defaulting to trusting
+nothing -- correct for this service's actual deployment today. See D19 in
+[docs/DECISIONS.md](docs/DECISIONS.md).
+
 **Phase 5 complete: multi-step, multi-party money movement that stays correct
 when a step fails halfway.** A marketplace payout debits a customer wallet into
 platform suspense, calls an external payment gateway, and settles to the

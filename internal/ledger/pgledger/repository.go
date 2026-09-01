@@ -27,6 +27,8 @@ import (
 	"github.com/satyamsipah/ledger-core/internal/idempotency/pgidem"
 	"github.com/satyamsipah/ledger-core/internal/ledger"
 	"github.com/satyamsipah/ledger-core/internal/outbox"
+	"github.com/satyamsipah/ledger-core/internal/saga"
+	"github.com/satyamsipah/ledger-core/internal/saga/pgsaga"
 )
 
 // Compile-time proof that this package satisfies the ports it claims to.
@@ -891,6 +893,37 @@ func (t *txn) MarkReversed(ctx context.Context, id uuid.UUID) error {
 // what keeps invariant 6 true without a distributed transaction.
 func (t *txn) AppendEvent(ctx context.Context, e outbox.Event) error {
 	return outbox.Append(ctx, t.tx, e)
+}
+
+// ApplyPendingDelta moves pending_minor inside the caller's transaction.
+//
+// No version bump and no last_entry_id: a hold is not a journal entry and has
+// no entry to point at. See the port's doc comment for why consuming a version
+// here would confuse the projector for nothing.
+func (t *txn) ApplyPendingDelta(ctx context.Context, d ledger.PendingDelta) error {
+	tag, err := t.tx.Exec(ctx, `
+		UPDATE account_balances
+		   SET pending_minor = pending_minor + $2
+		 WHERE account_id = $1`,
+		d.AccountID, d.DeltaMinor)
+	if err != nil {
+		return fmt.Errorf("apply pending delta %d to account %s: %w",
+			d.DeltaMinor, d.AccountID, mapError(err))
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("apply pending delta to account %s: %w", d.AccountID, ledger.ErrAccountNotFound)
+	}
+	return nil
+}
+
+// CommitSagaStep records the step and advances the saga inside the caller's
+// transaction.
+//
+// Delegated to pgsaga for the same reason AppendEvent delegates to outbox: the
+// statements belong with the tables they own, and what belongs here is the fact
+// that they are issued against t.tx and not against a pool.
+func (t *txn) CommitSagaStep(ctx context.Context, c saga.StepCommit) error {
+	return pgsaga.CommitStep(ctx, t.tx, c)
 }
 
 // CompleteIdempotency marks the request's key COMPLETED inside the caller's

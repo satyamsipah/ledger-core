@@ -74,6 +74,24 @@ type EntryRequest struct {
 // It runs inside the database transaction, so it must not perform I/O.
 type ResponseRenderer func(*Transaction) (status int, body []byte, err error)
 
+// Recorder is caller-supplied work that runs inside the ledger's transaction,
+// after the entries and balance deltas are applied and before COMMIT.
+//
+// It exists so a saga's state transition can be made durable at the same
+// instant as the money it describes. The alternative -- post, then record in a
+// second transaction -- is the shape docs/DECISIONS.md D20 rejected on the
+// write path, and it is worse here: the step being replayed after a crash is a
+// debit against a customer's wallet rather than a duplicate response.
+//
+// Like ResponseRenderer it runs while account row locks are held, so it must
+// not perform I/O. Unlike ResponseRenderer it is handed the transaction, which
+// is what lets it write through Tx's own narrow set of statements rather than
+// through a pool. There is deliberately no way to reach the raw pgx.Tx from
+// here: a caller that could would be able to take locks outside the single
+// global ordering D11 depends on, which is the one thing the pgledger package
+// exists to prevent.
+type Recorder func(ctx context.Context, tx Tx, posted *Transaction) error
+
 // Idempotent binds a request to an idempotency key that has already been
 // reserved by the caller.
 //
@@ -112,6 +130,11 @@ type TransactionRequest struct {
 	// invariant 5; see internal/idempotency for why the atomicity is the whole
 	// guarantee.
 	Idempotency *Idempotent
+
+	// Record, when set, runs inside the same database transaction as the
+	// journal entries. The saga orchestrator uses it to advance a saga's status
+	// and write its audit row atomically with the money movement they describe.
+	Record Recorder
 }
 
 // Service posts and reverses transactions and answers balance questions.
@@ -323,6 +346,17 @@ func (s *Service) PostTransaction(ctx context.Context, req TransactionRequest) (
 			return err
 		}
 
+		// Before the idempotency completion, so that a Recorder returning an
+		// error aborts the whole transaction with the journal entries still
+		// uncommitted. A saga whose transition is refused -- because another
+		// orchestrator took its lease and moved it on -- must not leave the
+		// money moved.
+		if req.Record != nil {
+			if err := req.Record(ctx, tx, header); err != nil {
+				return err
+			}
+		}
+
 		// Last, and inside this transaction. Everything the response describes
 		// is now present in this transaction's snapshot, so the stored body is
 		// a description of state that either becomes durable with it or
@@ -384,7 +418,7 @@ func completeIdempotency(ctx context.Context, tx Tx, idem *Idempotent, header *T
 // moves money back out of the receiving account, and that account may have
 // spent it. The caller has to resolve that, and no amount of retrying will.
 func (s *Service) ReverseTransaction(ctx context.Context, txID uuid.UUID, reason string) (*Transaction, error) {
-	return s.reverse(ctx, txID, reason, nil)
+	return s.reverse(ctx, txID, reason, nil, nil)
 }
 
 // ReverseTransactionIdempotent reverses a transaction under a reserved
@@ -401,10 +435,27 @@ func (s *Service) ReverseTransactionIdempotent(
 	reason string,
 	idem *Idempotent,
 ) (*Transaction, error) {
-	return s.reverse(ctx, txID, reason, idem)
+	return s.reverse(ctx, txID, reason, idem, nil)
 }
 
-func (s *Service) reverse(ctx context.Context, txID uuid.UUID, reason string, idem *Idempotent) (*Transaction, error) {
+// ReverseTransactionRecorded reverses a transaction and runs record inside the
+// same database transaction.
+//
+// This is how a saga compensates. The compensation's journal entries and the
+// saga's move to COMPENSATED become durable together, so an orchestrator that
+// dies immediately after compensating cannot come back and compensate again --
+// and a compensation that the saga's own state refuses cannot leave money
+// moved.
+func (s *Service) ReverseTransactionRecorded(
+	ctx context.Context,
+	txID uuid.UUID,
+	reason string,
+	record Recorder,
+) (*Transaction, error) {
+	return s.reverse(ctx, txID, reason, nil, record)
+}
+
+func (s *Service) reverse(ctx context.Context, txID uuid.UUID, reason string, idem *Idempotent, record Recorder) (*Transaction, error) {
 	if reason == "" {
 		return nil, ErrReversalReasonRequired
 	}
@@ -507,6 +558,15 @@ func (s *Service) reverse(ctx context.Context, txID uuid.UUID, reason string, id
 
 		if err := appendTransactionEvent(ctx, tx, EventTypeTransactionReversed, header, balances, &txID, reason); err != nil {
 			return err
+		}
+
+		// Same ordering as the posting path: the recorder runs before the
+		// idempotency completion, so refusing the saga transition takes the
+		// compensation's journal entries down with it.
+		if record != nil {
+			if err := record(ctx, tx, header); err != nil {
+				return err
+			}
 		}
 
 		if err := completeIdempotency(ctx, tx, idem, header); err != nil {

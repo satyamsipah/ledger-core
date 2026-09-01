@@ -8,6 +8,7 @@ import (
 
 	"github.com/satyamsipah/ledger-core/internal/idempotency"
 	"github.com/satyamsipah/ledger-core/internal/outbox"
+	"github.com/satyamsipah/ledger-core/internal/saga"
 )
 
 // Repository is the persistence port for the ledger.
@@ -108,6 +109,37 @@ type Tx interface {
 	// commits, the completion does not, and the retry -- correctly reasoning
 	// that IN_PROGRESS means no commit -- posts it a second time.
 	CompleteIdempotency(ctx context.Context, c idempotency.Completion) error
+
+	// ApplyPendingDelta moves account_balances.pending_minor, the hold a saga
+	// places on value that has left one account and not yet reached its final
+	// one.
+	//
+	// It does NOT bump version, and that is deliberate. version is the
+	// monotonic counter the Kafka projector uses to discard a redelivered
+	// balance event (D12), and it describes available_minor -- the number the
+	// projection actually stores. Consuming a version for a change the
+	// projection does not track would make the projector see a gap it cannot
+	// explain, for no benefit: pending_minor is not part of any projected
+	// balance.
+	//
+	// The caller must already hold the account's row lock. In practice that is
+	// free rather than a discipline to remember, because the only account a
+	// pending delta is ever applied to is one this same transaction is posting
+	// entries against, so LockAccounts has already taken it in D11's order.
+	ApplyPendingDelta(ctx context.Context, d PendingDelta) error
+
+	// CommitSagaStep records a saga's completed step and advances the saga to
+	// its next status, inside this transaction.
+	//
+	// It is on THIS interface for the identical reason CompleteIdempotency is,
+	// and the reason is worth restating because sagas raise the stakes: every
+	// method here runs in one database transaction, so declaring the saga
+	// transition alongside InsertEntries makes "the step and the money commit
+	// together" a property of the type rather than a convention. Writing it
+	// through a pool instead reproduces D20's rejected three-transaction shape,
+	// where the work commits, the bookkeeping does not, and the resumed
+	// orchestrator re-runs a step that has already debited a customer.
+	CommitSagaStep(ctx context.Context, c saga.StepCommit) error
 }
 
 // LockedAccount is an account and its balance, read under the row locks taken
@@ -146,6 +178,32 @@ type BalanceDelta struct {
 	// LastEntryID is the final entry of this transaction touching the account,
 	// giving the balance row a pointer back into the journal that produced it.
 	LastEntryID uuid.UUID
+}
+
+// PendingDelta is a movement of one account's pending_minor: the semantic lock
+// a saga holds while value is in flight.
+//
+// WHAT THIS DOES AND DOES NOT PREVENT, because the distinction decides whether
+// the whole hold is real or decorative. account_balances_no_overdraft_check is
+// `allow_negative OR available_minor >= 0` and does not mention pending_minor,
+// so incrementing this column does NOT stop a concurrent debit. It is not the
+// double-spend guard and must not be relied on as one -- in the payout saga
+// that guard is the suspense debit itself, which moves the money out of the
+// wallet where the ordinary CHECK already protects it.
+//
+// What this column IS is the answer to "how much of what this account holds is
+// spoken for by an unfinished saga", which is what makes the intermediate state
+// of a saga self-describing rather than merely visible. It is also a second,
+// independently-derived number: the sum of the suspense account's pending_minor
+// must equal the sum of the amounts of every non-terminal saga, and the two
+// disagreeing is a real signal in the same way D1's three balances are.
+type PendingDelta struct {
+	AccountID uuid.UUID
+
+	// DeltaMinor is signed: positive places a hold, negative releases one. The
+	// CHECK (pending_minor >= 0) on the column is what catches a double
+	// release, which is the likeliest way this gets used wrongly.
+	DeltaMinor int64
 }
 
 // StatementCursor is a keyset position in an account's journal.

@@ -967,3 +967,211 @@ produce equivalent Kafka messages. That is why the full event envelope
 `outbox.payload` — see D32. The Debezium connector's job shrinks to "put the
 `payload` column on Kafka verbatim," which is the only shape in which its
 output and the polling publisher's output are indistinguishable to a consumer.
+
+---
+
+## Phase 4 continued — the event schema, ordering, and the projector
+
+### D32. The event envelope, event types, and what "partition key = account_id" actually guarantees
+
+**Decided.** Every event carries `event_id` (UUIDv7), `event_type`, `event_version`
+(int, replacing the `.v1`-suffix scheme Phase 3 used — see D31's opening), `aggregate_id`,
+`occurred_at`, `trace_id`, and `payload`, assembled once in `outbox.Append` and stored as
+the *entirety* of `outbox.payload`.
+
+Five event types: `TransactionPosted`, `TransactionReversed`, `AccountCreated`,
+`BalanceUpdated`, `SagaStepCompleted` (declared; the saga orchestrator that would emit it
+does not exist yet — Phase 1's `internal/saga` package is still a reserved stub).
+
+**The keying decision, stated precisely, because it is the one place this design could
+have quietly been wrong.** A transaction inherently touches two or more accounts
+(double-entry), so it cannot be honestly keyed by a single `account_id` — the alternative
+would be picking one account arbitrarily (misleading) or fanning one domain fact out into
+several outbox rows (multiplies writes for one event). So:
+
+- `TransactionPosted` / `TransactionReversed` land on `ledger.events.transaction`, keyed by
+  **transaction_id**.
+- `BalanceUpdated` — new this phase, one emitted per account a transaction actually
+  touched, carrying that account's *resulting* balance and version (a set, not a delta,
+  for the same reason `eventBalance` already worked this way inside `transactionEvent`) —
+  lands on `ledger.events.account`, keyed by **account_id**. This is where "partition key
+  = account_id" actually applies.
+
+**What that keying guarantees, precisely:** every event that ever mentions a given
+account — across every transaction that has touched it, from the beginning of that
+account's history — is delivered to one consumer, in the same order those rows committed
+(WAL/LSN order under Debezium; see D31). True per-account ordering, for free.
+
+**What it does not guarantee, and this is the part worth being explicit about:** a single
+transfer's debit-side and credit-side `BalanceUpdated` events land on **two different
+accounts' partitions**, with **no ordering relationship between them**. A consumer that
+has processed the debit cannot assume the credit has arrived, or vice versa. Anything that
+needs both sides visible together — reconstructing one transfer's net effect, say — cannot
+get that from Kafka partition ordering alone and must join on `aggregate_id`
+(`transaction_id`, carried inside `BalanceUpdated`'s payload) or read `TransactionPosted`
+instead, which carries every touched account's resulting balance in one message.
+
+**Why the projector consumes `TransactionPosted`, not `BalanceUpdated`, and why that
+sidesteps the gap above entirely:** because the payload carries the *resulting* balance
+and version per account rather than a delta, applying it is a version compare-and-set —
+`UPDATE ... WHERE version < $new`. That is correct regardless of arrival order or
+redelivery, so the projector never needs the per-account ordering `BalanceUpdated`'s
+keying provides. `BalanceUpdated` is kept anyway, for a different, real audience: a
+lighter-weight, per-account consumer (cache invalidation, a notification service) that
+wants the ordering guarantee and does not want the whole transaction shape.
+
+**`AccountCreated` needed a service method that did not exist.** Before this phase,
+accounts only ever came from seed SQL or raw migrations — there was no service-layer
+creation path to hang an event off of. `ledger.Service.CreateAccount` was added, mirroring
+`PostTransaction`'s shape (insert the row, append the event, one transaction). A DB
+trigger mirroring `account_balances`'s autocreate trigger (migration 000009) was the
+alternative and was rejected: a trigger cannot see `trace_id` or span context, and every
+other event-emitting path in this codebase deliberately keeps that logic in Go, not SQL.
+
+### D33. `processed_events` alongside the version compare-and-set, not instead of it
+
+**Decided.** `internal/projector.Applier.Apply` checks `processed_events` (INSERT ... ON
+CONFLICT DO NOTHING) and applies the version-CAS to `balance_projections`, both inside one
+local Postgres transaction.
+
+**Why the CAS alone is not enough**, stated exactly, because the two are easy to conflate:
+the CAS makes *re-applying an event already seen* a no-op — the incoming version is not
+greater than the stored one, so the UPDATE's WHERE clause matches nothing. It says nothing
+about the window between that local transaction committing and this consumer's Kafka
+offset commit succeeding. A crash in that window means the *next* delivery of the same
+message re-enters `Apply` with an event the CAS has already silently absorbed — harmless
+for the CAS itself, but there is then no durable record that the event was ever
+definitively handled, which is the seam any future side effect of applying an event (a
+notification, an exactly-once-intent metric) would need. `processed_events`, checked and
+written in the same transaction as the projection update, is what makes "have I handled
+event_id X" an answerable fact rather than an inference from projection state — identical
+reasoning to `idempotency_keys` on the write path in Phase 3, transplanted to the read
+side.
+
+**Offsets are committed manually, and only after that local transaction commits — never
+before.** `kgo.DisableAutoCommit()` plus an explicit `CommitRecords` call after `Apply`
+succeeds. Committing first and applying second would mean a crash between the two loses
+the event with Kafka believing it was consumed — silently dropping exactly the event
+at-least-once delivery is supposed never to drop.
+
+**A batch stops, rather than skips, at the first transient failure.** `processBatch`
+commits everything successfully applied before a failing record and then returns without
+touching the rest of the batch. Committing offset N+1 while N failed (say, Postgres
+briefly unreachable) would let a restart resume past a message never actually applied,
+turning a transient outage into a silent gap. The unprocessed remainder is simply
+re-fetched next poll.
+
+### D34. The dead-letter topic, and what does and does not reach it
+
+**Decided.** One shared `ledger.events.dlq`, fed from two independent sources: Kafka
+Connect's own `errors.deadletterqueue` (a message the SMT or converter could not process
+at all — a connector-internal failure) and the projector's own consumer-side DLQ (a
+message that parsed fine but this build does not know how to apply — currently only
+`ErrUnknownEventType`).
+
+**One topic, not one per source.** The operational question during an incident is always
+the same — "what's in the DLQ and why" — and a replay procedure that has to check two
+places is one that gets one of them forgotten under pressure. Each record carries headers
+naming its origin (`dlq.source_topic`, `dlq.source_partition`, `dlq.source_offset`,
+`dlq.error`) so provenance survives being merged into one topic.
+
+**What reaches the DLQ, and what does not.** `ErrUnknownEventType` does — a future event
+type this build has not been taught yet is a deployment-ordering fact, not a poison
+message, and belongs on the DLQ so it can be replayed once the consumer understands it. A
+transient failure applying a *known* event type (Postgres briefly unreachable) does
+**not** — that is exactly what the "stop the batch, don't commit" behaviour in D33 is for,
+and routing it to the DLQ instead would make a temporary outage into a permanent,
+manually-triaged backlog for no reason.
+
+**Replay procedure.** `cmd/projector` gained no `-dlq-replay` mode this phase — the DLQ
+records carry everything needed (the original envelope as the message value, source
+topic/partition/offset as headers) to re-produce them onto their original topic by hand
+via `rpk topic produce` once whatever was wrong is fixed, and that manual step is
+deliberately not automated yet: an operator should look at *why* a message reached the DLQ
+before deciding it is safe to replay, and a one-command replay tool makes it too easy to
+skip that look. Automating it is reasonable future work once there is a real incident's
+worth of experience about what actually lands there.
+
+### D35. Deployment corrections found only by actually running the stack
+
+Three real defects surfaced only once the full `docker compose up` stack was exercised
+end to end, none of them caught by any unit or integration test, because none of them were
+in Go code at all.
+
+**The Debezium connector's own config validation requires
+`topic.creation.default.replication.factor` and `topic.creation.default.partitions` to be
+*present*, even with `topic.creation.enable: false`.** Removing them (on the reasoning
+that they are meaningless once creation is disabled) produced
+`ConfigException: Missing required configuration ... which has no default value`, and the
+connector never started. They are back, set to `1`/`1` — inert in practice, since
+`kafka-init` provisions every real topic with its actual configuration *before* Connect
+ever starts (D31's provisioning ordering), so Connect's own topic-creation path never
+fires. The values only exist to satisfy a config validator that does not know they are
+unreachable.
+
+**`cmd/outbox-publisher` and `cmd/projector` do not open a second HTTP listener.** Both
+follow the existing `cmd/reconciler` pattern from Phase 1 — one admin server, serving
+`/healthz`, `/readyz`, and `/metrics` together on `LEDGER_METRICS_ADDR`, with no separate
+`LEDGER_HTTP_ADDR` listener at all, because neither process has a public API. The first
+`docker-compose.yml` draft for this phase copied `cmd/api`'s two-port shape (app port +
+metrics port) without checking that assumption, publishing a port nothing was listening on
+and pointing both healthchecks at it — so both containers reported "Started" while their
+actual health endpoint (on the metrics port) was never checked, and a real client hitting
+the documented app port got connection-reset. Caught by curling every service's health
+endpoint by hand against the running stack, not by any automated check; the compose file
+and the `make up` output now name the correct, single port for each.
+
+**`docker compose run <service> /usr/local/bin/service -flags` re-executes the entrypoint
+binary as its own first argument.** The image's `ENTRYPOINT` already is that binary,
+so `docker compose run` appends whatever command is given as its `argv` — passing the
+binary path again makes it `argv[0]`'s *value*, i.e. Go's `flag.Parse()` sees a non-flag
+string in position zero of `os.Args[1:]` and — because `flag` stops looking for flags at
+the first positional argument — silently ignores every flag after it. `make rebuild` ran
+the long-lived Kafka consumer instead of the one-shot rebuild-and-diff, with no error of
+any kind, discovered only by watching its logs print ordinary consumer output instead of a
+comparison report. Fixed by dropping the redundant binary path from both the ad hoc
+invocation and the Makefile target; the Makefile now carries a comment stating exactly why
+that argument must never come back.
+
+**The throughline.** All three passed `go build`, `go vet`, `golangci-lint`, and the full
+test suite under `-race`. None of them are things a unit test or an integration test
+against a single package could have caught, because each is a fact about how several
+processes are wired together at the deployment layer — which is exactly why CLAUDE.md's
+Definition of Done requires `docker compose up` to actually be run, not merely trusted to
+work because the code that runs inside it does.
+
+### D36. Two things learned from writing the failure tests, worth keeping on record
+
+**franz-go's idempotent producer (the client-side default) will not honour
+`RecordDeliveryTimeout` for a record that was already sent and got no response.** Its own
+doc comment says as much: the timeout is only enforced when doing so is "safe" — a record
+never issued, or one issued that received a *response*. A record in flight when the
+connection dies mid-request is neither, because the client cannot tell whether the broker
+received it, and enforcing the timeout there could create a gap in the idempotent sequence
+number. So it waits forever instead, by design.
+
+This is the right default for a producer whose job is exactly-once-per-partition
+delivery. It is not this publisher's job — the polling publisher is deliberately
+at-least-once (D30) — so idempotent production was never buying anything here, and
+`internal/outbox/publish/polling`'s test client disables it
+(`kgo.DisableIdempotentWrite()`) so the delivery timeout can actually fire during the
+outage test. Found by that test hanging for its full timeout before the option was added,
+not by reading the documentation first. Worth knowing before tuning
+`RecordDeliveryTimeout` for `cmd/outbox-publisher`'s real client in production: the 30s
+bound set there is real for connection-refused and broker-error cases, and not an absolute
+guarantee against a connection that dies silently mid-request without a TCP reset.
+
+**`container.Stop()` + `container.Start()` does not cleanly restart the Testcontainers
+Redpanda module.** That module ships a custom entrypoint
+(`mounts/entrypoint-tc.sh`) that waits for its node configuration to be written by a
+lifecycle hook Testcontainers runs only as part of the original `Run()` call.
+`container.Start()` on an already-created container re-executes that entrypoint from
+scratch without re-running the hook, so it waits for a signal that will never come again —
+the container reports `running`, but the Redpanda process inside it never actually starts.
+`TestOutboxPublish_KafkaOutage` used `docker pause`/`docker unpause` instead (reached via
+`os/exec`, since the `testcontainers.Container` interface exposes neither): pausing
+freezes the *already-running* process via the kernel cgroup freezer rather than restarting
+it, so every connection to it goes genuinely unresponsive — a faithful simulation of an
+outage — with no startup sequence to break. Recorded here because the failure mode (a
+container silently never coming back, discovered only by a five-minute test timeout) would
+otherwise cost someone else the same hour it cost here.

@@ -1175,3 +1175,403 @@ it, so every connection to it goes genuinely unresponsive — a faithful simulat
 outage — with no startup sequence to break. Recorded here because the failure mode (a
 container silently never coming back, discovered only by a five-minute test timeout) would
 otherwise cost someone else the same hour it cost here.
+
+---
+
+## Phase 5 — Money that moves through a system we do not control
+
+### D37. Orchestration, not choreography
+
+**Decided.** One component owns the payout state machine, reads its own progress
+from `saga_instances`, and calls the ledger and the gateway itself.
+`internal/saga/payout.Orchestrator` is that component; the participants know
+nothing about each other.
+
+**Rejected: choreography** — each step emitting an event that triggers the next,
+with no central coordinator. It is the more fashionable shape and it is genuinely
+better at one thing: adding a participant costs nobody a code change.
+
+**Why it loses here, and the reason is specific rather than general.** The
+hardest question this saga ever has to answer is *"what happened to the gateway
+call?"* — and answering it requires knowing three things at once: that a call was
+made, which idempotency key it was made under, and what the saga would do with
+each possible answer. In a choreography, those three facts live in three
+different services and none of them is responsible for reconciling them. The
+recovery logic has to exist somewhere regardless; choreography does not remove
+it, it spreads it out and then makes it nobody's job.
+
+The second reason is diagnostic. In an orchestration, `SELECT status FROM
+saga_instances WHERE id = $1` is a complete answer to "where is this payout".
+Under choreography, that question is answered by replaying several topics and
+inferring — during an incident, about a customer's money, under time pressure.
+
+**Cost accepted:** the orchestrator is a coupling point and a place a bug stops
+everything. Mitigated by it being stateless, horizontally scalable with no leader
+election (D40), and by the state machine being data in a table rather than
+control flow in a process.
+
+**What is not given up:** the saga still *emits* `SagaStepCompleted` to
+`ledger.events.saga`. Anything that wants to react to a payout — notifications,
+analytics, a merchant-facing webhook — subscribes without the orchestrator
+knowing. Orchestration governs the money; events broadcast the news. The two are
+not in tension, and conflating them is the usual reason this decision gets made
+badly.
+
+### D38. Sagas give ACD but not I, and the suspense account is the mitigation
+
+**The property, stated exactly.** A saga is Atomic (compensation drives it to
+all-or-nothing), Consistent (every step is itself a balanced, constraint-checked
+transaction — invariants 1 through 4 hold at every instant) and Durable (state is
+in Postgres). It is **not Isolated**: `RESERVE` commits, and its effects are
+visible to everyone while the gateway call is still outstanding. There is no
+snapshot hiding the intermediate state, because there is no enclosing transaction
+to take one. Every reader sees a customer's wallet debited for a payout that has
+not yet been made and might never be.
+
+**This is not fixable, only mitigated.** Isolation across a network call to
+another company would require holding a database transaction open across that
+call — locks held for the duration of somebody else's outage — which is the
+failure mode sagas exist to escape. The dirty read is the price of not doing
+that.
+
+**What the pending-balance pattern actually buys.** The mitigation is not to hide
+the intermediate state but to make it **self-describing**. Between `RESERVE` and
+`SETTLE` the money sits in `payout-suspense`, a real account with a real balance
+whose name says what it is, and `pending_minor` on that account says how much of
+it belongs to sagas that have not finished. A reader is never misled; they are
+told, in the ledger's own vocabulary, that this value is in flight.
+
+Compare the alternative the requirement's wording suggests (D39): a hold recorded
+only against the wallet, where the intermediate state is "the wallet says 30000
+but 5000 of it is spoken for" — a number every reader must remember to subtract,
+and which every report that forgets will get wrong.
+
+**The second thing it buys is a reconciliation invariant**, in the spirit of D1's
+three independently derived balances:
+
+```
+suspense.pending_minor  ==  SUM(amount) over saga_instances in non-terminal states
+```
+
+Two numbers computed by different mechanisms — one by `ApplyPendingDelta` inside
+each ledger transaction, one by counting rows in a different table — that must
+agree. Disagreement localises the bug immediately.
+
+**Being precise about what does NOT prevent double-spending.** See D39. It is not
+`pending_minor`.
+
+### D39. The suspense debit is the semantic lock; `pending_minor` is not
+
+**Decided.** `RESERVE` posts real journal entries: DEBIT customer wallet, CREDIT
+platform suspense. The money genuinely leaves the wallet.
+
+**The trap this avoids, stated plainly**, because the requirement as originally
+worded ("funds are held in `pending_minor` so the user cannot double-spend")
+describes something that does not work against this schema.
+`account_balances_no_overdraft_check` is:
+
+```sql
+CHECK (allow_negative OR available_minor >= 0)
+```
+
+It **does not mention `pending_minor`**. A hold written only into that column is
+invisible to the constraint, so a concurrent debit sails straight past it. The
+hold would look like a lock, be described in the code as a lock, and stop
+nothing.
+
+**So the guard is the debit itself.** Once the wallet is debited, a second payout
+against the same wallet is refused by invariant 4's existing `CHECK` under the
+existing `SELECT … FOR UPDATE` — the ordinary write path's protection, already
+proven under 100 concurrent writers in Phase 2, and reused here without
+modification. `TestSagaPayout_ConcurrentSagasOnOneWalletCannotDoubleSpend` runs
+100 payouts against a wallet that can afford 40 and asserts exactly 40 succeed.
+
+**Rejected: an authorization hold, and strengthening the CHECK to
+`available_minor - pending_minor >= 0`.** This is the card-network shape — auth
+then capture — and it is a legitimate design. It was rejected for two reasons.
+It would rewrite invariant 4, which CLAUDE.md declares non-negotiable (the
+rewrite is *strictly stronger*, so it would have been safe, but "safe" is not the
+bar for changing a stated invariant). And it removes the platform-suspense leg
+entirely: with no journal entries at `RESERVE`, compensation becomes a hold
+release with nothing to reverse — which is tidier, and which would have made the
+compensating-transaction machinery this phase exists to build almost vacuous.
+
+**Consequence, and it is the argument that settles it:** because the money is in
+a named account rather than merely flagged, an unresolved gateway outcome is
+*survivable*. The funds are debited from the customer and not credited to the
+merchant — owned by nobody, lost by nobody — for as long as the ambiguity lasts.
+Under an auth-hold the equivalent state is a hold on a live wallet that a user is
+still spending against, and the longer it lasts the more it is in the way.
+
+### D40. The orchestrator drives itself from Postgres, not from Kafka
+
+**Decided, and it is a deliberate deviation from CLAUDE.md's architecture
+sketch**, which shows `Saga Orchestrator <- Kafka`. Recorded here rather than by
+quietly editing the diagram.
+
+`cmd/saga-orchestrator` claims work with `UPDATE … WHERE id IN (SELECT … FOR
+UPDATE SKIP LOCKED)` against `saga_instances`, exactly the competing-consumers
+shape D31 chose for the polling publisher: N replicas partition the backlog with
+no leader election, no assigned shard, and nothing to rebalance when one dies
+mid-batch.
+
+**Why not Kafka-driven.** An orchestrator whose state machine is advanced by
+consuming events has its state split across two systems, and can no longer answer
+"what step is this saga on" without replaying a topic. It also inherits
+at-least-once redelivery as a *correctness* concern on the state machine rather
+than merely on the read model — and it is halfway to the choreography D37
+rejected: a component reacting to events about itself is not obviously in charge
+of anything. The timeout sweeper needs a Postgres scan regardless (a message that
+never arrives generates no event), so the Kafka path would have been a second
+mechanism alongside a first, not instead of it.
+
+**Claims are scoped by `saga_type`.** Without the scope, two orchestrators
+deployed side by side each spend their claim budget taking the other's sagas
+hostage for a lease at a time. With it, an orchestrator only ever leases work it
+can actually do.
+
+### D41. A saga step and the money it describes commit together
+
+**Decided.** `ledger.Tx` gained `CommitSagaStep` and `ApplyPendingDelta`, and
+`ledger.TransactionRequest` gained a `Record` hook. A forward step's journal
+entries, its balance updates, its `pending_minor` movement, its saga status
+transition, its audit row, and its outbox event are **one COMMIT**.
+
+**This is D20's argument, transplanted and with higher stakes.** That entry
+rejected "reserve, work, complete" as three transactions because the work commits,
+the bookkeeping does not, and the resumed process re-runs it. On the write path
+the cost was a duplicated response. Here the step being re-run is *a debit against
+a customer's wallet*.
+
+**Rejected: drive through `Service.PostTransaction` and update saga state in a
+second transaction**, treating `ErrDuplicateIdempotencyKey` on resume as "this
+step already ran". It requires no change to `internal/ledger` at all, which is a
+real argument in favour of it — that package is the crown jewels. It was rejected
+because it is precisely the shape D20 identified as the bug, rescued only by the
+unique index; because resume would have to reverse-look-up a transaction by key
+to recover its id; and because it cannot move `pending_minor` regardless, so a
+ledger change was unavoidable either way.
+
+**Rejected: exposing the raw `pgx.Tx` through a `Raw()` accessor**, which would
+have been one line instead of two delegations. It would let any future caller take
+locks outside the single global ordering D11 depends on — the one thing
+`pgledger`'s package doc says the package exists to prevent. The two new methods
+follow `AppendEvent → outbox.Append` verbatim: a package-level function taking
+`pgx.Tx`, delegated from `*txn`, with the statements living beside the table they
+own.
+
+**Consequence: the saga never writes a `PENDING` transaction header.** `RESERVE`
+and `SETTLE` are each complete, balanced, immediately-`POSTED` transactions, and
+in-flight-ness lives in `saga_instances` instead. **This closes the gap carried
+since Phase 1** — "the saga's write-header-first path can still reach POSTED with
+zero entries" — by never taking that path. `transactions` needed no migration and
+`ErrTransactionNotPending` remains unreferenced.
+
+**Consequence: `status` only ever holds settled states.** There is no
+`RESERVING`/`SETTLING`. In-flight-ness is a lease, exactly as D20 uses
+`IN_PROGRESS` plus `lease_expires_at`, and it rests on the same property: a lease
+that has lapsed is proof its owner committed nothing.
+
+### D42. An unknown gateway outcome is resolved by asking, never by assuming
+
+**The situation.** The gateway is the one participant outside the database
+transaction, so it is the only one whose outcome can be genuinely unknown. A
+timeout, a severed connection and an orchestrator crash mid-call are
+**indistinguishable from this side**, and all three mean the same thing: a payment
+may or may not exist.
+
+**Decided.** The saga does nothing. It sits in `GATEWAY_PENDING` and the sweeper
+issues `GET /v1/payments/{key}` until it gets a conclusive answer or gives up.
+
+**The two tempting alternatives are each wrong in an expensive direction.**
+Assuming failure and compensating refunds a customer whose money really left, and
+the merchant is never paid. Assuming success and settling pays a merchant for a
+payment that never happened, out of the platform's own funds. Doing nothing is
+the only action that cannot create a discrepancy — and it is affordable precisely
+because the money is parked in suspense (D39) rather than in limbo.
+
+**Three mechanisms make asking possible**, and all three are load-bearing:
+
+1. **The key is a pure function of the saga id** — `<saga_id>:GATEWAY`, never the
+   attempt number. It survives a crash that loses everything in memory, because
+   it can be recomputed from the saga's own identity. Deriving it per-attempt is
+   the single most expensive bug available in this design: every retry becomes a
+   fresh charge.
+2. **The intent is committed before the call.** `BeginStep` writes the
+   `ATTEMPTED` row and the move to `GATEWAY_PENDING` in one transaction, and only
+   then does the HTTP request go out. Reversing that order loses the record in
+   exactly the crash that makes it necessary.
+3. **Resolution is a GET.** Re-POSTing would also be safe — the key is stable and
+   the gateway is idempotent — but only because of a property of *someone else's
+   system*. Staking a customer's money on another company's correctness when you
+   do not have to is a bad trade.
+
+**The assumption this encodes, and it is not free.** A probe returning 404 is
+treated as conclusive evidence that no payment was made, and the saga
+compensates. That is sound only while the gateway's record of accepted payments
+is durable and complete. If it accepted a payment and then lost the record, this
+answer is a lie and a customer is refunded money that really left. Real gateways
+provide that durability and every payments reconciliation rests on it. It is
+written down here so that the day one is found not to, the consequence is already
+on record rather than rediscovered from a support ticket. The sentinel's doc
+comment says the same thing at the point of use.
+
+**Giving up is a real outcome.** After `LEDGER_GATEWAY_MAX_PROBES` inconclusive
+probes the saga goes to `NEEDS_MANUAL_REVIEW`. That does not resolve the
+ambiguity — nothing available here can — it hands it to a human with the money
+still held and every attempt on the record.
+
+### D43. Why an exhausted compensation must not be resolved automatically
+
+**Decided.** `NEEDS_MANUAL_REVIEW` is terminal for automation. The orchestrator
+stops, the funds stay in the suspense account, `SagaNeedsManualReview` goes to
+`ledger.events.saga`, `ledger_saga_manual_review_total` increments, an ERROR line
+is logged with the saga id and the last error, and
+`GET /v1/sagas?status=NEEDS_MANUAL_REVIEW` lists it.
+
+**The argument, since this is the decision most likely to be second-guessed by
+somebody looking at a stuck-saga dashboard.** A compensation that has burned its
+whole budget failed for a reason the orchestrator does not understand. Either it
+was transient — and the retries already covered that — or it is *semantically
+impossible*: the account is frozen, the suspense funds were moved by another
+path, the reversal would drive an account negative. In the second case no number
+of further retries helps, and the only "automatic resolutions" actually available
+are force-posting with `allow_negative` or writing a balancing `ADJUSTMENT`.
+
+Both of those **mint money that no business event justifies**. And the deeper
+cost is not the one transaction: a ledger that can silently repair itself is a
+ledger whose balances are no longer evidence of anything, because any figure
+might be a real movement or might be automation papering over something it did
+not understand. The auditability that justifies double-entry in the first place
+is exactly what self-healing spends.
+
+So the system stops in a state that is *wrong but named*: the money is in
+`payout-suspense`, the amount is exact, `pending_minor` says it is unfinished,
+every attempt and its error are in `saga_steps`, and a person decides. Worse for
+the dashboard, better for the ledger.
+
+**Being stuck is also not silent, which is the other half of the requirement.**
+Three independent channels carry it — an event, a metric, and a log line — so
+losing any one of them does not lose the alert. The status is terminal *for the
+sweeper* specifically so that a saga a human has been paged about does not
+generate a fresh page every ten seconds and bury the entry they are reading.
+
+**Compensations are idempotent, and the mechanism is inherited rather than
+invented.** A compensation is a `REVERSAL`, guarded by D15's
+`UPDATE … WHERE id = $1 AND status = 'POSTED'`; a second one matches nothing and
+gets `ErrAlreadyReversed`. The saga transition is independently guarded on
+`status = 'COMPENSATING'`. Either guard alone would prevent the money being
+returned twice — which matters, because two reversals would each balance
+perfectly and the balance invariant would never notice.
+
+**The retry budgets are deliberately asymmetric.** `MaxCompensationAttempts`
+(8) exceeds `MaxStepAttempts` (5), and config validation refuses a deployment
+where it does not. Abandoning a forward step costs nothing — the customer is
+untouched. Abandoning a compensation strands real money. The two failures are not
+comparable, so their budgets are not equal.
+
+### D44. `ErrInsufficientFunds` is terminal for a saga and transient for an
+### idempotency key
+
+**Decided.** `terminalLedgerError` fails a payout immediately on insufficient
+funds, a frozen account, or a missing account.
+
+**This deliberately disagrees with D22**, which classifies the same error as
+*transient* and releases the idempotency key so a client can retry once the
+account is funded. Both are right, because they are answering different
+questions. An idempotency key represents *the client's intent*, which survives
+waiting; burning it would force an honest client to mint a new key for what is,
+to it, the same operation. A saga represents *an attempt to move a specific
+amount now*, and a payout is not a standing order. Retrying it leaves sagas
+circling for hours against wallets that are simply empty, holding leases and
+claim budget the whole time.
+
+Noting it explicitly because the two tables sit in the same codebase and look
+like they disagree by accident.
+
+### D45. The mock gateway is a real process that holds payments in memory
+
+**Decided.** `cmd/mock-gateway` is a real HTTP server with a control plane
+(`POST /control/behaviour`) for outcome, latency and two flavours of hang.
+
+`.claude/rules/testing.md` requires failure tests to kill things rather than
+simulate failure with a boolean flag, and names the gateway specifically. What
+that forbids is a flag *inside the orchestrator* making it pretend a call failed
+— a test of Go's error handling that says nothing about surviving a real one. The
+orchestrator therefore has no test-only branch at all; the only test seam is
+`WithCrashHook`, exported and deliberately separate from `Config` so it cannot be
+set by ordinary configuration loading, following the polling publisher's
+precedent.
+
+**The two hang modes are separate because they leave the world in opposite states
+while looking identical to the caller.** `HangBeforeRecording` means no payment
+exists and compensating is correct. `HangAfterRecording` means the payment exists
+and compensating would refund a customer whose money really left. A saga that
+handles one but not the other is broken in the more expensive direction, and only
+a probe can tell them apart — which is the whole of D42, made testable.
+
+**Payments are held in memory on purpose.** Killing the process loses them, which
+is the only faithful way to produce the genuinely unrecoverable case: a gateway
+that cannot tell you what it did. That is what
+`should need manual review when the gateway can never say what it did` kills the
+listener to produce.
+
+### D46. What running the stack found, and what it confirmed
+
+Verified against `docker compose up` rather than trusted, per the Definition of
+Done and for the reason D35 exists.
+
+**A real payout completed end to end in ~550ms**, and the balances were exact:
+wallet 50000 → 30000, merchant 19500, fee revenue 500, suspense back to 0 with no
+residual hold. Both `SagaStepCompleted` events reached `ledger.events.saga`
+through Debezium — the event type D32 declared in Phase 4 against an orchestrator
+that did not exist, now actually emitted.
+
+**A declining gateway compensated to the exact prior balance**, live, with the
+audit log reading `RESERVE/FORWARD/SUCCEEDED`, `GATEWAY/FORWARD/FAILED`,
+`RESERVE/COMPENSATION/SUCCEEDED`.
+
+**`docker compose pause mock-gateway` mid-payout produced a genuine ambiguity**
+and the saga resolved it correctly: it sat in `GATEWAY_PENDING` with 3000 held in
+suspense and `pending_minor` at 3000, and on unpause the probe returned 404, the
+saga compensated, and the wallet returned to exactly its prior balance. The
+gateway was then queried directly to confirm the saga had not guessed: it held a
+`SUCCEEDED` payment for the completed saga, a `FAILED` one for the declined saga,
+and **no payment at all** under the paused saga's key. Compensating was the
+correct answer and the saga reached it by asking.
+
+**Two things worth recording for whoever runs this next.** `rpk topic consume`
+without `--fetch-max-wait` blocks rather than returning what is there, which
+looks exactly like an empty topic. And `published_at` staying NULL on saga outbox
+rows is not a stalled publisher — D4 says nothing writes it on the Debezium happy
+path — so backlog must be judged from the topic, not from that column.
+
+### Known gaps carried into Phase 6
+
+- **The client IP is still spoofable (D19).** Unchanged, now two phases overdue.
+  Nothing added here reads `r.RemoteAddr`.
+- **The idempotency key namespace is still global and unauthenticated (D24).**
+  `saga_instances.idempotency_key` inherits it exactly: anyone who guesses
+  another caller's key can read that caller's saga, which now includes account
+  ids and amounts. It needs the same `(principal, key)` composite treatment.
+- **Redis is still unimplemented (D23).**
+- **A shard rebalancer still does not exist (D25).** A sharded payout suspense
+  account would be subject to the same false refusals; the seeded one is not
+  sharded, and a drainable suspense account should not be.
+- **`NEEDS_MANUAL_REVIEW` has no resolution path in the product.** An operator
+  can see a stuck saga through `GET /v1/sagas` and must fix it with a manual
+  `ADJUSTMENT` or reversal by hand. A guarded admin endpoint — "I have checked
+  the gateway, record this saga as settled/compensated" — is real work and
+  belongs with the admin surface, not bolted onto the orchestrator. Until it
+  exists, the runbook is: query the gateway for `<saga_id>:GATEWAY`, then post
+  the corresponding correction by hand and move the saga by SQL.
+- **The saga has one definition.** `internal/saga` is deliberately generic and
+  `internal/saga/payout` is the only implementation of it. The second saga is
+  what will show whether that seam is in the right place; one implementation
+  never does.
+- **`SagaStepCompleted` has no consumer.** It is emitted and nothing reads it.
+  That is the correct order to build it in, but it means the event's shape is
+  unvalidated by any real subscriber.
+- **The reconciliation invariant from D38 is documented, not enforced.** Nothing
+  yet compares `suspense.pending_minor` against the sum of non-terminal sagas.
+  It belongs in the reconciliation engine, which is still a Phase 1 skeleton.

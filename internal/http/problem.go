@@ -11,6 +11,7 @@ import (
 
 	"github.com/satyamsipah/ledger-core/internal/idempotency"
 	"github.com/satyamsipah/ledger-core/internal/ledger"
+	"github.com/satyamsipah/ledger-core/internal/saga"
 )
 
 // problemBase namespaces the machine-readable error identifiers.
@@ -127,6 +128,16 @@ func problemFor(err error) (int, string, string) {
 			"The account is frozen or closed and cannot be posted to"
 
 	// ---- Ledger: state ---------------------------------------------------
+	// ---- Saga ------------------------------------------------------------
+	case errors.Is(err, saga.ErrSagaNotFound):
+		return nethttp.StatusNotFound, "saga-not-found", "Saga not found"
+	case errors.Is(err, saga.ErrStaleTransition), errors.Is(err, saga.ErrLeaseLost):
+		// A lost race between orchestrator replicas is never a client's
+		// problem and never reaches a client through this table -- both are
+		// handled inside the orchestrator. Mapped anyway so that adding a
+		// sentinel without deciding its status stays a visible omission.
+		return nethttp.StatusConflict, "saga-conflict", "Saga was advanced concurrently"
+
 	case errors.Is(err, ledger.ErrAccountNotFound):
 		return nethttp.StatusNotFound, "account-not-found", "No such account"
 	case errors.Is(err, ledger.ErrTransactionNotFound):

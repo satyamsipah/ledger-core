@@ -40,6 +40,12 @@ tags:
     description: The write path.
   - name: accounts
     description: Balances and statements.
+  - name: sagas
+    description: |
+      Multi-step, multi-party money movements. A saga spans an external payment
+      gateway, so it cannot be one database transaction and is not one API call:
+      starting a payout returns immediately with a saga id, and the orchestrator
+      drives it to a terminal state on its own.
   - name: health
     description: Liveness and readiness probes.
 
@@ -305,6 +311,112 @@ paths:
               schema:
                 $ref: '#/components/schemas/Readiness'
 
+  /v1/payouts:
+    post:
+      tags: [sagas]
+      summary: Start a marketplace payout saga
+      operationId: startPayout
+      description: |
+        Begins a payout: the customer's wallet is debited into platform
+        suspense, an external gateway is called, and on success the merchant
+        payable and fee revenue accounts are credited. On failure the reserve
+        is compensated with a reversing transaction.
+
+        Returns **202, not 201**. No money has moved when this returns; the
+        saga is queued and an orchestrator claims it. Poll `GET /v1/sagas/{id}`
+        for the outcome, or consume `SagaStepCompleted` from
+        `ledger.events.saga`.
+
+        `Idempotency-Key` is required, as on every write. It dedupes the whole
+        saga rather than a single transaction: retrying with the same key
+        returns the saga that was already started.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StartPayoutRequest'
+      responses:
+        '202':
+          description: The saga was accepted, or already existed under this key.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Saga'
+        '400':
+          description: Missing or malformed idempotency key, or malformed body.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '422':
+          description: The payout is not representable -- unknown account, mixed currency, fee at or above the amount.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/sagas:
+    get:
+      tags: [sagas]
+      summary: List sagas by status
+      operationId: listSagas
+      description: |
+        The triage view. Defaults to `NEEDS_MANUAL_REVIEW`, which is the status
+        a human is paged about: automation has stopped, the funds are held in
+        the suspense account, and a person has to decide what happens next.
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/SagaStatus'
+          description: Defaults to `NEEDS_MANUAL_REVIEW`.
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 100 }
+      responses:
+        '200':
+          description: The matching sagas, newest first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SagaList'
+        '422':
+          description: The limit is out of range.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/sagas/{id}:
+    get:
+      tags: [sagas]
+      summary: Read a saga and its full attempt history
+      operationId: getSaga
+      description: |
+        Returns the saga and every attempt made against it, forward and
+        compensating, successful and failed. The history is the answer to "what
+        happened to this payout": a step that was refused four times and a step
+        that was never tried look identical from the status alone.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: The saga and its attempts.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Saga'
+        '404':
+          description: No such saga.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
 components:
   parameters:
     IdempotencyKey:
@@ -540,6 +652,112 @@ components:
           description: Dependency name to `ok` or the failure message.
           additionalProperties: { type: string }
 
+    SagaStatus:
+      type: string
+      description: |
+        A saga's position in its state machine. Every value is a SETTLED state:
+        there is no "in progress" status, because a step commits its ledger
+        entries and its transition together, so no crash can leave a saga
+        describing itself as halfway through something.
+
+        `GATEWAY_PENDING` is the one that matters operationally. It means the
+        gateway's outcome is UNKNOWN -- still in flight, timed out, or the
+        orchestrator died mid-call, which are indistinguishable from here. The
+        saga resolves it by asking the gateway, never by assuming.
+
+        `NEEDS_MANUAL_REVIEW` is terminal for automation only. The funds are
+        held in the suspense account and a person has to act.
+      enum:
+        - PENDING
+        - RESERVED
+        - GATEWAY_PENDING
+        - GATEWAY_SUCCEEDED
+        - GATEWAY_FAILED
+        - COMPENSATING
+        - COMPLETED
+        - COMPENSATED
+        - FAILED
+        - NEEDS_MANUAL_REVIEW
+
+    StartPayoutRequest:
+      type: object
+      required: [customer_wallet_id, platform_suspense_id, merchant_payable_id, fee_revenue_id, amount]
+      properties:
+        customer_wallet_id: { type: string, format: uuid }
+        platform_suspense_id:
+          type: string
+          format: uuid
+          description: |
+            Where the funds wait while the gateway is called. This account is
+            what makes an unknown gateway outcome survivable: the money is out
+            of the customer's wallet and not yet the merchant's, so it is owned
+            by nobody and lost by nobody for as long as the ambiguity lasts.
+        merchant_payable_id: { type: string, format: uuid }
+        fee_revenue_id: { type: string, format: uuid }
+        amount:
+          $ref: '#/components/schemas/Money'
+        fee:
+          allOf:
+            - $ref: '#/components/schemas/Money'
+          description: |
+            Optional, and must share the payout's currency and be strictly less
+            than it. Omitted or zero means no fee leg is posted at all -- a
+            zero-amount journal entry is rejected by the schema.
+        external_ref: { type: string }
+
+    Saga:
+      type: object
+      required: [id, saga_type, status, current_step, retry_count, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        saga_type: { type: string }
+        status:
+          $ref: '#/components/schemas/SagaStatus'
+        current_step:
+          type: string
+          enum: [RESERVE, GATEWAY, SETTLE, DONE]
+        retry_count: { type: integer }
+        last_error: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        attempts:
+          type: array
+          description: Present on the single-saga read. Every attempt, in order.
+          items:
+            $ref: '#/components/schemas/SagaAttempt'
+
+    SagaAttempt:
+      type: object
+      required: [step, direction, attempt, status, started_at]
+      properties:
+        step: { type: string, enum: [RESERVE, GATEWAY, SETTLE] }
+        direction: { type: string, enum: [FORWARD, COMPENSATION] }
+        attempt: { type: integer }
+        status:
+          type: string
+          enum: [ATTEMPTED, SUCCEEDED, FAILED]
+          description: |
+            `ATTEMPTED` with no `finished_at` is the write-ahead intent record,
+            committed before the work began. On the gateway step it is the
+            durable evidence that a payment may exist under a known key.
+        transaction_id:
+          type: string
+          format: uuid
+          description: The ledger transaction this step posted. Absent for the gateway step, which posts none.
+        error: { type: string }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time }
+
+    SagaList:
+      type: object
+      required: [status, sagas]
+      properties:
+        status: { type: string }
+        sagas:
+          type: array
+          items:
+            $ref: '#/components/schemas/Saga'
+
     ProblemType:
       type: string
       description: |
@@ -571,6 +789,8 @@ components:
         - mixed-currency
         - request-in-progress
         - reversal-reason-required
+        - saga-conflict
+        - saga-not-found
         - scale-mismatch
         - timeout
         - too-few-entries

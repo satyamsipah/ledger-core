@@ -9,17 +9,28 @@ MIGRATE      := $(COMPOSE) run --rm migrate -path=/migrations -database='$(MIGRA
 N ?= 1
 
 .DEFAULT_GOAL := help
-.PHONY: help up down logs migrate-up migrate-down seed test test-race lint loadtest build fmt tidy psql
+.PHONY: help up down logs migrate-up migrate-down seed rebuild test test-race lint loadtest build fmt tidy psql
 
 help: ## List available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
 		| awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
 
-up: ## Start the whole stack (postgres, redpanda, connect, redis, api) and apply migrations
+up: ## Start the whole stack (postgres, redpanda, connect, redis, api, outbox-publisher, projector) and apply migrations
 	$(COMPOSE) up --build -d
-	@echo "api      http://localhost:8080/healthz"
-	@echo "metrics  http://localhost:9090/metrics"
-	@echo "connect  http://localhost:8083/connectors"
+	@echo "api               http://localhost:8080/healthz"
+	@echo "api metrics       http://localhost:9090/metrics"
+	@echo "outbox-publisher  http://localhost:9091/healthz  (health+metrics share one port; no separate app port)"
+	@echo "projector         http://localhost:9093/healthz  (health+metrics share one port; no separate app port)"
+	@echo "connect           http://localhost:8083/connectors"
+
+rebuild: ## Recompute balances from journal_entries and diff against the live projection
+	# No leading /usr/local/bin/service here: the image's ENTRYPOINT already is
+	# that binary, so this becomes its argv. Repeating the binary path would
+	# make -rebuild the entrypoint's SECOND positional argument rather than its
+	# first flag, and Go's flag package stops looking for flags at the first
+	# non-flag argument -- silently running the long-lived consumer instead of
+	# a one-shot rebuild, exactly as this comment exists to prevent.
+	$(COMPOSE) run --rm projector -rebuild
 
 down: ## Stop the stack and remove its volumes
 	$(COMPOSE) down --volumes --remove-orphans

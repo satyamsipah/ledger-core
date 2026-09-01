@@ -58,6 +58,47 @@ type Metrics struct {
 	// died, which is otherwise invisible until the table is large enough to
 	// hurt.
 	IdempotencySwept prometheus.Counter
+
+	// OutboxPublished counts outbox rows successfully published, labelled by
+	// which implementation did it. Comparable across a config-flag switch
+	// between "polling" and "debezium" is the whole point of D31's design --
+	// this is the number that answers "did switching actually change
+	// anything."
+	OutboxPublished *prometheus.CounterVec
+
+	// OutboxPublishErrors counts failed publish attempts. Not fatal by design
+	// -- both publishers retry -- but a sustained rate here means Kafka is
+	// unreachable or rejecting writes, and is the earliest signal of exactly
+	// the "Kafka is down" scenario the failure tests drive on purpose.
+	OutboxPublishErrors *prometheus.CounterVec
+
+	// OutboxBacklog is the current count of unpublished outbox rows. Not
+	// labelled by publisher: backlog is a property of the outbox table, which
+	// only one publisher is ever draining against at a time given the
+	// mutually-exclusive config flag, so a second label would only ever have
+	// one non-zero value.
+	OutboxBacklog prometheus.Gauge
+
+	// ProjectorConsumerLag is the standard shape -- topic and partition,
+	// computed the way any Kafka consumer-lag exporter would (high watermark
+	// minus committed offset) rather than derived from client-side fetch
+	// counters, which measure a different and less operationally useful
+	// thing.
+	ProjectorConsumerLag *prometheus.GaugeVec
+
+	// ProjectorEventsProcessed counts events the projector applied, and
+	// ProjectorDuplicatesSkipped counts ones processed_events already knew
+	// about -- the metric that turns "at-least-once delivery" from a design
+	// document's claim into an operationally visible number.
+	ProjectorEventsProcessed   *prometheus.CounterVec
+	ProjectorDuplicatesSkipped prometheus.Counter
+
+	// ProjectorDLQTotal counts messages the projector could not apply and
+	// routed to the dead-letter topic. Anything other than zero here is worth
+	// paging on: it means either a poison message or a projection invariant
+	// violation, and the replay procedure documented in docs/DECISIONS.md
+	// only helps once someone has noticed.
+	ProjectorDLQTotal prometheus.Counter
 }
 
 // NewMetrics builds the registry and registers the process collectors.
@@ -119,12 +160,64 @@ func NewMetrics(service string) *Metrics {
 			Help:        "Expired idempotency records deleted by the TTL sweeper.",
 			ConstLabels: prometheus.Labels{"service": service},
 		}),
+		OutboxPublished: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace:   "ledger",
+			Subsystem:   "outbox",
+			Name:        "published_total",
+			Help:        "Outbox rows successfully published, by publisher implementation.",
+			ConstLabels: prometheus.Labels{"service": service},
+		}, []string{"publisher"}),
+		OutboxPublishErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace:   "ledger",
+			Subsystem:   "outbox",
+			Name:        "publish_errors_total",
+			Help:        "Failed publish attempts, by publisher implementation.",
+			ConstLabels: prometheus.Labels{"service": service},
+		}, []string{"publisher"}),
+		OutboxBacklog: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace:   "ledger",
+			Subsystem:   "outbox",
+			Name:        "backlog",
+			Help:        "Unpublished outbox rows at last check.",
+			ConstLabels: prometheus.Labels{"service": service},
+		}),
+		ProjectorConsumerLag: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace:   "ledger",
+			Subsystem:   "projector",
+			Name:        "consumer_lag",
+			Help:        "Consumer group lag by topic and partition.",
+			ConstLabels: prometheus.Labels{"service": service},
+		}, []string{"topic", "partition"}),
+		ProjectorEventsProcessed: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace:   "ledger",
+			Subsystem:   "projector",
+			Name:        "events_processed_total",
+			Help:        "Events applied to the balance projection, by event type.",
+			ConstLabels: prometheus.Labels{"service": service},
+		}, []string{"event_type"}),
+		ProjectorDuplicatesSkipped: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace:   "ledger",
+			Subsystem:   "projector",
+			Name:        "duplicates_skipped_total",
+			Help:        "Redelivered events discarded by processed_events dedupe.",
+			ConstLabels: prometheus.Labels{"service": service},
+		}),
+		ProjectorDLQTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace:   "ledger",
+			Subsystem:   "projector",
+			Name:        "dlq_total",
+			Help:        "Messages the projector could not apply and routed to the dead-letter topic.",
+			ConstLabels: prometheus.Labels{"service": service},
+		}),
 	}
 
 	registry.MustRegister(
 		m.HTTPRequests, m.HTTPDuration,
 		m.TxRetries, m.TxAttempts,
 		m.IdempotencyOutcomes, m.IdempotencySwept,
+		m.OutboxPublished, m.OutboxPublishErrors, m.OutboxBacklog,
+		m.ProjectorConsumerLag, m.ProjectorEventsProcessed,
+		m.ProjectorDuplicatesSkipped, m.ProjectorDLQTotal,
 	)
 	return m
 }

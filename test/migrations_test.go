@@ -16,9 +16,11 @@ import (
 var expectedTables = []string{
 	"account_balances",
 	"accounts",
+	"balance_projections",
 	"idempotency_keys",
 	"journal_entries",
 	"outbox",
+	"processed_events",
 	"transactions",
 }
 
@@ -31,6 +33,12 @@ var expectedFunctions = []string{
 	"ledger_assert_transaction_balanced",
 	"ledger_create_account_balance",
 	"ledger_reject_journal_mutation",
+	// ledger_shard_account (migration 000012) was missing from this list
+	// before now -- a pre-existing gap, not introduced here, but caught while
+	// this list was already being extended for Phase 4's tables. Its absence
+	// meant a down-migration dropping the function without a matching
+	// reversal would have passed a table-only check.
+	"ledger_shard_account",
 	"ledger_sync_allow_negative",
 	"set_updated_at",
 }

@@ -19,22 +19,29 @@
 
   "transforms": "outbox",
   "transforms.outbox.type": "io.debezium.transforms.outbox.EventRouter",
-  "transforms.outbox.table.field.event.id": "id",
+
+  "transforms.outbox.table.field.event.id": "event_id",
   "transforms.outbox.table.field.event.key": "aggregate_id",
   "transforms.outbox.table.field.event.type": "event_type",
   "transforms.outbox.table.field.event.payload": "payload",
   "transforms.outbox.table.expand.json.payload": "true",
   "transforms.outbox.route.by.field": "aggregate_type",
   "transforms.outbox.route.topic.replacement": "ledger.events.${routedByValue}",
-  "transforms.outbox.table.fields.additional.placement": "event_type:header:eventType,created_at:header:createdAt",
 
   "key.converter": "org.apache.kafka.connect.storage.StringConverter",
   "value.converter": "org.apache.kafka.connect.json.JsonConverter",
   "value.converter.schemas.enable": "false",
 
   "heartbeat.interval.ms": "10000",
-  "topic.creation.enable": "true",
+
+  "topic.creation.enable": "false",
   "topic.creation.default.replication.factor": "1",
-  "topic.creation.default.partitions": "3",
-  "topic.creation.default.cleanup.policy": "delete"
+  "topic.creation.default.partitions": "1",
+
+  "errors.tolerance": "all",
+  "errors.deadletterqueue.topic.name": "ledger.events.dlq",
+  "errors.deadletterqueue.topic.replication.factor": "1",
+  "errors.deadletterqueue.context.headers.enable": "true",
+  "errors.log.enable": "true",
+  "errors.log.include.messages": "true"
 }

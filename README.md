@@ -11,20 +11,25 @@ written yet does something unanticipated.
 
 ## Status
 
-**Phase 3 complete: the write path under duplicates and concurrency.** There is
-an HTTP API now — `POST /v1/transactions`, `POST /v1/transactions/{id}/reverse`,
-`GET /v1/accounts/{id}/balance` and `/statement` — behind required idempotency
-keys, a retry wrapper for aborted transactions, and optional sub-account
-sharding for hot accounts. See [the API](#the-api) and
-[Idempotency](#idempotency).
+**Phase 4 complete: events out of Postgres, without losing or inventing one.**
+Every write still lands in `outbox` inside the same transaction as the journal
+(invariant 6), and now two independent publishers can carry it to Kafka —
+Debezium reading the write-ahead log (the default) or a polling publisher this
+repository runs itself — behind one interface and one config flag. A balance
+projector consumes the stream, dedupes by `event_id`, and can rebuild itself
+from `journal_entries` and diff against its own live state on demand. See
+[Events](#events) and [The projector](#the-projector).
 
-Phase 2 (the ledger core) and Phase 1 (skeleton, schema, local environment) are
-unchanged and still the foundation: `docker compose up` brings the whole stack
-up from scratch.
+Phase 3 (idempotency, concurrency, sharding), Phase 2 (the ledger core) and
+Phase 1 (skeleton, schema, local environment) are unchanged and still the
+foundation: `docker compose up` brings the whole stack up from scratch,
+including the topic layout, the connector, the publisher and the projector.
 
-Two gaps are open and worth knowing about before deploying this anywhere real:
-the client IP is spoofable (D19), and idempotency keys share one namespace with
-no authentication behind them (D24). Both are recorded in
+Three gaps are open and worth knowing about before deploying this anywhere
+real: the client IP is spoofable (D19), idempotency keys share one namespace
+with no authentication behind them (D24), and `SagaStepCompleted` is a
+declared event type with no orchestrator behind it yet — `internal/saga` is
+still the Phase 1 stub. All recorded in
 [docs/DECISIONS.md](docs/DECISIONS.md) rather than papered over.
 
 ## Quick start
@@ -32,7 +37,7 @@ no authentication behind them (D24). Both are recorded in
 Requires Docker and Go 1.25+.
 
 ```bash
-make up      # postgres + redpanda + kafka-connect + redis + api, migrations applied
+make up      # postgres, redpanda, kafka-connect, redis, api, outbox-publisher, projector
 make seed    # load the development chart of accounts
 ```
 
@@ -41,8 +46,14 @@ make seed    # load the development chart of accounts
 | API liveness | http://localhost:8080/healthz |
 | API readiness | http://localhost:8080/readyz |
 | Post a transaction | `POST` http://localhost:8080/v1/transactions |
-| Metrics | http://localhost:9090/metrics |
+| API metrics | http://localhost:9090/metrics |
 | Kafka Connect | http://localhost:8083/connectors |
+| Outbox publisher health + metrics | http://localhost:9091/readyz — one port for both; see [Events](#events) |
+| Projector health + metrics | http://localhost:9093/readyz — same reason |
+
+```bash
+make rebuild   # recompute balances from journal_entries, diff against the live projection
+```
 
 ```bash
 curl -X POST http://localhost:8080/v1/transactions \
@@ -72,29 +83,41 @@ make help        # every target
 
 ```
 cmd/api             public HTTP surface
-cmd/projector       Kafka consumer maintaining the read-side balance projection
+cmd/outbox-publisher  runs whichever outbox publisher LEDGER_OUTBOX_PUBLISHER
+                    names -- polling, or a Debezium connector health monitor
+cmd/kafka-init      one-shot: provisions the Kafka topic layout, then exits
+cmd/projector       Kafka consumer maintaining the read-side balance
+                    projection; -rebuild recomputes it from journal_entries
+                    and diffs against the live one
 cmd/reconciler      scheduled invariant checks against data at rest
 internal/ledger     double-entry domain: Money, entries, ledger.Service
 internal/ledger/pgledger  the PostgreSQL repository: locking and SQL
 internal/idempotency  request de-duplication (invariant 5)
 internal/idempotency/pgidem  the idempotency_keys statements, including the
                     completion that runs inside the ledger transaction
-internal/outbox     transactional outbox (invariant 6)
+internal/outbox     transactional outbox (invariant 6); the event envelope
+                    every publisher and consumer agrees on
+internal/outbox/publish  the Publisher interface, and both implementations:
+                    publish/polling, publish/debezium
+internal/kafka      topic names, partition counts, explicit per-topic config
+internal/projector  consumes and applies events, dedupes by event_id, rebuilds
 internal/saga       multi-step orchestration with compensating transactions
 internal/http       router, middleware, health, server lifecycle
 internal/db         pgx pool, query-timeout conventions, 40001/40P01 retrier
 internal/config     environment configuration
 internal/observability  slog, Prometheus, OpenTelemetry
 migrations/         golang-migrate SQL, up and down
-test/               integration tests against real PostgreSQL
+test/               integration tests against real PostgreSQL and Kafka
 deploy/             Docker Compose stack, Dockerfile, Debezium connector, seed
 api/openapi.yaml    OpenAPI 3.1, checked against the router by the test suite
 ```
 
 ## The schema
 
-Six tables: `accounts`, `transactions`, `journal_entries`, `account_balances`,
-`idempotency_keys`, `outbox`.
+Eight tables: `accounts`, `transactions`, `journal_entries`, `account_balances`,
+`idempotency_keys`, `outbox`, `balance_projections`, `processed_events`. The
+last two belong to the projector, not the write path — see
+[The projector](#the-projector).
 
 ### How each invariant is enforced
 
@@ -335,6 +358,85 @@ bottleneck and the connection pool, WAL fsync and CPU take over — so 4–8 sha
 recovers most of the available gain and the rest is largely wasted. The ratio is
 the transferable result; the absolute numbers describe one laptop.
 
+## Events
+
+Every write that changes state appends a row to `outbox`, inside the same
+database transaction as the journal entries it describes — invariant 6, and
+the mechanism the [dual-write problem](docs/DECISIONS.md) does and does not
+solve is spelled out in D30. What follows is turning that committed row into a
+Kafka message, and this repository ships two ways to do it, behind one
+interface, selected by `LEDGER_OUTBOX_PUBLISHER` (`debezium`, the default, or
+`polling`):
+
+| | Debezium (default) | Polling |
+|---|---|---|
+| How | Reads the write-ahead log via a registered connector | `SELECT … FOR UPDATE SKIP LOCKED LIMIT 100`, produces, marks `published_at`, one transaction |
+| Ordering | Strict commit (LSN) order | Insertion order — not quite the same thing under concurrency |
+| Ops cost | A Kafka Connect cluster, a replication slot to monitor | One more Go binary |
+
+Full comparison — latency, crash behaviour, why `SKIP LOCKED` is what makes
+running several polling replicas safe rather than merely running — is D31.
+
+**The wire format is identical either way.** The full envelope —
+`event_id` (UUIDv7), `event_type`, `event_version`, `aggregate_id`,
+`occurred_at`, `trace_id`, `payload` — is assembled once, in Go, and stored as
+the *entirety* of `outbox.payload`. Debezium's connector does nothing but
+relay that column verbatim; that is what makes switching the config flag a
+real choice rather than a change in message shape too (D31's closing
+argument, D32 for the envelope itself).
+
+Three topics, each on `ledger.events.<name>`, explicit partition counts and
+retention rather than broker defaults (`internal/kafka`, provisioned by
+`cmd/kafka-init` before anything else starts):
+
+| Topic | Carries | Keyed by | Partitions |
+|---|---|---|---|
+| `transaction` | `TransactionPosted`, `TransactionReversed` | `transaction_id` | 6 |
+| `account` | `AccountCreated`, `BalanceUpdated` | `account_id` | 12 |
+| `saga` | `SagaStepCompleted` (declared; no orchestrator emits it yet) | saga id | 3 |
+| `dlq` | poison messages, from Connect or from the projector | — | 3 |
+
+**What keying by `account_id` guarantees, and what it does not.** Every event
+that ever mentions a given account is delivered to one consumer in commit
+order — real per-account ordering. What it does *not* give: a single
+transfer's debit and credit are two independent `BalanceUpdated` messages on
+two different partitions, with no ordering relationship between them. A
+transaction can't be keyed by one account it isn't only about — see D32 for
+why `TransactionPosted` is keyed by `transaction_id` instead, and why the
+projector below doesn't need the per-account guarantee anyway.
+
+## The projector
+
+`cmd/projector` consumes `TransactionPosted`/`TransactionReversed` and
+maintains `balance_projections` — a read model built **entirely from the
+Kafka stream**, independently of `account_balances`, which the write path
+updates synchronously under its own row lock. Two numbers computed by
+different code paths agreeing is what gives reconciliation a real job.
+
+Applying an event is a version compare-and-set
+(`UPDATE … WHERE version < $new`), not a delta — so it converges correctly
+regardless of redelivery or arrival order, without needing the per-account
+ordering guarantee above at all. `processed_events`, written in the same
+local transaction as the projection update, closes the one gap the
+compare-and-set alone doesn't: the window between that commit and this
+consumer's own Kafka offset commit (D33). Offsets are committed manually,
+only after the local transaction succeeds.
+
+An event type this build doesn't recognise is routed to `ledger.events.dlq`
+— tagged with its source topic, partition, offset and the error — rather
+than wedging every message behind it (D34).
+
+```bash
+make rebuild   # or: docker compose run --rm projector -rebuild -accounts <uuid,...>
+```
+
+Recomputes every account's balance **directly from `journal_entries`** —
+bypassing Kafka, the outbox and every publisher entirely — and diffs it
+against the live projection, account by account, exiting non-zero on any
+disagreement. `-accounts` scopes it to specific accounts, which is both a
+real operational need (a targeted investigation into one customer's balance)
+and what makes the check usable against a database other tests also touch.
+
 ## Tests
 
 No mocks for database behaviour — every test runs against real PostgreSQL via
@@ -397,7 +499,40 @@ Phase 3 adds:
 - `Canonicalize` against the RFC 8785 worked example, the ECMAScript number
   boundaries at 1e21 and 1e-7, and duplicate-key rejection
 
-Coverage across `internal/ledger` and `internal/outbox` is 85.5%.
+Coverage across `internal/ledger` and `internal/outbox` is 85.5% as of Phase 3;
+Phase 4's new packages are covered by the integration suite below rather than
+by isolated unit tests, since almost everything they do only means something
+against a real broker and a real database.
+
+Phase 4 adds, actually killing things per `.claude/rules/testing.md`:
+
+- `TestOutboxPublish_KafkaOutage` — pauses the real Redpanda container
+  (`docker pause`, not `Stop`/`Start`; see below) mid-run, posts more
+  transactions while it's down, asserts the backlog accumulates and doesn't
+  silently drain, then unpauses and asserts zero loss by exact row count
+- `TestOutboxPublish_PollingCrashBetweenPublishAndMark` — a hook fires after
+  Kafka has genuinely acknowledged a batch and before the marking transaction
+  commits; `pg_terminate_backend` kills the publisher's connection at exactly
+  that instant. Confirms the row is still unpublished, the message reached
+  Kafka anyway, a retry produces a real duplicate `event_id` on the wire, and
+  `projector.Applier` recognises and skips the second delivery
+- `TestProjector_RebuildMatchesLive` — posts a mixed workload through the real
+  write path, drains it to a real broker with the real polling publisher,
+  consumes and applies it with the real consumer, then diffs the result
+  against `journal_entries` directly — the required end-to-end check, not a
+  check of any one component's self-consistency
+- `TestProjector_UnknownEventTypeIsDeadLettered` — a message this build can't
+  apply lands on the DLQ tagged with its origin, and its offset still commits
+
+Two things learned writing these, worth knowing before relying on either
+mechanism elsewhere: franz-go's idempotent producer won't honour
+`RecordDeliveryTimeout` for a record already sent with no response — correct
+for exactly-once delivery, and simply not what this at-least-once publisher
+needs (D30, D36); and the Testcontainers Redpanda module can't be cleanly
+stopped and restarted via `container.Stop()`/`Start()`, because its custom
+entrypoint waits on a lifecycle hook that only runs during the original
+`Run()` — `docker pause`/`unpause` sidesteps the problem rather than working
+around it.
 
 ## Documentation
 
@@ -405,4 +540,5 @@ Coverage across `internal/ledger` and `internal/outbox` is 85.5%.
 - [api/openapi.yaml](api/openapi.yaml) — the HTTP contract, validated against
   the router by the test suite
 - [docs/DECISIONS.md](docs/DECISIONS.md) — every significant decision, what was
-  rejected, and why. Phase 3 is D20–D29; the open gaps are listed at the end
+  rejected, and why. Phase 3 is D20–D29, Phase 4 is D30–D36; the open gaps are
+  listed at the end of the Phase 3 section

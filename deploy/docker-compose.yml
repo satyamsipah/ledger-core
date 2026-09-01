@@ -87,6 +87,25 @@ services:
       retries: 30
       start_period: 10s
 
+  kafka-init:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        SERVICE: kafka-init
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      LEDGER_ENV: local
+      LEDGER_KAFKA_BROKERS: redpanda:29092
+      LEDGER_LOG_LEVEL: debug
+    # A one-shot container, like migrate: everything that needs the topic
+    # layout to exist -- with its explicit per-topic configuration, not
+    # whatever the broker defaults to on first use -- waits on
+    # service_completed_successfully rather than on this being "up".
+    restart: on-failure
+
   connect:
     image: quay.io/debezium/connect:2.7
     depends_on:
@@ -94,6 +113,14 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+      # Debezium's EventRouter SMT will happily produce to a topic that does
+      # not exist yet -- Redpanda auto-creates it on first write, with broker
+      # defaults, silently discarding kafka-init's explicit partition count
+      # and retention the moment they would have mattered. Waiting here is
+      # what makes kafka-init's provisioning the thing that actually decides
+      # the topic layout, rather than a race it usually wins.
+      kafka-init:
+        condition: service_completed_successfully
     environment:
       BOOTSTRAP_SERVERS: redpanda:29092
       GROUP_ID: ledger-connect
@@ -127,6 +154,8 @@ services:
       # The connector references public.outbox, so the table must exist before
       # it is registered.
       migrate:
+        condition: service_completed_successfully
+      kafka-init:
         condition: service_completed_successfully
     volumes:
       - ./debezium/outbox-connector.json:/config/outbox-connector.json:ro
@@ -185,6 +214,89 @@ services:
       - "9090:9090"
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  outbox-publisher:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        SERVICE: outbox-publisher
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      kafka-init:
+        condition: service_completed_successfully
+      redpanda:
+        condition: service_healthy
+      # Registered here even though the debezium arm (the default) does not
+      # touch Kafka Connect's data plane itself -- it only polls
+      # /connectors/ledger-outbox/status, and there is no point starting that
+      # poll loop before connect-init has had a chance to register what it is
+      # polling for.
+      connect-init:
+        condition: service_completed_successfully
+    environment:
+      LEDGER_ENV: local
+      LEDGER_METRICS_ADDR: ":9091"
+      LEDGER_POSTGRES_DSN: postgres://ledger:ledger@postgres:5432/ledger?sslmode=disable
+      LEDGER_KAFKA_BROKERS: redpanda:29092
+      LEDGER_LOG_LEVEL: debug
+      # debezium is the default in config.go too; stated explicitly here so
+      # switching arms for a local comparison is one line to change, per
+      # docs/DECISIONS.md D31.
+      LEDGER_OUTBOX_PUBLISHER: debezium
+      LEDGER_OUTBOX_CONNECT_URL: http://connect:8083
+      LEDGER_OUTBOX_CONNECTOR_NAME: ledger-outbox
+    ports:
+      - "9091:9091"
+    healthcheck:
+      # cmd/outbox-publisher, like cmd/reconciler, is a background worker with
+      # no user-facing API -- it serves health and metrics together on the
+      # metrics listener rather than opening a second HTTP_ADDR nothing would
+      # ever bind, so this is the same port the LEDGER_METRICS_ADDR above
+      # names, not a separate app port.
+      test: ["CMD", "wget", "-qO-", "http://localhost:9091/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  projector:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        SERVICE: projector
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      kafka-init:
+        condition: service_completed_successfully
+      redpanda:
+        condition: service_healthy
+      # The projector's whole job is to consume what the publisher produces;
+      # starting it before there is anything registered to publish just means
+      # its first several polls return nothing.
+      connect-init:
+        condition: service_completed_successfully
+    environment:
+      LEDGER_ENV: local
+      # 9093, not 9092 -- 9092 is redpanda's own host-mapped Kafka port.
+      LEDGER_METRICS_ADDR: ":9093"
+      LEDGER_POSTGRES_DSN: postgres://ledger:ledger@postgres:5432/ledger?sslmode=disable
+      LEDGER_KAFKA_BROKERS: redpanda:29092
+      LEDGER_LOG_LEVEL: debug
+    ports:
+      - "9093:9093"
+    healthcheck:
+      # Same reasoning as outbox-publisher above: cmd/projector serves health
+      # and metrics together on the metrics listener; there is no separate
+      # HTTP_ADDR port to point this at.
+      test: ["CMD", "wget", "-qO-", "http://localhost:9093/healthz"]
       interval: 5s
       timeout: 3s
       retries: 10

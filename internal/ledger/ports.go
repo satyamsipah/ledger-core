@@ -63,6 +63,13 @@ type Tx interface {
 	// what prevents deadlock.
 	LockAccounts(ctx context.Context, ids []uuid.UUID) ([]LockedAccount, error)
 
+	// InsertAccount writes a new account row and fills in the timestamps the
+	// database generated. There is no matching update: an account's mutable
+	// fields (status, allow_negative) change through their own narrow paths
+	// elsewhere, never through a general-purpose account update, so this
+	// interface does not offer one.
+	InsertAccount(ctx context.Context, a *Account) error
+
 	// InsertTransaction writes the header and fills in the timestamps the
 	// database generated.
 	InsertTransaction(ctx context.Context, t *Transaction) error

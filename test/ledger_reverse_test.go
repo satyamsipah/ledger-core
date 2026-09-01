@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/satyamsipah/ledger-core/internal/ledger"
+	"github.com/satyamsipah/ledger-core/internal/outbox"
 )
 
 // TestReverseTransaction_MirrorsWithoutMutatingHistory is invariant 2 expressed
@@ -94,19 +95,23 @@ func TestReverseTransaction_MirrorsWithoutMutatingHistory(t *testing.T) {
 
 	t.Run("should emit a reversal event naming the transaction it undoes", func(t *testing.T) {
 		var (
-			eventType string
-			payload   []byte
+			eventType     string
+			envelopeBytes []byte
 		)
 		require.NoError(t, sharedPool.QueryRow(ctx, `
-			SELECT event_type, payload FROM outbox WHERE aggregate_id = $1`, reversal.ID.String()).
-			Scan(&eventType, &payload))
+			SELECT event_type, payload FROM outbox
+			 WHERE aggregate_id = $1 AND aggregate_type = 'transaction'`, reversal.ID.String()).
+			Scan(&eventType, &envelopeBytes))
 		assert.Equal(t, ledger.EventTypeTransactionReversed, eventType)
+
+		var envelope outbox.Envelope
+		require.NoError(t, json.Unmarshal(envelopeBytes, &envelope))
 
 		var event struct {
 			Reverses *uuid.UUID `json:"reverses_transaction_id"`
 			Reason   string     `json:"reason"`
 		}
-		require.NoError(t, json.Unmarshal(payload, &event))
+		require.NoError(t, json.Unmarshal(envelope.Payload, &event))
 		require.NotNil(t, event.Reverses)
 		assert.Equal(t, original.ID, *event.Reverses)
 		assert.Equal(t, "duplicate settlement file", event.Reason)

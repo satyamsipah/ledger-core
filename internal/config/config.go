@@ -28,6 +28,7 @@ type Config struct {
 	Postgres      Postgres
 	Ledger        Ledger
 	Kafka         Kafka
+	Outbox        Outbox
 	Redis         Redis
 	Observability Observability
 }
@@ -95,6 +96,28 @@ type Kafka struct {
 	ConsumerGroup string
 }
 
+// Outbox configures how committed outbox rows reach Kafka. See
+// docs/DECISIONS.md D31 for the comparison between the two publishers this
+// selects between.
+type Outbox struct {
+	// Publisher selects which implementation runs: "polling" or "debezium".
+	// Debezium is the default -- see D31 for why LSN ordering outweighs
+	// polling's lower operational footprint for a ledger specifically.
+	Publisher string
+
+	// PollInterval and BatchSize configure the polling publisher only; the
+	// Debezium publisher ignores both, since it does not poll anything itself.
+	PollInterval time.Duration
+	BatchSize    int
+
+	// ConnectURL and ConnectorName configure the Debezium publisher's
+	// connector-status monitor: where Kafka Connect's REST API lives, and
+	// which connector (registered separately, by deploy/docker-compose.yml's
+	// connect-init service) to report the health of.
+	ConnectURL    string
+	ConnectorName string
+}
+
 // Redis configures the idempotency fast path. Redis is a latency optimisation
 // only: correctness never depends on it being reachable.
 type Redis struct {
@@ -155,6 +178,13 @@ func Load(service string) (Config, error) {
 			Brokers:       envList("KAFKA_BROKERS", []string{"localhost:9092"}),
 			ConsumerGroup: env("KAFKA_CONSUMER_GROUP", "ledger-"+service),
 		},
+		Outbox: Outbox{
+			Publisher:     env("OUTBOX_PUBLISHER", "debezium"),
+			PollInterval:  envDuration("OUTBOX_POLL_INTERVAL", 500*time.Millisecond, fail),
+			BatchSize:     envInt("OUTBOX_BATCH_SIZE", 100, fail),
+			ConnectURL:    env("OUTBOX_CONNECT_URL", "http://localhost:8083"),
+			ConnectorName: env("OUTBOX_CONNECTOR_NAME", "ledger-outbox"),
+		},
 		Redis: Redis{
 			Addr: env("REDIS_ADDR", "localhost:6379"),
 			DB:   envInt("REDIS_DB", 0, fail),
@@ -198,6 +228,15 @@ func Load(service string) (Config, error) {
 		fail("%sIDEMPOTENCY_LEASE (%s) must not exceed %sIDEMPOTENCY_TTL (%s); "+
 			"idempotency_keys_lease_within_ttl_check would reject the reservation",
 			envPrefix, cfg.Ledger.IdempotencyLease, envPrefix, cfg.Ledger.IdempotencyTTL)
+	}
+	switch cfg.Outbox.Publisher {
+	case "polling", "debezium":
+	default:
+		fail("%sOUTBOX_PUBLISHER must be \"polling\" or \"debezium\", got %q",
+			envPrefix, cfg.Outbox.Publisher)
+	}
+	if cfg.Outbox.BatchSize < 1 {
+		fail("%sOUTBOX_BATCH_SIZE must be at least 1, got %d", envPrefix, cfg.Outbox.BatchSize)
 	}
 
 	if len(errs) > 0 {

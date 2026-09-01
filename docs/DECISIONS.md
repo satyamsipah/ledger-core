@@ -868,3 +868,102 @@ integrating against a path that no longer exists.
   a small table, so index locality on `accounts` is not the concern that
   motivated v7 for `journal_entries`. Worth noting so the inconsistency is not
   read as an oversight.
+
+---
+
+## Phase 4 — Events out of Postgres, without losing or inventing one
+
+### D30. The dual-write problem, and exactly what the outbox does and does not solve
+
+**The problem, stated plainly.** A write path that must update Postgres and
+publish to Kafka cannot do both atomically, because the two are different
+systems with no shared transaction coordinator. Write Postgres first, then
+Kafka: the process dies in the gap, the transaction commits, and no event is
+ever published — a transfer moved real money and every downstream
+consumer (the projector, a reconciliation job, a notification service) has no
+idea it happened. Write Kafka first, then Postgres: the Postgres write then
+fails or rolls back, and every consumer now believes a transfer happened that
+the ledger itself will deny. Neither ordering closes the window, because
+closing it requires exactly the thing that is missing — one atomic commit
+spanning both systems, which does not exist for two independently-operated
+stores.
+
+**What the outbox actually does.** It deletes the second system from the
+transaction. `outbox.Append` writes a row inside the *same* Postgres
+transaction as the journal entries it describes (`internal/outbox/writer.go`);
+one system, one commit, and invariant 6 holds by construction rather than by
+discipline. What is left afterwards — getting a row that is durably committed
+in Postgres onto Kafka — is a **replication** problem, not a dual-write one.
+Replication can retry indefinitely against its own bookkeeping (a
+`published_at` column, or Debezium's replication-slot LSN) without ever putting
+the ledger's own consistency at risk, because the ledger's own consistency was
+already settled the moment the outbox row committed.
+
+**What it does not solve, stated exactly, because this is the part that gets
+lost.** The gap between "the row committed in Postgres" and "the row's
+publication is durably recorded" still exists — it has simply moved from
+*across two systems* to *inside the publisher's own bookkeeping*. A publisher
+(either implementation; see D31) can produce a message to Kafka, receive the
+broker's acknowledgment, and crash before recording that fact. On restart it
+finds the row still looking unpublished and produces it again. The outbox
+therefore gives **at-least-once delivery, never exactly-once**, and this is not
+a residual bug to be tolerated — it is the direct, permanent consequence of
+choosing atomicity on the side that can actually have it (Postgres) over
+atomicity on the side that cannot (a second system reached over a network).
+**Every consumer of these events must be idempotent on `event_id`.** That
+requirement is why `processed_events` exists in the projector (D33) rather than
+a nice-to-have: without it, a duplicate delivery is a duplicate balance
+mutation, which is exactly the failure invariant 6 was written to prevent one
+layer up.
+
+### D31. Two publishers, one interface, Debezium the default
+
+**Decided.** `internal/outbox/publish.Publisher` is implemented twice —
+`polling` (a Go process running `SELECT … FOR UPDATE SKIP LOCKED` and producing
+via `franz-go`) and `debezium` (a status monitor over Kafka Connect's REST API;
+the actual publishing is Debezium reading the write-ahead log, entirely outside
+this codebase's control) — selected by `LEDGER_OUTBOX_PUBLISHER`. Debezium is
+the default.
+
+|  | Polling | Debezium CDC |
+|---|---|---|
+| **Latency** | Bounded below by the poll interval (200ms–1s) plus batch size; a real, constant floor even when idle. | Sub-second, typically tens of milliseconds — tailing the WAL as it is written, not waiting for a clock tick. |
+| **Ordering** | `ORDER BY id`, i.e. *insertion* order. Insertion order is not commit order under concurrent transactions: a lower-`id` row can commit after a higher-`id` row from a faster concurrent transaction, so a narrow but real reordering window exists. | Strict LSN order. The WAL **is** the commit order — this is the one categorical advantage, and no amount of polling cleverness closes the insertion-vs-commit-order gap the polling arm has, because that gap is a property of `id` being assigned at insert rather than at commit. |
+| **Crash behaviour** | Transaction-scoped and simple to reason about because it is code in this repository: row locks, the Kafka produce, and the `published_at` UPDATE all happen inside one database transaction. A crash mid-publish leaves the row unlocked and unmarked; the next poll cycle re-selects and re-publishes it. | Debezium tracks its own position (the replication slot's LSN plus a Kafka Connect offset topic). A crash replays from the last committed offset — the same at-least-once guarantee, but the recovery mechanism lives inside Kafka Connect rather than in a table this repository can `SELECT` from. |
+| **Operational complexity** | One more Go binary, run alone; no new infrastructure. | A Kafka Connect cluster; a replication slot that **must** be monitored, because an abandoned slot means the WAL is never recycled — a runaway disk-fill failure mode with a delayed, ugly blast radius; connector JSON to version and deploy; SMT configuration. Materially more moving parts. |
+| **Scaling out** | `SKIP LOCKED` (below) makes N replicas trivial and stateless. | One task per connector by default for a single-table source; scaling is a Kafka Connect exercise, not "start another process." |
+| **Cost to the write path** | Row locks held across a network call (the Kafka produce), bounded by a small batch size and a context deadline — a real anti-pattern in general, kept narrow here on purpose. | None. WAL reading is fully decoupled from the write path; no lock is ever taken by the connector. |
+
+**Why `FOR UPDATE SKIP LOCKED` is essential rather than a tuning knob.** Without
+it, a second polling replica's `SELECT … FOR UPDATE` **blocks** on any row the
+first replica has already locked, until the first replica's transaction
+commits. Every replica beyond the first then adds queueing rather than
+throughput — N replicas would have the effective concurrency of one, while
+paying for N. `SKIP LOCKED` makes a locked row invisible to a second
+transaction instead of a blocking one: replica B simply skips what A is
+holding and claims a *different* batch of up to 100 rows. N replicas therefore
+partition the backlog with zero coordination — no leader election, no assigned
+shard, nothing to rebalance when a replica dies mid-batch. That is the entire
+mechanism, and it is why this is the standard shape for a competing-consumers
+polling publisher rather than an incidental detail of the query.
+
+**Decided: Debezium is the default.** The deciding factor is not latency or
+operational cost — it is that LSN-ordered delivery is a correctness property
+the polling arm cannot match without independently reconstructing what the WAL
+already gives for free (a commit-ordered sequence, which is exactly the
+unsolved problem D16/D17 named for temporal balance queries in Phase 2).
+Polling is not a lesser fallback, though: it is the arm that makes the
+crash-recovery test in `TestOutbox_PollingPublisher_CrashBetweenPublishAndMark`
+possible to drive deterministically, because it is a process this repository
+starts and stops on purpose — interrupting Debezium's internal offset commit at
+a chosen instant is not something a test can arrange from outside Kafka
+Connect.
+
+**Consequence: the wire format cannot depend on which publisher wrote it.** For
+the config flag to be a real choice rather than a de facto one, both arms must
+produce equivalent Kafka messages. That is why the full event envelope
+(`event_id`, `event_type`, `event_version`, `aggregate_id`, `occurred_at`,
+`trace_id`, `payload`) is assembled once, in Go, and stored as the entirety of
+`outbox.payload` — see D32. The Debezium connector's job shrinks to "put the
+`payload` column on Kafka verbatim," which is the only shape in which its
+output and the polling publisher's output are indistinguishable to a consumer.

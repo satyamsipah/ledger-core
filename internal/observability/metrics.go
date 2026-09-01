@@ -99,6 +99,39 @@ type Metrics struct {
 	// violation, and the replay procedure documented in docs/DECISIONS.md
 	// only helps once someone has noticed.
 	ProjectorDLQTotal prometheus.Counter
+
+	// SagaSteps counts saga step attempts by step, direction and outcome.
+	//
+	// Direction is a label rather than a separate metric because the ratio
+	// between them is the number that matters: forward steps vastly
+	// outnumbering compensations is a healthy system, and the two series
+	// converging means something upstream is failing.
+	SagaSteps *prometheus.CounterVec
+
+	// SagaGatewayProbes counts resolution probes by what they concluded.
+	//
+	// The "unknown" series is the one to alert on. A probe that cannot settle
+	// the question is the leading indicator of a saga heading for manual
+	// review, and it fires while the money is still recoverable rather than
+	// after a human has been paged.
+	SagaGatewayProbes *prometheus.CounterVec
+
+	// SagaManualReview counts sagas that stopped and require a human, by the
+	// reason they stopped.
+	//
+	// THIS IS THE ALERT. It is a counter rather than a gauge on purpose: a
+	// gauge returning to zero because somebody resolved the saga erases the
+	// fact that it ever happened, and "how often does this happen" is exactly
+	// what decides whether the compensation budget is set correctly.
+	SagaManualReview *prometheus.CounterVec
+
+	// SagaInstances is the current population by status, refreshed on a ticker.
+	//
+	// Labelled by status only, never by saga id: an id label would grow one
+	// series per payout and take the scrape down within a day. The stuck sagas
+	// themselves are listed through the API, which is the right tool for
+	// unbounded identifiers.
+	SagaInstances *prometheus.GaugeVec
 }
 
 // NewMetrics builds the registry and registers the process collectors.
@@ -209,6 +242,38 @@ func NewMetrics(service string) *Metrics {
 			Help:        "Messages the projector could not apply and routed to the dead-letter topic.",
 			ConstLabels: prometheus.Labels{"service": service},
 		}),
+
+		SagaSteps: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace:   "ledger",
+			Subsystem:   "saga",
+			Name:        "steps_total",
+			Help:        "Saga step attempts, by step, direction and outcome.",
+			ConstLabels: prometheus.Labels{"service": service},
+		}, []string{"step", "direction", "outcome"}),
+
+		SagaGatewayProbes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace:   "ledger",
+			Subsystem:   "saga",
+			Name:        "gateway_probes_total",
+			Help:        "Gateway resolution probes, by what they concluded.",
+			ConstLabels: prometheus.Labels{"service": service},
+		}, []string{"outcome"}),
+
+		SagaManualReview: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace:   "ledger",
+			Subsystem:   "saga",
+			Name:        "manual_review_total",
+			Help:        "Sagas that stopped and require human resolution, by reason.",
+			ConstLabels: prometheus.Labels{"service": service},
+		}, []string{"saga_type", "reason"}),
+
+		SagaInstances: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace:   "ledger",
+			Subsystem:   "saga",
+			Name:        "instances",
+			Help:        "Saga instances by status.",
+			ConstLabels: prometheus.Labels{"service": service},
+		}, []string{"status"}),
 	}
 
 	registry.MustRegister(
@@ -218,6 +283,7 @@ func NewMetrics(service string) *Metrics {
 		m.OutboxPublished, m.OutboxPublishErrors, m.OutboxBacklog,
 		m.ProjectorConsumerLag, m.ProjectorEventsProcessed,
 		m.ProjectorDuplicatesSkipped, m.ProjectorDLQTotal,
+		m.SagaSteps, m.SagaGatewayProbes, m.SagaManualReview, m.SagaInstances,
 	)
 	return m
 }

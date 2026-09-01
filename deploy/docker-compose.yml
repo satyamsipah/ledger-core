@@ -302,6 +302,67 @@ services:
       retries: 10
       start_period: 5s
 
+  # A stand-in for the external payment gateway. Local development only, and
+  # the process says so in its own startup log.
+  #
+  # It holds payments in memory on purpose: restarting it loses them, which is
+  # the only faithful way to reproduce the worst case the saga has to survive --
+  # a gateway that cannot tell you what it did. `docker compose pause
+  # mock-gateway` mid-payout drives the same path.
+  mock-gateway:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        SERVICE: mock-gateway
+    environment:
+      LEDGER_ENV: local
+      LEDGER_HTTP_ADDR: ":8090"
+      LEDGER_LOG_LEVEL: debug
+    ports:
+      - "8090:8090"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8090/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+
+  saga-orchestrator:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        SERVICE: saga-orchestrator
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      # The orchestrator calls the gateway on its third step. Starting before
+      # the gateway answers would turn every early saga into an ambiguity to
+      # be probed away -- correct, but a noisy and pointless way to start up.
+      mock-gateway:
+        condition: service_healthy
+    environment:
+      LEDGER_ENV: local
+      # 9094: 9090-9093 are taken by api, outbox-publisher, redpanda's host
+      # Kafka port, and the projector respectively.
+      LEDGER_METRICS_ADDR: ":9094"
+      LEDGER_POSTGRES_DSN: postgres://ledger:ledger@postgres:5432/ledger?sslmode=disable
+      LEDGER_GATEWAY_URL: http://mock-gateway:8090
+      LEDGER_LOG_LEVEL: debug
+    ports:
+      - "9094:9094"
+    healthcheck:
+      # Health and metrics share the metrics listener, as in every worker here;
+      # there is no separate HTTP_ADDR port to point this at. See D35.
+      test: ["CMD", "wget", "-qO-", "http://localhost:9094/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
 volumes:
   postgres-data:
   redpanda-data:

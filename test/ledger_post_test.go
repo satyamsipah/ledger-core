@@ -17,6 +17,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/satyamsipah/ledger-core/internal/ledger"
+	"github.com/satyamsipah/ledger-core/internal/outbox"
 )
 
 // TestPostTransaction_PostsBalancedTransfer walks the whole write path once and
@@ -101,15 +102,24 @@ func TestPostTransaction_PostsBalancedTransfer(t *testing.T) {
 		var (
 			aggregateType string
 			eventType     string
-			payload       []byte
+			envelopeBytes []byte
 		)
 		require.NoError(t, sharedPool.QueryRow(ctx, `
 			SELECT aggregate_type, event_type, payload
-			  FROM outbox WHERE aggregate_id = $1`, posted.ID.String()).
-			Scan(&aggregateType, &eventType, &payload))
+			  FROM outbox WHERE aggregate_id = $1 AND aggregate_type = 'transaction'`, posted.ID.String()).
+			Scan(&aggregateType, &eventType, &envelopeBytes))
 
 		assert.Equal(t, "transaction", aggregateType)
 		assert.Equal(t, ledger.EventTypeTransactionPosted, eventType)
+
+		// The stored payload is the full wire envelope (event_id, event_type,
+		// event_version, occurred_at, trace_id) wrapping the transaction-
+		// specific fields, per docs/DECISIONS.md D31/D32 -- both publishers
+		// relay this column verbatim, so it has to be self-contained.
+		var envelope outbox.Envelope
+		require.NoError(t, json.Unmarshal(envelopeBytes, &envelope))
+		assert.Equal(t, ledger.EventTypeTransactionPosted, envelope.EventType)
+		assert.Equal(t, posted.ID.String(), envelope.AggregateID)
 
 		var event struct {
 			TransactionID uuid.UUID `json:"transaction_id"`
@@ -128,7 +138,7 @@ func TestPostTransaction_PostsBalancedTransfer(t *testing.T) {
 				Version   int64     `json:"version"`
 			} `json:"balances"`
 		}
-		require.NoError(t, json.Unmarshal(payload, &event))
+		require.NoError(t, json.Unmarshal(envelope.Payload, &event))
 
 		assert.Equal(t, posted.ID, event.TransactionID)
 		assert.Equal(t, "INR", event.Currency)
@@ -140,6 +150,17 @@ func TestPostTransaction_PostsBalancedTransfer(t *testing.T) {
 		// precision in the TypeScript dashboard.
 		assert.Equal(t, "50000", event.Entries[0].Amount.Amount)
 		assert.Equal(t, 2, event.Entries[0].Amount.Scale)
+	})
+
+	t.Run("should append one BalanceUpdated event per account touched", func(t *testing.T) {
+		var count int
+		require.NoError(t, sharedPool.QueryRow(ctx, `
+			SELECT count(*) FROM outbox
+			 WHERE aggregate_type = 'account' AND event_type = $1
+			   AND aggregate_id IN ($2, $3)`,
+			ledger.EventTypeBalanceUpdated, source.String(), target.String()).Scan(&count))
+		assert.Equal(t, 2, count,
+			"one BalanceUpdated per touched account is what makes partition key = account_id meaningful; see D32")
 	})
 
 	assertGlobalInvariant(t, ctx, sharedPool)

@@ -615,6 +615,27 @@ func (t *txn) LockAccounts(ctx context.Context, ids []uuid.UUID) ([]ledger.Locke
 	return locked, nil
 }
 
+// InsertAccount writes a new account row.
+//
+// currency is written into accounts_id_currency_key's shape (id, currency)
+// implicitly by this single-row INSERT satisfying the UNIQUE constraint on
+// first write; there is no separate step, because there is nothing else yet
+// that could conflict with a brand-new id.
+func (t *txn) InsertAccount(ctx context.Context, a *ledger.Account) error {
+	err := t.tx.QueryRow(ctx, `
+		INSERT INTO accounts (id, external_ref, account_type, normal_balance,
+		                      currency, owner_id, allow_negative, status)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		RETURNING created_at, updated_at, version`,
+		a.ID, a.ExternalRef, a.Type, a.NormalBalance, a.Currency, a.OwnerID,
+		a.AllowNegative, a.Status).
+		Scan(&a.CreatedAt, &a.UpdatedAt, &a.Version)
+	if err != nil {
+		return fmt.Errorf("insert account %s: %w", a.ID, mapError(err))
+	}
+	return nil
+}
+
 // InsertTransaction writes the header.
 //
 // posted_at is derived in SQL from the status rather than passed in, so

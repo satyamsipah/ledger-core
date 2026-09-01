@@ -14,12 +14,26 @@ import (
 	"github.com/satyamsipah/ledger-core/internal/outbox"
 )
 
-// Event types are versioned in their names so a consumer subscribing today
-// keeps working when a v2 payload appears alongside them.
+// Event types name what happened. They are stable strings, not versioned in
+// their own spelling -- EventVersion (below) is what a consumer compares when
+// deciding whether it understands a payload, replacing the ".v1"-suffix scheme
+// Phase 3 used. A consumer branching on an integer does not need to parse a
+// string suffix to do it.
 const (
-	EventTypeTransactionPosted   = "ledger.transaction.posted.v1"
-	EventTypeTransactionReversed = "ledger.transaction.reversed.v1"
+	EventTypeTransactionPosted   = "TransactionPosted"
+	EventTypeTransactionReversed = "TransactionReversed"
+	EventTypeAccountCreated      = "AccountCreated"
+	EventTypeBalanceUpdated      = "BalanceUpdated"
 )
+
+// eventVersion is the schema version stamped on every event this package
+// emits. One constant rather than one per event type: every payload below
+// changed together, in this phase, so they start together at 1. A future
+// change to just one payload shape earns that one event type its own bumped
+// version instead of moving this constant, which is why this is not named
+// eventVersion1 or otherwise implied to be the only version that will ever
+// exist.
+const eventVersion int16 = 1
 
 // Metadata keys used by reversals.
 //
@@ -113,6 +127,123 @@ type Service struct {
 // NewService wires a service to its repository.
 func NewService(repo Repository) *Service {
 	return &Service{repo: repo}
+}
+
+// CreateAccountRequest is a new account to open.
+type CreateAccountRequest struct {
+	ExternalRef   string
+	Type          AccountType
+	Currency      string
+	OwnerID       *string
+	AllowNegative bool
+}
+
+// CreateAccount opens an account and emits AccountCreated, inside one database
+// transaction.
+//
+// There is no row lock to take here -- a brand-new UUID has no concurrent
+// writer to serialise against -- so the only reason this runs inside
+// s.repo.InTx at all is invariant 6: the account row and the event describing
+// it must commit together, and InTx is the one place in this package that
+// makes that true. NormalBalance is derived from Type
+// (AccountType.NormalBalance in types.go) rather than accepted from the
+// caller, which is what makes accounts_normal_balance_matches_type_check
+// unreachable through this path rather than merely satisfied by a caller who
+// remembered to align the two.
+//
+// The account_balances row is not created here. Migration 000009's trigger
+// does it, unconditionally, on every INSERT into accounts regardless of which
+// code path performed it -- and that is deliberate: a lock on a balance row
+// that does not exist locks nothing and reports no error while doing so (see
+// that migration's comment), so guaranteeing the row's existence is a
+// correctness property of the schema, not a convenience this method could
+// also provide by hand and might one day forget to.
+func (s *Service) CreateAccount(ctx context.Context, req CreateAccountRequest) (*Account, error) {
+	if err := req.validate(); err != nil {
+		return nil, err
+	}
+
+	id, err := uuid.NewV7()
+	if err != nil {
+		return nil, fmt.Errorf("generate account id: %w", err)
+	}
+
+	var created *Account
+	err = s.repo.InTx(ctx, func(ctx context.Context, tx Tx) error {
+		account := &Account{
+			ID:            id,
+			ExternalRef:   req.ExternalRef,
+			Type:          req.Type,
+			NormalBalance: req.Type.NormalBalance(),
+			Currency:      req.Currency,
+			OwnerID:       req.OwnerID,
+			AllowNegative: req.AllowNegative,
+			Status:        AccountStatusActive,
+		}
+		if err := tx.InsertAccount(ctx, account); err != nil {
+			return err
+		}
+
+		payload, err := json.Marshal(accountCreatedEvent{
+			AccountID:     account.ID,
+			ExternalRef:   account.ExternalRef,
+			Type:          account.Type,
+			NormalBalance: account.NormalBalance,
+			Currency:      account.Currency,
+			OwnerID:       account.OwnerID,
+			AllowNegative: account.AllowNegative,
+		})
+		if err != nil {
+			return fmt.Errorf("marshal %s event for account %s: %w", EventTypeAccountCreated, account.ID, err)
+		}
+
+		if err := tx.AppendEvent(ctx, outbox.Event{
+			AggregateType: outbox.AggregateAccount,
+			AggregateID:   account.ID.String(),
+			EventType:     EventTypeAccountCreated,
+			EventVersion:  eventVersion,
+			OccurredAt:    account.CreatedAt,
+			Payload:       payload,
+		}); err != nil {
+			return err
+		}
+
+		created = account
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return created, nil
+}
+
+// accountCreatedEvent is the payload for EventTypeAccountCreated.
+type accountCreatedEvent struct {
+	AccountID     uuid.UUID   `json:"account_id"`
+	ExternalRef   string      `json:"external_ref"`
+	Type          AccountType `json:"account_type"`
+	NormalBalance Direction   `json:"normal_balance"`
+	Currency      string      `json:"currency"`
+	OwnerID       *string     `json:"owner_id,omitempty"`
+	AllowNegative bool        `json:"allow_negative"`
+}
+
+// validate checks everything that can be known without touching the database,
+// on the same principle as TransactionRequest.validate: the database enforces
+// these constraints regardless, but a caller should get a domain error rather
+// than a raw constraint violation for a mistake this cheap to catch first.
+func (r CreateAccountRequest) validate() error {
+	if r.ExternalRef == "" {
+		return fmt.Errorf("create account: external_ref is required: %w", ErrInvalidEntry)
+	}
+	if !r.Type.Valid() {
+		return fmt.Errorf("create account: account type %q: %w", r.Type, ErrInvalidAccountType)
+	}
+	if _, err := NewMoney(0, r.Currency); err != nil {
+		return fmt.Errorf("create account: %w", err)
+	}
+	return nil
 }
 
 // PostTransaction writes a balanced transaction and moves the affected
@@ -825,12 +956,95 @@ func appendTransactionEvent(
 		return fmt.Errorf("marshal %s event for %s: %w", eventType, header.ID, err)
 	}
 
-	return tx.AppendEvent(ctx, outbox.Event{
+	// PostedAt over CreatedAt when both exist: it is the more precise answer to
+	// "when did this take effect" for a transaction that spent time PENDING
+	// before posting. PostTransaction always posts synchronously so the two
+	// are identical there, but reversal and any future saga-posted path can
+	// legitimately have them differ, and this is correct for both without a
+	// caller having to know which.
+	occurredAt := header.CreatedAt
+	if header.PostedAt != nil {
+		occurredAt = *header.PostedAt
+	}
+
+	if err := tx.AppendEvent(ctx, outbox.Event{
 		AggregateType: outbox.AggregateTransaction,
 		AggregateID:   header.ID.String(),
 		EventType:     eventType,
+		EventVersion:  eventVersion,
+		OccurredAt:    occurredAt,
 		Payload:       payload,
-	})
+	}); err != nil {
+		return err
+	}
+
+	return appendBalanceUpdatedEvents(ctx, tx, header, balances, occurredAt)
+}
+
+// appendBalanceUpdatedEvents emits one BalanceUpdated event per account this
+// transaction touched, in addition to the single TransactionPosted or
+// TransactionReversed event appendTransactionEvent already wrote.
+//
+// THIS IS WHERE "PARTITION KEY = ACCOUNT_ID" ACTUALLY APPLIES. A transaction
+// event is keyed by transaction id because a transaction inherently touches
+// two or more accounts and cannot honestly be keyed by one of them (see
+// AggregateTransaction's doc comment). A balance update is, by construction,
+// about exactly one account, so it is the natural place to key by account_id
+// and get the real per-account ordering guarantee that gives: every
+// BalanceUpdated event that ever mentions this account, across every
+// transaction that has touched it, is delivered to one consumer in commit
+// order.
+//
+// WHAT THIS DOES NOT GIVE, AND WHY THE PROJECTOR DOES NOT NEED IT ANYWAY: the
+// debit-side and credit-side BalanceUpdated events of one transfer land on two
+// different accounts' partitions, with no ordering relationship between them
+// -- a consumer that has processed one cannot assume the other has arrived.
+// The projector sidesteps this by consuming TransactionPosted instead (which
+// carries every touched account's resulting balance in one message) and by
+// applying balances as a version compare-and-set rather than a delta, which
+// converges to the correct state regardless of arrival order. BalanceUpdated
+// exists for consumers that want a lighter, per-account message and do not
+// need the whole transaction shape -- a cache invalidator, a notification
+// service -- and for them, the per-account ordering above is the real and
+// useful guarantee.
+func appendBalanceUpdatedEvents(ctx context.Context, tx Tx, header *Transaction, balances []eventBalance, occurredAt time.Time) error {
+	for _, b := range balances {
+		payload, err := json.Marshal(balanceUpdatedEvent{
+			AccountID:     b.AccountID,
+			TransactionID: header.ID,
+			Available:     b.Available,
+			Version:       b.Version,
+		})
+		if err != nil {
+			return fmt.Errorf("marshal %s event for account %s: %w", EventTypeBalanceUpdated, b.AccountID, err)
+		}
+
+		if err := tx.AppendEvent(ctx, outbox.Event{
+			AggregateType: outbox.AggregateAccount,
+			AggregateID:   b.AccountID.String(),
+			EventType:     EventTypeBalanceUpdated,
+			EventVersion:  eventVersion,
+			OccurredAt:    occurredAt,
+			Payload:       payload,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// balanceUpdatedEvent is the payload for EventTypeBalanceUpdated.
+//
+// Available is the resulting balance, not a delta -- the same design choice
+// transactionEvent.Balances already made, and for the identical reason: a
+// consumer applying "set to this value at this version" converges to the
+// correct state under redelivery and out-of-order arrival alike, where a delta
+// would not.
+type balanceUpdatedEvent struct {
+	AccountID     uuid.UUID `json:"account_id"`
+	TransactionID uuid.UUID `json:"transaction_id"`
+	Available     Money     `json:"available"`
+	Version       int64     `json:"version"`
 }
 
 // uniformCurrency returns the shared currency of a set of entries, or the empty

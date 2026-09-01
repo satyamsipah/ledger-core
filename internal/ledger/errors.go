@@ -93,6 +93,13 @@ var (
 	// schema's CHECK constraint accepts.
 	ErrInvalidTransactionType = errors.New("ledger: unknown transaction type")
 
+	// ErrInvalidAccountType means the account type is not one
+	// accounts_account_type_check accepts. A sentinel of its own rather than
+	// reusing ErrInvalidTransactionType: the two check different columns on
+	// different tables, and a caller branching on errors.Is should not have to
+	// know that "transaction type" was standing in for "account type" too.
+	ErrInvalidAccountType = errors.New("ledger: unknown account type")
+
 	// ErrMissingRenderer means a request carried an idempotency key with no
 	// ResponseRenderer. Committing that would leave the key IN_PROGRESS over a
 	// transaction that really posted -- the one state the idempotency design

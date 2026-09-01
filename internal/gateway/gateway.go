@@ -21,6 +21,8 @@ import (
 // -- it is the absence of an answer, and it travels as ErrGatewayUnavailable.
 type Status string
 
+// The two outcomes a gateway can report. Both are CONCLUSIVE: reaching either
+// one means the question has been answered and the saga may act on it.
 const (
 	StatusSucceeded Status = "SUCCEEDED"
 	StatusFailed    Status = "FAILED"

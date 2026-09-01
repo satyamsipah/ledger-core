@@ -110,12 +110,12 @@ func (c *HTTPClient) do(req *http.Request, key string) (*Payment, error) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	switch {
-	case resp.StatusCode == http.StatusOK, resp.StatusCode == http.StatusCreated:
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusCreated:
 		return decodePayment(resp.Body, key)
-	case resp.StatusCode == http.StatusNotFound:
+	case http.StatusNotFound:
 		return nil, fmt.Errorf("gateway key %s: %w", key, ErrPaymentNotFound)
-	case resp.StatusCode == http.StatusBadRequest, resp.StatusCode == http.StatusUnprocessableEntity:
+	case http.StatusBadRequest, http.StatusUnprocessableEntity:
 		return nil, fmt.Errorf("gateway key %s: %w: %s", key, ErrInvalidRequest, snippet(resp.Body))
 	default:
 		return nil, fmt.Errorf("gateway key %s returned %d: %w: %s",

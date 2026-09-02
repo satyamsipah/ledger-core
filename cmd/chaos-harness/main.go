@@ -139,8 +139,13 @@ func run() error {
 
 	go func() {
 		<-ctx.Done()
+		// Deliberately built from context.Background(), matching
+		// internal/http/server.go's identical shutdown: ctx is already
+		// cancelled by the time we get here, so deriving the shutdown
+		// deadline from it would abort the drain instantly.
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		//nolint:contextcheck // see comment above; shutdownCtx must not inherit the already-cancelled ctx
 		_ = server.Shutdown(shutdownCtx)
 	}()
 

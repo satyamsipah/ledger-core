@@ -31,7 +31,13 @@ func newDockerClient() *dockerClient {
 			Timeout: 10 * time.Second,
 			Transport: &nethttp.Transport{
 				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-					return net.Dial("unix", "/var/run/docker.sock")
+					// DialContext, not the bare net.Dial: the whole point of
+					// giving this client a Timeout is that a wedged Docker
+					// daemon turns into a clean error rather than a hang, and
+					// that guarantee has to reach the dial itself, not just
+					// the request round trip.
+					var d net.Dialer
+					return d.DialContext(ctx, "unix", "/var/run/docker.sock")
 				},
 			},
 		},
@@ -61,7 +67,7 @@ func (d *dockerClient) post(ctx context.Context, path string) error {
 	if err != nil {
 		return fmt.Errorf("call docker %s: %w", path, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode >= 300 {
 		return fmt.Errorf("docker %s: unexpected status %d", path, resp.StatusCode)

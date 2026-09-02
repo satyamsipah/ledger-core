@@ -48,7 +48,7 @@ func (r durationRequest) duration() time.Duration {
 }
 
 func decodeBody(r *nethttp.Request, v any) error {
-	defer r.Body.Close()
+	defer func() { _ = r.Body.Close() }()
 	if r.ContentLength == 0 {
 		return nil
 	}
@@ -80,19 +80,23 @@ func (h *harness) handleDBDown(w nethttp.ResponseWriter, r *nethttp.Request) {
 		return
 	}
 	d := req.duration()
+	ctx := r.Context()
 
-	h.logger.WarnContext(r.Context(), "injecting fault: postgres unreachable", slog.Duration("duration", d))
-	if err := h.docker.pause(r.Context(), h.cfg.postgresContainer); err != nil {
+	h.logger.WarnContext(ctx, "injecting fault: postgres unreachable", slog.Duration("duration", d))
+	if err := h.docker.pause(ctx, h.cfg.postgresContainer); err != nil {
 		writeResult(w, "db-down", d, fmt.Errorf("pause postgres: %w", err))
 		return
 	}
 
 	time.Sleep(d)
 
-	// Best-effort unpause even if the request context has since been
-	// cancelled: leaving postgres frozen because a caller disconnected would
-	// turn a bounded fault into an unbounded outage nobody asked for.
-	if err := h.docker.unpause(context.Background(), h.cfg.postgresContainer); err != nil {
+	// WithoutCancel, not Background: best-effort unpause even if the request
+	// context has since been cancelled -- leaving postgres frozen because a
+	// caller disconnected would turn a bounded fault into an unbounded
+	// outage nobody asked for -- but still derived from ctx rather than a
+	// disconnected root, the same reasoning internal/outbox/publish/polling
+	// already uses for its own deferred rollback.
+	if err := h.docker.unpause(context.WithoutCancel(ctx), h.cfg.postgresContainer); err != nil {
 		writeResult(w, "db-down", d, fmt.Errorf("unpause postgres: %w", err))
 		return
 	}
@@ -109,16 +113,17 @@ func (h *harness) handleKafkaDown(w nethttp.ResponseWriter, r *nethttp.Request) 
 		return
 	}
 	d := req.duration()
+	ctx := r.Context()
 
-	h.logger.WarnContext(r.Context(), "injecting fault: kafka unreachable", slog.Duration("duration", d))
-	if err := h.docker.pause(r.Context(), h.cfg.redpandaContainer); err != nil {
+	h.logger.WarnContext(ctx, "injecting fault: kafka unreachable", slog.Duration("duration", d))
+	if err := h.docker.pause(ctx, h.cfg.redpandaContainer); err != nil {
 		writeResult(w, "kafka-down", d, fmt.Errorf("pause redpanda: %w", err))
 		return
 	}
 
 	time.Sleep(d)
 
-	if err := h.docker.unpause(context.Background(), h.cfg.redpandaContainer); err != nil {
+	if err := h.docker.unpause(context.WithoutCancel(ctx), h.cfg.redpandaContainer); err != nil {
 		writeResult(w, "kafka-down", d, fmt.Errorf("unpause redpanda: %w", err))
 		return
 	}
@@ -141,18 +146,22 @@ func (h *harness) handleSlowQuery(w nethttp.ResponseWriter, r *nethttp.Request) 
 	}
 	d := req.duration()
 
-	h.logger.WarnContext(r.Context(), "injecting fault: slow query (holding a real row lock)",
+	ctx := r.Context()
+	h.logger.WarnContext(ctx, "injecting fault: slow query (holding a real row lock)",
 		slog.String("account_ref", h.cfg.hotAccountRef), slog.Duration("duration", d))
 
 	// A fresh, dedicated connection: this transaction is held deliberately
 	// across the whole sleep, and sharing the pool with anything else this
 	// process might do would be its own small bug to chase later.
-	tx, err := h.pool.Begin(r.Context())
+	tx, err := h.pool.Begin(ctx)
 	if err != nil {
 		writeResult(w, "slow-query", d, fmt.Errorf("begin: %w", err))
 		return
 	}
-	defer func() { _ = tx.Rollback(context.Background()) }()
+	// WithoutCancel: a rollback must still be attempted even if the request
+	// context is already done by the time this runs, the same pattern
+	// internal/outbox/publish/polling uses for its own deferred rollback.
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
 
 	// FOR UPDATE on account_balances, keyed by the account's own
 	// external_ref -- the same row the ordinary write path locks
@@ -160,7 +169,7 @@ func (h *harness) handleSlowQuery(w nethttp.ResponseWriter, r *nethttp.Request) 
 	// account genuinely queues behind this one rather than behind a lock
 	// nothing else contends for.
 	var accountID string
-	err = tx.QueryRow(r.Context(), `
+	err = tx.QueryRow(ctx, `
 		SELECT ab.account_id
 		  FROM account_balances ab
 		  JOIN accounts a ON a.id = ab.account_id
@@ -174,12 +183,12 @@ func (h *harness) handleSlowQuery(w nethttp.ResponseWriter, r *nethttp.Request) 
 	// pg_sleep INSIDE the held transaction, not a Go time.Sleep after
 	// releasing it: the lock and the delay must be the same interval, or
 	// this is a slow HTTP handler wearing a slow query's name.
-	if _, err := tx.Exec(r.Context(), `SELECT pg_sleep($1)`, d.Seconds()); err != nil {
+	if _, err := tx.Exec(ctx, `SELECT pg_sleep($1)`, d.Seconds()); err != nil {
 		writeResult(w, "slow-query", d, fmt.Errorf("hold lock: %w", err))
 		return
 	}
 
-	if err := tx.Commit(r.Context()); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		writeResult(w, "slow-query", d, fmt.Errorf("commit: %w", err))
 		return
 	}
@@ -217,7 +226,7 @@ func (h *harness) setGatewayBehaviour(ctx context.Context, b gatewayBehaviourReq
 	if err != nil {
 		return fmt.Errorf("set gateway behaviour: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
 		return fmt.Errorf("set gateway behaviour: unexpected status %d", resp.StatusCode)
 	}
@@ -243,17 +252,18 @@ func (h *harness) handleGatewayTimeout(w nethttp.ResponseWriter, r *nethttp.Requ
 		latency = 30_000
 	}
 
-	h.logger.WarnContext(r.Context(), "injecting fault: gateway latency",
+	ctx := r.Context()
+	h.logger.WarnContext(ctx, "injecting fault: gateway latency",
 		slog.Int("latency_ms", latency), slog.Duration("duration", d))
 
-	if err := h.setGatewayBehaviour(r.Context(), gatewayBehaviourRequest{Outcome: "succeed", LatencyMS: latency}); err != nil {
+	if err := h.setGatewayBehaviour(ctx, gatewayBehaviourRequest{Outcome: "succeed", LatencyMS: latency}); err != nil {
 		writeResult(w, "gateway-timeout", d, err)
 		return
 	}
 
 	time.Sleep(d)
 
-	if err := h.setGatewayBehaviour(context.Background(), gatewayBehaviourRequest{Outcome: "succeed", LatencyMS: 0}); err != nil {
+	if err := h.setGatewayBehaviour(context.WithoutCancel(ctx), gatewayBehaviourRequest{Outcome: "succeed", LatencyMS: 0}); err != nil {
 		writeResult(w, "gateway-timeout", d, err)
 		return
 	}
@@ -274,16 +284,17 @@ func (h *harness) handleGateway500(w nethttp.ResponseWriter, r *nethttp.Request)
 	}
 	d := req.duration()
 
-	h.logger.WarnContext(r.Context(), "injecting fault: gateway 500s", slog.Duration("duration", d))
+	ctx := r.Context()
+	h.logger.WarnContext(ctx, "injecting fault: gateway 500s", slog.Duration("duration", d))
 
-	if err := h.setGatewayBehaviour(r.Context(), gatewayBehaviourRequest{Outcome: "error"}); err != nil {
+	if err := h.setGatewayBehaviour(ctx, gatewayBehaviourRequest{Outcome: "error"}); err != nil {
 		writeResult(w, "gateway-500", d, err)
 		return
 	}
 
 	time.Sleep(d)
 
-	if err := h.setGatewayBehaviour(context.Background(), gatewayBehaviourRequest{Outcome: "succeed"}); err != nil {
+	if err := h.setGatewayBehaviour(context.WithoutCancel(ctx), gatewayBehaviourRequest{Outcome: "succeed"}); err != nil {
 		writeResult(w, "gateway-500", d, err)
 		return
 	}
@@ -328,17 +339,18 @@ func (h *harness) handleClockSkew(w nethttp.ResponseWriter, r *nethttp.Request) 
 		return
 	}
 
-	h.logger.WarnContext(r.Context(), "injecting fault: clock skew",
+	ctx := r.Context()
+	h.logger.WarnContext(ctx, "injecting fault: clock skew",
 		slog.String("target", req.Target), slog.Float64("offset_seconds", req.OffsetSeconds), slog.Duration("duration", d))
 
-	if err := h.setClockOffset(r.Context(), targetURL, req.OffsetSeconds); err != nil {
+	if err := h.setClockOffset(ctx, targetURL, req.OffsetSeconds); err != nil {
 		writeResult(w, "clock-skew", d, err)
 		return
 	}
 
 	time.Sleep(d)
 
-	if err := h.setClockOffset(context.Background(), targetURL, 0); err != nil {
+	if err := h.setClockOffset(context.WithoutCancel(ctx), targetURL, 0); err != nil {
 		writeResult(w, "clock-skew", d, err)
 		return
 	}
@@ -362,7 +374,7 @@ func (h *harness) setClockOffset(ctx context.Context, targetURL string, offsetSe
 	if err != nil {
 		return fmt.Errorf("set clock skew on %s: %w", targetURL, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
 		return fmt.Errorf("set clock skew on %s: unexpected status %d -- is LEDGER_FAULT_INJECTION_ENABLED set on that process?",
 			targetURL, resp.StatusCode)

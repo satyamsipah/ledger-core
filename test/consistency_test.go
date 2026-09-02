@@ -86,8 +86,12 @@ func TestConsistency_Checks(t *testing.T) {
 		_, err = pool.Exec(ctx, `ALTER TABLE journal_entries DISABLE TRIGGER journal_entries_no_mutation`)
 		require.NoError(t, err)
 		t.Cleanup(func() {
-			_, _ = pool.Exec(context.Background(), `ALTER TABLE journal_entries ENABLE TRIGGER journal_entries_balanced`)
-			_, _ = pool.Exec(context.Background(), `ALTER TABLE journal_entries ENABLE TRIGGER journal_entries_no_mutation`)
+			// ctx (the outer, never-cancelled context.Background() this test
+			// started with), not a fresh context.Background() call: identical
+			// in effect here, but derived rather than a second root, which is
+			// what contextcheck actually wants to see.
+			_, _ = pool.Exec(ctx, `ALTER TABLE journal_entries ENABLE TRIGGER journal_entries_balanced`)
+			_, _ = pool.Exec(ctx, `ALTER TABLE journal_entries ENABLE TRIGGER journal_entries_no_mutation`)
 		})
 
 		txID := mustUUIDv7(t)
@@ -128,7 +132,7 @@ func TestConsistency_Checks(t *testing.T) {
 			`UPDATE account_balances SET available_minor = available_minor + 777 WHERE account_id = $1`, a)
 		require.NoError(t, err)
 		t.Cleanup(func() {
-			_, _ = pool.Exec(context.Background(),
+			_, _ = pool.Exec(ctx,
 				`UPDATE account_balances SET available_minor = $2 WHERE account_id = $1`, a, before)
 		})
 

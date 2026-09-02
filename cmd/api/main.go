@@ -22,6 +22,7 @@ import (
 	"github.com/satyamsipah/ledger-core/internal/ledger"
 	"github.com/satyamsipah/ledger-core/internal/ledger/pgledger"
 	"github.com/satyamsipah/ledger-core/internal/observability"
+	"github.com/satyamsipah/ledger-core/internal/reconciliation/pgreconciliation"
 	"github.com/satyamsipah/ledger-core/internal/saga/payout"
 	"github.com/satyamsipah/ledger-core/internal/saga/pgsaga"
 )
@@ -81,7 +82,7 @@ func run() error {
 		pgledger.WithRetrier(retrier),
 		pgledger.WithAdvisoryLocks(cfg.Ledger.AdvisoryLocks))
 
-	ledgerService := ledger.NewService(repository)
+	ledgerService := ledger.NewService(repository, metrics)
 
 	// NoopCache: Redis is deliberately absent. Correctness never depended on it,
 	// and the cache hit-rate counter is what will decide whether the dependency
@@ -114,6 +115,11 @@ func run() error {
 		StepTimeout: cfg.Saga.StepTimeout,
 	})
 
+	// The API reads reconciliation reports; it never runs a reconciliation.
+	// cmd/reconciler owns the job, the same split this process already makes
+	// for sagas: it starts and reads them but never drives the state machine.
+	reconciliationStore := pgreconciliation.New(pool.Pool, cfg.Postgres.QueryTimeout)
+
 	router := ledgerhttp.NewRouter(ledgerhttp.Deps{
 		Service:          serviceName,
 		Logger:           logger,
@@ -123,6 +129,7 @@ func run() error {
 		Idempotency:      idempotencyManager,
 		Payout:           payoutStarter,
 		Sagas:            sagaStore,
+		Reconciliation:   reconciliationStore,
 		TrustedProxyHops: cfg.HTTP.TrustedProxyHops,
 		Auth:             authStore,
 	})
@@ -133,6 +140,13 @@ func run() error {
 	// through whatever fronts the public API.
 	metricsMux := nethttp.NewServeMux()
 	metricsMux.Handle("/metrics", metrics.Handler())
+	if cfg.FaultInjectionEnabled {
+		// Admin listener only, never the public one -- see
+		// ledgerhttp.HandleClockSkew's own doc comment for why this is not
+		// wired through Deps/NewMux like every other route.
+		metricsMux.Handle("/internal/faults/clock-skew", ledgerhttp.HandleClockSkew())
+		logger.Warn("fault injection enabled: /internal/faults/clock-skew is live on the admin listener")
+	}
 	metricsCfg := cfg.HTTP
 	metricsCfg.Addr = cfg.Observability.MetricsAddr
 	metricsServer := ledgerhttp.NewServer("metrics", metricsCfg, metricsMux, logger)

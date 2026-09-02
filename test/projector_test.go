@@ -12,6 +12,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/satyamsipah/ledger-core/internal/kafka"
 	"github.com/satyamsipah/ledger-core/internal/ledger"
@@ -108,6 +112,87 @@ func TestProjector_ConsumesAndAppliesTransactionPosted(t *testing.T) {
 		return err == nil && available == authoritative.Available.AmountMinor() && version == authoritative.Version
 	}, 15*time.Second, 100*time.Millisecond,
 		"the projection must converge to the same balance and version the write path itself holds")
+}
+
+// TestProjector_TraceContextPropagatesThroughKafkaHeaders proves the thing
+// the phase actually asked for -- "trace context propagated through Kafka
+// message headers so one trace spans the whole async flow" -- rather than
+// merely that outbox.trace_parent gets populated. Populating a column and
+// genuinely linking a span are different claims, and only the second is what
+// makes a trace in a real backend show the HTTP request and the projector's
+// handling of its event as one connected waterfall instead of two spans that
+// happen to carry a matching string.
+//
+// It installs a REAL tracer provider with an in-memory recorder as the
+// process-global one, globally, for its own duration -- safe despite this
+// package running many tests in parallel elsewhere, because this test does
+// not call t.Parallel(). Go's test runner does not begin executing ANY
+// t.Parallel() test's body in this package until every non-parallel test --
+// this one included, cleanup and all -- has already returned, so no parallel
+// test observes the swapped provider mid-test. See
+// TestProjector_ConsumesAndAppliesTransactionPosted and its neighbours for
+// the same non-parallel shape, chosen there for the unrelated reason that
+// each test spins its own Redpanda container.
+//
+// The assertion that matters is SpanContext().TraceID() equality between the
+// producing span and a span the projector started, found by searching
+// recorded spans rather than assumed to be the only one recorded: draining
+// the outbox (see drainToKafka) also publishes any backlog OTHER tests left
+// behind on the shared pool, and this consumer will apply those too, each
+// starting its own "projector.apply_event" span with no relation to this
+// test's trace. Searching for the matching trace id, rather than asserting
+// there is exactly one span, is what makes this robust to that shared state
+// rather than flaky because of it.
+func TestProjector_TraceContextPropagatesThroughKafkaHeaders(t *testing.T) {
+	ctx := context.Background()
+
+	_, brokers := startRedpanda(ctx, t)
+	provisionTestTopics(ctx, t, brokers)
+
+	recorder := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+
+	originalProvider := otel.GetTracerProvider()
+	originalPropagator := otel.GetTextMapPropagator()
+	otel.SetTracerProvider(provider)
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	t.Cleanup(func() {
+		otel.SetTracerProvider(originalProvider)
+		otel.SetTextMapPropagator(originalPropagator)
+	})
+
+	service := newLedgerService(sharedPool)
+	from := newAccount(t, ctx, sharedPool, "INR", true)
+	to := newTypedAccount(t, ctx, sharedPool, ledger.AccountTypeLiability, "INR", false)
+
+	tracedCtx, span := provider.Tracer("test").Start(ctx, "test-request")
+	producingTraceID := span.SpanContext().TraceID()
+	require.True(t, producingTraceID.IsValid())
+
+	_, err := service.PostTransaction(tracedCtx, transferRequest(t, from, to, 300, "INR"))
+	require.NoError(t, err)
+	span.End()
+
+	drainToKafka(t, ctx, brokers)
+
+	_, stop := runConsumerFor(t, brokers)
+	defer stop()
+
+	var consumerSpan sdktrace.ReadOnlySpan
+	require.Eventually(t, func() bool {
+		for _, s := range recorder.Ended() {
+			if s.Name() == "projector.apply_event" && s.SpanContext().TraceID() == producingTraceID {
+				consumerSpan = s
+				return true
+			}
+		}
+		return false
+	}, 15*time.Second, 100*time.Millisecond,
+		"the projector must start a span in the SAME trace as the request that produced the event")
+
+	assert.True(t, consumerSpan.Parent().IsValid(),
+		"the consumer's span must carry a real parent, proving Extract linked it rather than starting a fresh root that coincidentally shares a trace id")
+	assert.Equal(t, producingTraceID, consumerSpan.Parent().TraceID())
 }
 
 // TestProjector_DuplicateDeliveryIsSkipped covers dedupe on the consumer's

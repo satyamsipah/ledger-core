@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/satyamsipah/ledger-core/internal/clock"
 	"github.com/satyamsipah/ledger-core/internal/idempotency"
 	"github.com/satyamsipah/ledger-core/internal/ledger"
 )
@@ -639,6 +640,93 @@ func TestIdempotency_ExpiredKeyIsRefusedRatherThanReexecuted(t *testing.T) {
 	balance, err := service.GetBalance(ctx, to)
 	require.NoError(t, err)
 	assert.Equal(t, int64(600), balance.Available.AmountMinor())
+
+	assertGlobalInvariant(t, ctx, sharedPool)
+}
+
+// TestIdempotency_ClockSkewCausesReadPathToTreatALiveRecordAsExpired proves
+// internal/clock's own reason for existing: internal/idempotency.resolveExisting
+// now reads clock.Now() rather than time.Now() specifically so a fault-injection
+// harness can simulate a skewed API process clock, and this is the test that
+// the wiring actually took -- not merely that the package compiles.
+//
+// Unlike TestIdempotency_ExpiredKeyIsRefusedRatherThanReexecuted above, nothing
+// in the database is aged or swept here. The record stays exactly as it was,
+// still fully present, still genuinely un-expired by its own expires_at
+// column; only the process's OWN clock reading moves. That is the entire
+// point: this is the read-path check (D21's "a retry arriving after the TTL
+// is refused"), not the sweeper's physical deletion, and it is the one place
+// a skewed API clock could genuinely misbehave.
+//
+// No t.Parallel(): this test sets internal/clock's process-wide offset, which
+// every other test in this suite implicitly assumes reads the real clock.
+// Safe anyway, for the identical reason
+// TestProjector_TraceContextPropagatesThroughKafkaHeaders swaps OTel's global
+// provider safely -- see that test's own comment: Go's test runner does not
+// begin running any t.Parallel() test's body in this package until every
+// serial test, this one included with its own cleanup, has already returned.
+func TestIdempotency_ClockSkewCausesReadPathToTreatALiveRecordAsExpired(t *testing.T) {
+	ctx := context.Background()
+	t.Cleanup(func() { clock.SetOffset(0) })
+
+	service := newLedgerService(sharedPool)
+	manager := newIdempotencyManager(t, sharedPool, idempotency.DefaultLease)
+
+	from := newAccount(t, ctx, sharedPool, "INR", true)
+	to := newTypedAccount(t, ctx, sharedPool, ledger.AccountTypeLiability, "INR", false)
+
+	key := uuid.NewString()
+	fingerprint, err := idempotency.FingerprintOf("POST", "/v1/transactions", []byte(`{"amount":"700"}`))
+	require.NoError(t, err)
+
+	reservation := idempotency.Reservation{
+		Key: key, Fingerprint: fingerprint, Method: "POST", Route: "/v1/transactions",
+		TTL: time.Hour, Lease: idempotency.DefaultLease,
+	}
+
+	_, disposition, err := manager.Acquire(ctx, reservation)
+	require.NoError(t, err)
+	require.Equal(t, idempotency.Proceed, disposition)
+
+	request := transferRequest(t, from, to, 700, "INR")
+	request.Idempotency = &ledger.Idempotent{Key: key, Render: renderStub(t)}
+	posted, err := service.PostTransaction(ctx, request)
+	require.NoError(t, err)
+
+	// This test never runs a publisher, so PostTransaction's own outbox rows
+	// (one TransactionPosted, two BalanceUpdated) sit unpublished when it
+	// ends -- and TestOutboxPublish_KafkaOutage's polling publisher drains
+	// the WHOLE shared outbox table, not merely the rows its own test
+	// created, so it would sweep these up and inflate its own before/after
+	// delta by exactly one transfer's worth. Deleted rather than left
+	// behind: this test's assertions are entirely about the idempotency
+	// read path, and these rows never mattered to it even while present.
+	t.Cleanup(func() {
+		_, _ = sharedPool.Exec(context.Background(),
+			`DELETE FROM outbox WHERE aggregate_id IN ($1, $2, $3) AND published_at IS NULL`,
+			posted.ID.String(), from.String(), to.String())
+	})
+
+	t.Run("should replay normally while the clock is not skewed", func(t *testing.T) {
+		_, disposition, err := manager.Acquire(ctx, reservation)
+		require.NoError(t, err)
+		assert.Equal(t, idempotency.Replay, disposition)
+	})
+
+	t.Run("should refuse the same still-present record once the clock skews past its TTL", func(t *testing.T) {
+		clock.SetOffset(2 * time.Hour)
+
+		_, _, err := manager.Acquire(ctx, reservation)
+		assert.ErrorIs(t, err, idempotency.ErrKeyExpired)
+	})
+
+	t.Run("should replay again once the clock is un-skewed, with nothing about the record itself changed", func(t *testing.T) {
+		clock.SetOffset(0)
+
+		_, disposition, err := manager.Acquire(ctx, reservation)
+		require.NoError(t, err)
+		assert.Equal(t, idempotency.Replay, disposition)
+	})
 
 	assertGlobalInvariant(t, ctx, sharedPool)
 }

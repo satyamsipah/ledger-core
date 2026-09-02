@@ -11,6 +11,13 @@ name: ledger-core
 services:
   postgres:
     image: postgres:16-alpine
+    # Pinned rather than left to Compose's own auto-naming (normally
+    # <project>-<service>-<n>): cmd/chaos-harness pauses this container by
+    # name over the Docker Engine API, and a name that changes with whatever
+    # directory this repo happens to be checked out into would make its
+    # default CHAOS_POSTGRES_CONTAINER wrong on every machine but the one it
+    # was set on.
+    container_name: ledger-postgres
     command:
       - postgres
       # wal_level=logical is what makes CDC possible at all. Debezium decodes
@@ -59,6 +66,9 @@ services:
 
   redpanda:
     image: redpandadata/redpanda:v24.2.7
+    # Pinned for the identical reason postgres above is: cmd/chaos-harness
+    # addresses this container by name.
+    container_name: ledger-redpanda
     command:
       - redpanda
       - start
@@ -209,6 +219,11 @@ services:
       LEDGER_REDIS_ADDR: redis:6379
       LEDGER_KAFKA_BROKERS: redpanda:29092
       LEDGER_LOG_LEVEL: debug
+      # Off by default, deliberately explicit rather than merely absent:
+      # deploy/docker-compose.chaos.yml overrides this to "true" for a chaos
+      # run, and stating the default here says what it is being overridden
+      # FROM, not just that it happens to default to false somewhere in Go.
+      LEDGER_FAULT_INJECTION_ENABLED: "false"
     ports:
       - "8080:8080"
       - "9090:9090"
@@ -352,6 +367,9 @@ services:
       LEDGER_POSTGRES_DSN: postgres://ledger:ledger@postgres:5432/ledger?sslmode=disable
       LEDGER_GATEWAY_URL: http://mock-gateway:8090
       LEDGER_LOG_LEVEL: debug
+      # See the identical flag on the api service above -- same default,
+      # same override file, same reasoning.
+      LEDGER_FAULT_INJECTION_ENABLED: "false"
     ports:
       - "9094:9094"
     healthcheck:
@@ -363,6 +381,97 @@ services:
       retries: 10
       start_period: 5s
 
+  reconciler:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        SERVICE: reconciler
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      LEDGER_ENV: local
+      # 9095: 9090-9094 are taken by api, outbox-publisher, redpanda's host
+      # Kafka port, the projector and the saga orchestrator respectively.
+      LEDGER_METRICS_ADDR: ":9095"
+      LEDGER_POSTGRES_DSN: postgres://ledger:ledger@postgres:5432/ledger?sslmode=disable
+      LEDGER_LOG_LEVEL: debug
+      # Empty by default: this container has no PSP statement to reconcile
+      # against out of the box, and a reconciler that failed every tick on a
+      # missing file would be a worse default than one that says so once and
+      # idles. See README.md's Reconciliation section for how to point this
+      # at deploy/seed/psp_statement.example.csv once you have posted matching
+      # transactions to try it against.
+      LEDGER_RECONCILER_PSP_CSV_PATH: ""
+    ports:
+      - "9095:9095"
+    healthcheck:
+      # Health and metrics share the metrics listener, as in every worker
+      # here; there is no separate HTTP_ADDR port to point this at. See D35.
+      test: ["CMD", "wget", "-qO-", "http://localhost:9095/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9099:9090"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9090/-/healthy"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+      start_period: 5s
+
+  grafana:
+    image: grafana/grafana:11.3.1
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    environment:
+      # Local only, and deliberately obvious for the same reason
+      # api_keys' seeded dev key is (see deploy/seed/seed.sql): unmistakable
+      # in a diff or a log line, and it authenticates nothing this stack does
+      # not already expose on localhost with no auth at all.
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    # A single mount, deliberately: the dashboard JSON lives inside
+    # grafana/provisioning/dashboards/files rather than in a sibling
+    # directory mounted separately, because mounting a second bind volume
+    # AT A PATH INSIDE this one -- the original shape here -- fails outright.
+    # Docker has to create that path's mountpoint inside the already-mounted
+    # read-only provisioning tree, and cannot: "read-only file system".
+    # Discovered by actually running `docker compose up`, not by reading the
+    # compose file, exactly the class of defect D35 says this stack's own
+    # Definition of Done exists to catch.
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      # Host port 3001, not Grafana's usual 3000: 3000 is a common default for
+      # unrelated local dev tooling, and this stack should not assume it owns
+      # a port nothing here requested. The container's own internal port
+      # stays 3000, so nothing inside this compose network needs to know the
+      # remap happened.
+      - "3001:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+
 volumes:
   postgres-data:
   redpanda-data:
+  prometheus-data:
+  grafana-data:

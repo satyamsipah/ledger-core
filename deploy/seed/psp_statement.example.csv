@@ -1,0 +1,8 @@
+external_ref,amount_minor,currency,status,settled_at
+demo-clean,150000,INR,SETTLED,2026-01-15T10:00:00Z
+demo-amount-mismatch,150000,INR,SETTLED,2026-01-15T10:05:00Z
+demo-status-mismatch,150000,INR,FAILED,2026-01-15T10:10:00Z
+demo-missing-in-ledger,75000,INR,SETTLED,2026-01-15T10:15:00Z
+demo-timing-difference,150000,INR,SETTLED,2026-01-15T14:00:00Z
+demo-duplicate,50000,INR,SETTLED,2026-01-15T10:20:00Z
+demo-duplicate,50000,INR,SETTLED,2026-01-15T10:21:00Z

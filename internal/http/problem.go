@@ -12,6 +12,7 @@ import (
 	"github.com/satyamsipah/ledger-core/internal/auth"
 	"github.com/satyamsipah/ledger-core/internal/idempotency"
 	"github.com/satyamsipah/ledger-core/internal/ledger"
+	"github.com/satyamsipah/ledger-core/internal/reconciliation"
 	"github.com/satyamsipah/ledger-core/internal/saga"
 )
 
@@ -144,6 +145,10 @@ func problemFor(err error) (int, string, string) {
 		// handled inside the orchestrator. Mapped anyway so that adding a
 		// sentinel without deciding its status stays a visible omission.
 		return nethttp.StatusConflict, "saga-conflict", "Saga was advanced concurrently"
+
+	// ---- Reconciliation ---------------------------------------------------
+	case errors.Is(err, reconciliation.ErrRunNotFound):
+		return nethttp.StatusNotFound, "reconciliation-run-not-found", "Reconciliation run not found"
 
 	case errors.Is(err, ledger.ErrAccountNotFound):
 		return nethttp.StatusNotFound, "account-not-found", "No such account"

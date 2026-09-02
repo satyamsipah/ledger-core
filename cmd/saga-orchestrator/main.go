@@ -81,7 +81,7 @@ func run() error {
 
 	orchestrator := payout.New(
 		pgsaga.New(pool.Pool, cfg.Postgres.QueryTimeout),
-		ledger.NewService(repository),
+		ledger.NewService(repository, metrics),
 		gateway.NewHTTPClient(cfg.Gateway.URL, cfg.Gateway.Timeout, cfg.Gateway.ProbeTimeout),
 		logger,
 		metrics,
@@ -99,6 +99,15 @@ func run() error {
 
 	mux := nethttp.NewServeMux()
 	mux.Handle("/metrics", metrics.Handler())
+	if cfg.FaultInjectionEnabled {
+		// A more specific pattern than "/" below, so Go's own ServeMux
+		// routes it here rather than into the chi router regardless of
+		// registration order. See ledgerhttp.HandleClockSkew's doc comment
+		// for why this is not wired through Deps/NewMux like every route
+		// mounted just below.
+		mux.Handle("/internal/faults/clock-skew", ledgerhttp.HandleClockSkew())
+		logger.Warn("fault injection enabled: /internal/faults/clock-skew is live on the admin listener")
+	}
 	mux.Handle("/", ledgerhttp.NewRouter(ledgerhttp.Deps{
 		Service:  serviceName,
 		Logger:   logger,

@@ -653,6 +653,193 @@ docker compose -f deploy/docker-compose.yml pause mock-gateway
 make sagas-stuck                                           # the triage list
 ```
 
+## Reconciliation
+
+`cmd/reconciler` proves the ledger correct against a source of truth this
+service does not control: a PSP settlement statement. On a schedule (daily by
+default, `LEDGER_RECONCILER_INTERVAL`) it reads a CSV from
+`LEDGER_RECONCILER_PSP_CSV_PATH` and three-way matches it against this
+ledger's own `transactions` and the saga orchestrator's `saga_instances`,
+keyed on `external_ref`.
+
+Every mismatch is classified into one of six categories:
+
+| Category | Meaning |
+|---|---|
+| `MISSING_IN_LEDGER` | The statement names a reference no transaction carries |
+| `MISSING_IN_PSP` | The ledger posted it; the statement never mentions it |
+| `AMOUNT_MISMATCH` | The amount or currency disagrees |
+| `STATUS_MISMATCH` | e.g. the ledger says `POSTED`, the PSP says `FAILED` |
+| `TIMING_DIFFERENCE` | Only the settlement instant disagrees |
+| `DUPLICATE` | The statement lists one reference more than once |
+
+Only `TIMING_DIFFERENCE` auto-resolves, and only when the gap is inside
+`LEDGER_RECONCILER_TIMING_WINDOW` (default two hours). Every other category
+becomes an `OPEN` exception requiring review. The report is
+`GET /v1/reconciliation/runs/{id}` — a run's own counts, a breakdown by
+category, and every exception it raised.
+
+**What counts as "the ledger's amount" for a reference.** A single payout saga
+posts two transactions sharing one `external_ref` (RESERVE and SETTLE), so the
+match takes the *latest* transaction per reference and reads its amount as the
+sum of its `DEBIT`-side entries — safe for any balanced transaction, because
+invariant 1 already guarantees debits equal credits, not a rule specific to
+payouts.
+
+```bash
+curl -H "Authorization: Bearer $KEY" localhost:8080/v1/reconciliation/runs
+```
+
+Authenticated, unlike the saga read routes — see [Authentication](#authentication)
+for `$KEY`. An exception carries amounts and external references, the same
+class of information D24 already scopes idempotency responses to a principal
+to protect.
+
+See `docs/DECISIONS.md` (Phase 6) for the match query, the classification
+priority order, and why the join runs in SQL while classification runs in Go.
+
+`deploy/seed/psp_statement.example.csv` shows the format and one row per
+category. It is not wired into `docker compose up` by default — unlike
+`deploy/seed/seed.sql`, which seeds accounts with no transactions, a
+meaningful reconciliation demo needs transactions actually posted with
+matching `external_ref` values first. To try it: post a few transactions with
+`external_ref` set (e.g. `demo-clean`, `demo-amount-mismatch`), copy the
+example file, edit its rows to match what you posted, then point
+`LEDGER_RECONCILER_PSP_CSV_PATH` at it and restart `cmd/reconciler`.
+
+## Consistency checks
+
+Alongside the PSP match, `cmd/reconciler` runs three structural checks
+against the ledger's own data on a short ticker
+(`LEDGER_RECONCILER_CONSISTENCY_INTERVAL`, default one minute) — no
+configuration required, unlike the PSP match, because "is our own data
+internally consistent" should not wait on an operator pointing this process
+at a settlement file:
+
+| Check | What it proves |
+|---|---|
+| Global invariant | `SUM` of every signed journal entry, per currency, is still zero across the *entire* journal — not merely for the one transaction the deferred trigger last fired on |
+| Projection drift | `account_balances` (the synchronous balance, updated under lock) agrees with a full recomputation from `journal_entries` |
+| Orphan detection | No `POSTED`/`REVERSED` transaction has fewer than two entries, and no journal entry lacks a parent transaction |
+
+Projection drift here is deliberately not the same check `make rebuild`
+already runs — that one diffs the journal against `balance_projections`, the
+Kafka-driven read model, to prove the async pipeline agrees with the ledger.
+This one diffs against `account_balances`, the write path's own synchronous
+balance, closing the three-way triangle D1 in `docs/DECISIONS.md` originally
+described.
+
+Each check reports itself as a Prometheus gauge (`ledger_consistency_*`,
+scraped from the metrics port) and, on a violation, an `ERROR` log line
+naming the offending currency, account, or transaction ids. The global
+invariant gauge is the one to page on: any nonzero value means invariant 1 no
+longer holds somewhere in the journal.
+
+See `docs/DECISIONS.md` D49 for why these three are plain query functions
+rather than a persisted store like the PSP match, and why proving they
+actually *detect* a violation needed a private database rather than the test
+suite's shared one.
+
+## Observability
+
+`make up` now also starts Prometheus (`localhost:9099` — `9090` is the `api`
+container's own metrics port) and Grafana (`localhost:3001` — `3000` is
+Grafana's usual default, remapped here since it is a common port for
+unrelated local dev tooling this stack should not assume it owns; anonymous
+viewer access, `admin`/`admin` for changes), both provisioned automatically:
+the "Ledger Core" dashboard and the five alert rules below exist from first
+boot, nothing clicked together by hand.
+
+**Metrics** follow one convention throughout
+(`internal/observability/metrics.go`): every series is `ledger_<subsystem>_*`
+plus a `service` label naming which process emitted it. The ones added in
+this phase, beyond the reconciliation and consistency-check metrics described
+above:
+
+| Metric | What it answers |
+|---|---|
+| `ledger_transactions_posted_total{type,status}` | `PostTransaction`/`reverse` calls, success or error — recorded in `internal/ledger.Service` itself, so saga-originated posts are counted alongside HTTP ones rather than missed |
+| `ledger_transaction_duration_seconds{type}` | How long a post or reversal took, success or failure alike |
+| `ledger_outbox_lag_seconds` | Age of the OLDEST unpublished outbox row — the number `ledger_outbox_backlog`'s row *count* cannot give you: a thousand rows written a second ago is healthy, five rows sitting for ten minutes is not |
+| `ledger_saga_oldest_overdue_seconds` | Age of the most-overdue non-terminal saga — what actually backs the "saga stuck" alert, which a population-by-status gauge alone cannot express |
+
+**Tracing** now genuinely spans the async boundary. `outbox.trace_parent`
+(migration `000018`) carries the full W3C `traceparent` value; both outbox
+publishers promote it onto a Kafka message HEADER of the same name (the
+polling publisher sets it directly, the Debezium connector via
+`table.fields.additional.placement` in
+`deploy/debezium/outbox-connector.json`), and `internal/projector.Consumer`
+extracts it and starts its `projector.apply_event` span as a real CHILD of
+the request that produced the event — not merely a span tagged with a
+matching id. `TestProjector_TraceContextPropagatesThroughKafkaHeaders` proves
+this with an in-memory span recorder rather than a string comparison. Set
+`LEDGER_OTLP_ENDPOINT` on every service to see it in a real backend (Jaeger,
+Tempo, anything OTLP/gRPC); with nothing configured, tracing is a documented
+no-op (see `internal/observability.NewTracerProvider`) rather than a
+collector every request retries against and never reaches.
+
+**Alerts** (`deploy/prometheus/alerts.yml`), one per row, each backed by a
+metric this codebase computes specifically to make the alert honest:
+
+| Alert | Fires when |
+|---|---|
+| `LedgerGlobalInvariantBroken` | `journal_entries` stops summing to zero for some currency |
+| `LedgerOutboxLagHigh` | Oldest unpublished outbox row exceeds 30s |
+| `LedgerProjectionDrift` | `account_balances` disagrees with the journal for ≥1 account |
+| `LedgerSagaStuck` | The most-overdue saga has been stuck for over 5 minutes |
+| `LedgerReconciliationExceptions` | A reconciliation run recorded a NEW exception in the last day (`increase()`, not a bare threshold — see `docs/DECISIONS.md` D50 for why a raw `> 0` on a counter that never resets would misfire permanently) |
+
+`docs/RUNBOOK.md` has one section per alert: what it means, how to confirm
+and localise it, and what to actually do. See `docs/DECISIONS.md` D50 for the
+rest of the reasoning — in particular why `ledger_transactions_posted_total`
+lives in the service layer rather than the HTTP handler, and why testing the
+trace-propagation mechanism needed a real span recorder installed as the
+process-global provider for one non-parallel test.
+
+## Fault injection and chaos testing
+
+`cmd/chaos-harness` injects the six faults a production ledger actually
+needs to survive — DB connection failure, Kafka unavailability, a slow
+query, gateway timeout, gateway 500, clock skew — against a real running
+stack. Every one is a real mechanism, never a boolean an orchestrator checks
+internally: `docker pause`/`unpause` for the first two (the same mechanism
+`docs/DECISIONS.md` D36 already validated), a real held row lock for the
+third, `mock-gateway`'s own `/control/behaviour` (D45) for the two gateway
+faults, and a genuine, narrowly-scoped clock override
+(`internal/http.HandleClockSkew`) for the last — see D51 for why clock skew
+turned out to have exactly two legitimate targets in this codebase and not
+the ones an obvious design would have picked.
+
+Off by default. Nothing above runs, and nothing in the default stack even
+exposes the surface to run it, unless you explicitly opt in:
+
+```bash
+make chaos-up      # docker-compose.yml + docker-compose.chaos.yml
+make chaos-fault FAULT=slow-query BODY='{"duration_seconds":10}'
+make chaos-test    # runs the automated chaos test against the running stack
+make chaos-down
+```
+
+`make chaos-up` layers `deploy/docker-compose.chaos.yml` on top of the
+normal stack: it flips `LEDGER_FAULT_INJECTION_ENABLED` to `true` on `api`
+and `saga-orchestrator` only, and starts `chaos-harness` — built from its
+own `deploy/Dockerfile.chaos-harness`, which runs as root because it holds
+`/var/run/docker.sock`, a capability no other image in this repo has or
+needs.
+
+`TestChaos_InvariantHoldsUnderRandomFaults` (`test/chaos_test.go`) posts
+real transfers against the real API while firing random faults for forty
+seconds, tolerating individual request failures — a fault is doing its job
+when some of those fail — and asserting only the one thing that must never
+be false regardless: the global invariant, checked both the way every
+write-path test in this suite already does
+(`assertGlobalInvariant`) and via `internal/consistency`'s own checks. It
+skips itself with an explanation, rather than failing confusingly, when
+`LEDGER_CHAOS_HARNESS_URL`/`LEDGER_CHAOS_API_URL` are not set — it drives an
+already-running `docker compose` stack rather than Testcontainers, because
+`chaos-harness` pauses containers by name and that only means something
+against a stack that is actually running.
+
 ## Tests
 
 No mocks for database behaviour — every test runs against real PostgreSQL via

@@ -27,6 +27,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/satyamsipah/ledger-core/internal/clock"
 	"github.com/satyamsipah/ledger-core/internal/gateway"
 	"github.com/satyamsipah/ledger-core/internal/ledger"
 	"github.com/satyamsipah/ledger-core/internal/observability"
@@ -204,7 +205,13 @@ func (o *Orchestrator) Start(ctx context.Context, p Payload, principalID string,
 		Status:         saga.StatusPending,
 		Payload:        payload,
 		IdempotencyKey: idempotencyKey,
-		StepDeadlineAt: time.Now().Add(o.cfg.StepTimeout),
+		// clock.Now(), not time.Now(): every LATER deadline is computed by
+		// PostgreSQL's own now() (see internal/saga.Transition's doc
+		// comment for why), but this is the very first one, computed here
+		// because the saga does not exist in the database yet to compute it
+		// server-side. It is therefore the one deadline a skewed
+		// orchestrator clock could genuinely set wrong.
+		StepDeadlineAt: clock.Now().Add(o.cfg.StepTimeout),
 	})
 	if err != nil {
 		return nil, err

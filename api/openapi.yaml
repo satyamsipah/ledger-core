@@ -2,7 +2,7 @@ openapi: 3.1.0
 
 info:
   title: Ledger-Core API
-  version: 0.3.0
+  version: 0.4.0
   description: |
     The write and read surface of a double-entry ledger.
 
@@ -46,6 +46,12 @@ tags:
       gateway, so it cannot be one database transaction and is not one API call:
       starting a payout returns immediately with a saga id, and the orchestrator
       drives it to a terminal state on its own.
+  - name: reconciliation
+    description: |
+      Proving the ledger correct against a PSP settlement statement -- a
+      three-way match against the ledger's own transactions and the saga
+      orchestrator's records, keyed on external_ref. Read-only: runs are
+      produced on a schedule by cmd/reconciler, never triggered here.
   - name: health
     description: Liveness and readiness probes.
 
@@ -417,6 +423,75 @@ paths:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
 
+  /v1/reconciliation/runs:
+    get:
+      tags: [reconciliation]
+      summary: List recent reconciliation runs
+      operationId: listReconciliationRuns
+      description: |
+        Newest first. cmd/reconciler produces these on a schedule (daily by
+        default); this endpoint only reads what it already found. Requires
+        authentication, unlike the saga read routes -- a run's exceptions
+        carry amounts and external references, the class of information D24
+        already scopes idempotency responses to a principal to protect.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 100 }
+      responses:
+        '200':
+          description: The most recent runs.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReconciliationRunList'
+        '401':
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '422':
+          description: The limit is out of range.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/reconciliation/runs/{id}:
+    get:
+      tags: [reconciliation]
+      summary: Read one reconciliation run and every exception it raised
+      operationId: getReconciliationRun
+      description: |
+        The daily report: the run's own counts, a breakdown by category, and
+        the full list of exceptions -- MISSING_IN_LEDGER, MISSING_IN_PSP,
+        AMOUNT_MISMATCH, STATUS_MISMATCH, an unresolved TIMING_DIFFERENCE, or
+        DUPLICATE. A TIMING_DIFFERENCE inside the configured window does not
+        appear here as OPEN; it is included with `status: AUTO_RESOLVED`, so
+        the run's exception list always reconciles to `exception_count`.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: The run and its exceptions.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReconciliationRun'
+        '401':
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: No such run.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
 components:
   securitySchemes:
     ApiKeyAuth:
@@ -773,6 +848,74 @@ components:
           items:
             $ref: '#/components/schemas/Saga'
 
+    ReconciliationRun:
+      type: object
+      required: [id, source, started_at, status, psp_row_count, matched_count, auto_resolved_count, exception_count]
+      properties:
+        id: { type: string, format: uuid }
+        source:
+          type: string
+          description: Where the PSP statement came from -- a file path in this deployment.
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time }
+        status: { type: string, enum: [RUNNING, COMPLETED, FAILED] }
+        psp_row_count: { type: integer }
+        matched_count:
+          type: integer
+          description: References where the ledger, the saga (if any) and the PSP statement agreed outright.
+        auto_resolved_count:
+          type: integer
+          description: TIMING_DIFFERENCE findings closed automatically because the gap was inside the configured window.
+        exception_count: { type: integer }
+        error:
+          type: string
+          description: Populated only when status is FAILED.
+        by_category:
+          type: object
+          description: |
+            Exception counts keyed by category, e.g. {"AMOUNT_MISMATCH": 2}.
+            Absent categories found none.
+          additionalProperties: { type: integer }
+        exceptions:
+          type: array
+          description: Present on the single-run read.
+          items:
+            $ref: '#/components/schemas/ReconciliationException'
+
+    ReconciliationException:
+      type: object
+      required: [id, external_ref, category, status, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        external_ref: { type: string }
+        category:
+          type: string
+          enum: [MISSING_IN_LEDGER, MISSING_IN_PSP, AMOUNT_MISMATCH, STATUS_MISMATCH, TIMING_DIFFERENCE, DUPLICATE]
+        status:
+          type: string
+          enum: [OPEN, AUTO_RESOLVED, RESOLVED]
+        ledger_transaction_id: { type: string, format: uuid }
+        saga_id: { type: string, format: uuid }
+        ledger_amount_minor: { type: integer, description: Sum of the matched transaction's DEBIT-side entries. }
+        psp_amount_minor: { type: integer }
+        currency: { type: string }
+        ledger_status: { type: string }
+        psp_status: { type: string }
+        details:
+          type: object
+          description: Category-specific detail -- e.g. the PSP row count for a DUPLICATE, the computed gap for a TIMING_DIFFERENCE.
+        created_at: { type: string, format: date-time }
+        resolved_at: { type: string, format: date-time }
+
+    ReconciliationRunList:
+      type: object
+      required: [runs]
+      properties:
+        runs:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReconciliationRun'
+
     ProblemType:
       type: string
       description: |
@@ -804,6 +947,7 @@ components:
         - malformed-body
         - missing-idempotency-key
         - mixed-currency
+        - reconciliation-run-not-found
         - request-in-progress
         - reversal-reason-required
         - saga-conflict

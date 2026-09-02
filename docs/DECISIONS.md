@@ -1706,3 +1706,570 @@ which accounts a principal owns, whether ownership is single- or multi-tenant,
 how it interacts with sharding's `parent_account_id`. That is real Phase 6
 work, and this fix does not pre-empt it by picking an answer under the cover
 of a security patch.
+
+---
+
+## Phase 6 — Proving the ledger correct, continuously
+
+### D48. The reconciliation engine: what a three-way match actually checks, and why
+
+**The gap every other invariant in this codebase leaves open.** Everything
+before this phase checks the ledger against *itself* — the deferred trigger,
+the overdraft `CHECK`, the projector's rebuild-and-diff against
+`balance_projections` (D33, `make rebuild`). None of that can catch this
+system agreeing with itself while disagreeing with the bank: a transaction the
+gateway silently dropped, one it silently duplicated, an amount that drifted
+in transit. `internal/reconciliation` and `cmd/reconciler` exist to find
+exactly that, by matching three independently-maintained records on
+`external_ref`: the ledger's own `transactions`, the saga orchestrator's
+`saga_instances`, and a PSP settlement statement this service does not
+control.
+
+**Decided: the join is SQL, the classification is Go.** Assembling the three
+sides by `external_ref` is a join, and it runs in one query
+(`pgreconciliation.Repository.Match`) for the same reason
+`internal/projector.Rebuild` already does its own comparison in SQL: loading a
+day's transactions into Go to match by hand against a CSV a fraction of its
+size would mean holding the larger side in memory to compare it against the
+smaller one, for no benefit. Deciding *which category* a mismatch falls into,
+and whether a timing gap is small enough to auto-resolve, is a business rule
+with a configurable parameter (the timing window) — exactly the kind of
+decision this codebase's layering (`handler -> service -> repository`) already
+keeps out of SQL. `classify` (`internal/reconciliation/classify.go`) is the
+one place that decision is made, and it is pure — no database, no clock
+outside what it is handed — so every rule in the table below is pinned by
+`TestClassify` without a container.
+
+**What "the ledger's amount" means for one `external_ref`, and why it needed a
+rule at all.** A single marketplace payout posts *two* transactions sharing
+one `external_ref` — RESERVE (D39's suspense debit) and SETTLE (D41) — so
+`external_ref` does not name a transaction uniquely. Two things were rejected
+before the one that shipped:
+
+- **Hard-code the payout shape** (read `metadata->>'saga_step'`, prefer
+  `SETTLE`). Rejected because it makes this package know something about
+  payouts specifically, and the whole point of keying on `external_ref` rather
+  than on saga internals is that a second saga type — or a transaction posted
+  outside any saga at all — should reconcile through the identical path.
+- **Sum every transaction sharing the reference.** Rejected because RESERVE
+  and SETTLE are not two payments to add together; they are the same payout's
+  two ledger-internal legs, and summing them double-counts it.
+
+**Decided: the *latest* transaction by `created_at`, and its amount is the sum
+of its `DEBIT`-side entries.** "Latest" needs no knowledge of payouts —
+"whatever the ledger most recently believes about this reference" is a
+generically correct answer for any workflow that corrects itself with a
+second transaction under one reference, and it happens to coincide with
+SETTLE for a payout because SETTLE is created after RESERVE. The amount
+definition is the more interesting piece: summing `DEBIT`-side entries is safe
+for *any* balanced transaction, of *any* type, because invariant 1 already
+guarantees debits equal credits per `(transaction_id, currency)` — that is not
+a fact this package asserts, it is a fact the deferred trigger already
+enforces on every row that exists. A reconciliation engine that had to be told
+what "amount" means per transaction type would need updating every time a new
+`transaction_type` shipped; this one does not.
+
+**Decided: `Match` is bounded by a lookback window, not the whole table.**
+Finding `MISSING_IN_PSP` references requires considering every ledger
+transaction that carries an `external_ref`, not only the ones the statement
+mentions — that is inherent to the check, not an implementation shortcut. Left
+unbounded, every run would scan `transactions` in full, forever, for a table
+this codebase otherwise never scans outside a migration. `since` (default
+seven days, `LEDGER_RECONCILER_LOOKBACK`) keeps it a bounded scan against a
+partial-index-backed column (`transactions (external_ref) WHERE NOT NULL`,
+D1) instead.
+
+**Decided: classification priority is DUPLICATE, then MISSING\_\*, then
+AMOUNT_MISMATCH, then STATUS_MISMATCH, then TIMING_DIFFERENCE.** More than one
+condition can describe the same reference, and a caller needs exactly one
+category. DUPLICATE goes first because a PSP statement listing one reference
+twice is a defect in the *statement*, independent of what the ledger says —
+reporting it as an amount mismatch instead would send an operator
+investigating the wrong system. AMOUNT_MISMATCH outranks STATUS_MISMATCH
+because a transaction whose amount is simply wrong is the more actionable
+defect, and a status disagreement alongside a wrong amount is very likely the
+same underlying problem wearing two symptoms, not two problems.
+TIMING_DIFFERENCE is last because it is the only category this function ever
+resolves on the spot, and everything checked before it (amount, status) must
+already agree for a timing gap to be the *only* thing wrong.
+
+**Decided: only `TIMING_DIFFERENCE`, and only inside the window, auto-resolves
+— and it is still recorded, as `AUTO_RESOLVED`, not silently dropped.** The
+alternative — matching cleanly and writing nothing — was rejected because it
+would make a run's exception count a lossy summary: an operator re-deriving
+"how many references had *any* timing gap" from a report that only shows the
+gaps that mattered would get it wrong. Recording the resolution and closing it
+in the same motion is what keeps `exception_count` on `reconciliation_runs`
+an honest total of everything the run found, not just what it left open.
+
+**Rejected: an authorization hold on the reference used as a lock, mirroring
+D39's own rejection.** Not applicable here — there is no write path in this
+package at all. `Engine.Run` reads `transactions` and `saga_instances`; it
+never posts, reverses, or updates either. That is also why several replicas of
+`cmd/reconciler` running the identical statement concurrently is a nuisance
+(duplicate runs, duplicate exception rows) rather than a correctness bug: two
+reads racing each other cannot double-spend anything. Compare D40's
+claim-based coordination for the saga orchestrator, which exists precisely
+because *that* process moves money and this one does not.
+
+**Decided: the report is read-only HTTP, and authenticated from day one.**
+`GET /v1/reconciliation/runs` and `GET /v1/reconciliation/runs/{id}` require
+`requireAuth`, unlike `GET /v1/sagas/{id}` — which D47 named as an open gap,
+not a template to repeat. A reconciliation exception carries external
+references and amounts, the same class of information D24 scoped idempotency
+responses to a principal to protect; there was no reason to reopen that
+question for a new endpoint when the answer was already settled.
+
+**What remains open, carried forward rather than folded in here.** Scheduled
+internal consistency checks (the global invariant page, projection-drift
+detection beyond `make rebuild`'s manual invocation, orphan detection),
+full OpenTelemetry/Kafka-header trace propagation, the fault-injection harness
+and its chaos test, and the Grafana/Prometheus deployment itself are the rest
+of Phase 6 and are not implemented by this entry — see the phase's own
+tracking for status. `NEEDS_MANUAL_REVIEW`-style resolution for an `OPEN`
+reconciliation exception also does not exist yet, for the identical reason
+D43 gives for sagas: an admin surface for "I have investigated this, mark it
+resolved" is real work belonging with the admin dashboard, not a field bolted
+onto this phase's first cut.
+
+### D49. The internal consistency checks: a query package, not a second store
+
+**Decided.** `internal/consistency` adds three functions —
+`CheckGlobalInvariant`, `CheckProjectionDrift`, `CheckOrphans` — each taking a
+bare `*pgxpool.Pool` and returning a result struct. `cmd/reconciler` runs all
+three on one ticker (`LEDGER_RECONCILER_CONSISTENCY_INTERVAL`, default one
+minute) alongside the PSP match loop D48 already added, and turns the outcome
+into a Prometheus gauge plus, on a violation, an `ERROR` log line.
+
+**Rejected: the same `Store`/persisted-run shape D48 used for the PSP
+match.** Seriously considered, since it is already built and already wired
+into this exact process. Rejected because the two jobs answer different kinds
+of question. A PSP mismatch is an audit finding — evidence someone reviews
+later, with a lifecycle (`OPEN` → resolved) worth persisting and worth an API
+to browse historically. A structural check is a yes/no question about the
+ledger's own state *right now*: "does the journal still sum to zero" has no
+useful history beyond its current answer, and a table of a year of "yes, it
+balanced" rows would be pure write load with no reader. `internal/projector`'s
+own `Rebuild` function already established the right shape for this — a plain
+function over a pool, called from `make rebuild` and now from a ticker — and
+these three functions follow it rather than reinventing D48's heavier
+machinery for a job that does not need it.
+
+**The three checks answer three different questions, and conflating any two
+of them would quietly lose one:**
+
+- `CheckGlobalInvariant` proves the deferred trigger (migration 000005) is
+  still holding across the *entire* journal, not merely for the one
+  transaction it last fired on. Grouped by currency, not summed globally —
+  invariant 1 balances per `(transaction_id, currency)`, so a bug that is
+  simultaneously +100 in one currency and −100 in another would net to zero
+  and hide behind a single ungrouped total. Two unrelated defects must not be
+  able to cancel each other out of the one check meant to catch either of
+  them.
+- `CheckProjectionDrift` recomputes every account's balance from
+  `journal_entries` and diffs it against `account_balances` — the
+  *synchronous* balance the write path updates under lock (D1). This is
+  deliberately **not** the comparison `internal/projector.Rebuild` already
+  makes, which diffs the same recomputation against `balance_projections`,
+  the *Kafka-driven* read model. D1 names three independently derived
+  balances specifically so any two agreeing while a third dissents localises
+  the bug; Phase 4 built the async-pipeline leg of that triangle, and this is
+  the write-path leg nothing before Phase 6 checked on a schedule. Running
+  both is what actually closes D1's original design, not a duplicate of
+  either alone.
+- `CheckOrphans` proves two structural claims: no `POSTED` or `REVERSED`
+  transaction has fewer than two entries (excluding `PENDING`, which is a
+  legitimate transient state per Phase 1's own carried-forward gap — a saga
+  writing a header before its legs), and no `journal_entries` row lacks a
+  parent transaction. The second is unconstructible given the foreign key the
+  table already carries, and is checked anyway: one query, and it is what
+  would catch a future migration that weakened that constraint by mistake,
+  which a schema-level promise nobody re-verifies at runtime cannot.
+
+**Every result is capped at `maxReported` (200) offending rows, with the true
+count carried alongside the capped list.** A check that found fifty thousand
+violations has a much bigger problem than this process's memory or a log line
+can usefully describe, and the failure mode to avoid is a check that makes
+things worse by holding an unbounded result set during an incident that is
+already resource-constrained. The true count is never lost — `TotalDrifted`,
+`TotalFewEntry`, `TotalOrphanEntries` are separate fields from the capped
+slices — so "3 accounts drifted" and "50,000 accounts drifted" stay
+distinguishable even when only the first 200 are named.
+
+**The gauge is `Reset()` before every tick, not merely overwritten.**
+`GlobalInvariantViolation` is labelled by currency; without the reset, a
+currency that stops violating would leave a stale nonzero series on the
+dashboard forever, because nothing would ever write a `0` for a label that
+has simply stopped being reported. `Reset` followed by setting only today's
+actual violations makes "never seen" and "checked and clean" the same,
+correct state: absent from the series entirely, which is also what makes the
+Prometheus alert this sets up for (Phase 6's observability item, not yet
+written) a simple `!= 0` rather than a stateful "was previously nonzero"
+query.
+
+**Verification had to defeat the very safeguards being verified, which is
+why this test does not run against the shared suite database.**
+`TestConsistency_Checks` proves each check actually *detects* a violation, not
+merely that it reports clean against healthy data — and the only way to
+produce a genuinely unbalanced journal or a genuinely drifted balance is to
+write around the deferred trigger and the append-only trigger that make both
+otherwise unreachable through any real write path. Doing that against
+`sharedPool` would corrupt every other test in the suite running concurrently
+against it. `TestMigrations_RoundTrip` already established the precedent of a
+private container for exactly this reason ("it tears the schema down"); this
+test tears the *safety* down instead, which is no less disqualifying for a
+database other tests depend on staying clean. `ALTER TABLE journal_entries
+DISABLE TRIGGER journal_entries_balanced` (and, for the same subtest's own
+cleanup, `journal_entries_no_mutation`) is scoped to that one private
+database, re-enabled before the subtest ends, and never touches `sharedPool`
+at all.
+
+**What remains open.** The Prometheus alert rules that turn these gauges into
+an actual page, and the Grafana dashboard, are Phase 6's observability item
+and are not written by this entry. `ConsistencyInterval`'s one-minute default
+is untuned against real data volume — `CheckGlobalInvariant` and
+`CheckProjectionDrift` are both full scans of `journal_entries` with no index
+that makes them cheap at scale, and the honest answer to "what should this be
+in production" is "measured against a real database," not guessed here.
+
+### D50. Observability: the metrics that were missing, a real trace across the async boundary, and what got deployed
+
+Four pieces, tied together by one theme: closing gaps that looked closed. Every
+metric this phase's Definition of Done names by name already existed under a
+different, defensible name (`ledger_saga_instances` for "saga_state_total",
+`ledger_db_tx_retries_total` for "serialization_retries_total by sqlstate",
+`ledger_projector_consumer_lag` for "consumer_lag",
+`ledger_reconciliation_exceptions_total` for "reconciliation_exceptions_total
+by category" — already exact). What genuinely did not exist is recorded here.
+
+**`transactions_posted_total` and `transaction_duration` are recorded in
+`internal/ledger.Service`, not the HTTP layer.** `ledger_http_requests_total`
+already counts HTTP traffic; recording a second, domain-level counter at the
+handler would double-count every API-originated post while still missing
+every saga-originated one, since `payout.Orchestrator` calls
+`PostTransaction`/`ReverseTransaction*` directly and never passes through an
+HTTP handler. The instrumentation wraps `PostTransaction` and the shared
+`reverse` implementation with a two-line measuring shim
+(`postTransaction`/`doReverse` hold the unexported, untouched bodies) rather
+than threading `time.Now()` calls through either — the smallest diff against
+code that already carries a great deal of load-bearing commentary about
+ordering, and the two are behaviourally identical.
+
+**The type label is guarded against cardinality, not merely typed.**
+`TransactionType` is a small closed enum in practice, but `req.Type` is read
+for the metric label *before* `validate()` runs, so a caller sending garbage
+would otherwise mint one Prometheus series per distinct garbage string it
+tried. `observeTransaction` folds every `!t.Valid()` value into a single
+`"invalid"` label — cheap, and it is the same cardinality discipline
+`HTTPRequests`' own doc comment already states for routes ("route rather than
+raw path, so a UUID in the URL cannot explode cardinality").
+
+**`ledger.NewService` gained a `metrics` parameter, nil-safe.** The
+alternative — a setter, or a second constructor — was rejected because every
+other metrics-consuming type in this codebase (`db.Retrier`,
+`polling.Publisher`, `payout.Orchestrator`) takes it as a constructor argument,
+and a service built once at startup has no legitimate later point at which
+metrics would arrive. `nil` is accepted and checked, matching `Retrier`'s own
+convention, because the large majority of this codebase's tests construct a
+service purely to drive `PostTransaction` and have no reason to also build a
+registry — see `newLedgerService` in `test/testdb.go` versus
+`newRetryingLedgerService`, which already existed and already built one for
+the retrier; it now hands the same instance to `NewService` too, rather than
+constructing a second, disconnected one.
+
+**`ledger_outbox_lag_seconds` needed a place to run that both publisher arms
+share, and neither arm's own process had one.** The polling publisher already
+holds a pool; the Debezium arm is a pure HTTP status monitor over Kafka
+Connect's REST API and, before this entry, opened no direct connection to
+Postgres *at all* — D31 states plainly that Debezium's data path never touches
+this codebase, and that was taken further than intended: the *monitoring*
+path did not need to make the same abstention, and hadn't been given the
+chance not to. `cmd/outbox-publisher` now opens a pool unconditionally,
+regardless of which arm is selected, purely for
+`runBacklogMonitor` — a `SELECT count(*), EXTRACT(EPOCH FROM now() -
+min(created_at))` against `outbox_unpublished_idx`, the same partial index
+D4 built for "any future fallback publisher" and monitoring, finally used for
+the second of those two stated purposes. `ledger_outbox_backlog` existed as a
+declared, registered metric since Phase 4 and had never once been `.Set()` —
+found only because writing the lag gauge alongside it meant looking at the
+one query that should have been feeding both.
+
+**`ledger_saga_oldest_overdue_seconds` is a new `saga.Store` method, not a
+second query bolted onto the metric.** The phase asks to alert on "saga stuck
+> 5 min", and `ledger_saga_instances` — a population count by status — cannot
+express that: a healthy system with a dozen sagas in flight and a system with
+one saga stuck for an hour produce the same non-zero gauge. The new
+`OldestOverdueSeconds` query reuses `saga_instances_deadline_idx` exactly —
+the same partial index, same four excluded terminal statuses — that the
+sweeper's own `ClaimExpired` already relies on, so this is a read-only cousin
+of a query this package already had to get right. `NEEDS_MANUAL_REVIEW` is
+excluded on purpose: it is alerted on separately
+(`ledger_saga_manual_review_total`), and including it here would let one old,
+unresolved escalation permanently dominate the gauge and hide a second,
+freshly-stuck saga behind it. Wired into `refreshGauges`, which `SweepOnce`
+already called on every sweep tick — no new loop, no new ticker.
+
+**Kafka header trace propagation: a new column, not a repurposed one.**
+`outbox.trace_id` (D32) stays exactly what it was — an informational JSON
+envelope field nothing extracts back into a span. The gap named in this
+phase's own kickoff is real: "one trace spans the whole async flow" was not
+true before this entry, because nothing on the consumer side ever called
+`Extract`. Closing it needed the full W3C `traceparent` value (trace id *and*
+span id, plus flags), which `trace_id` alone cannot reconstruct into a valid
+remote `SpanContext`. `outbox.trace_parent` (migration `000018`) holds that
+value, computed once via `otel.GetTextMapPropagator().Inject` — reusing the
+exact propagator `NewTracerProvider` installs for HTTP, rather than
+hand-formatting the W3C string, so this can never drift from what `otelhttp`
+already relies on elsewhere in this codebase. Kept as a separate column
+alongside `trace_id` rather than replacing it: `trace_id` is read by nothing
+today, but it is a smaller, human-readable value a support engineer might
+grep a database dump for, and there was no correctness reason to delete it.
+
+**The wire format still cannot depend on which publisher wrote it (D31's own
+rule), so both arms promote the SAME column to the SAME header.** The polling
+publisher sets `traceparent` as a real `kgo.RecordHeader` when
+`trace_parent` is non-empty. The Debezium connector promotes it via the
+EventRouter SMT's `table.fields.additional.placement` config
+(`trace_parent:header:traceparent`) — a declarative connector-config change,
+not Go code, which is exactly the asymmetry D31 already documented between
+the two arms' data paths. Neither arm touches the JSON payload: the header is
+a purely transport-level addition, so every existing byte-for-byte assertion
+about the wire body (D28's reasoning for `response_body`, applied here to the
+event envelope) stays true unchanged.
+
+**The consumer extracts and starts a genuine child span, verified by an
+in-memory span recorder, not by comparing two independently-read strings.**
+`internal/projector.Consumer.handle` extracts `traceparent` from the record's
+headers into a `propagation.MapCarrier`, calls
+`otel.GetTextMapPropagator().Extract`, and starts `"projector.apply_event"`
+from the resulting context. `tracer := otel.Tracer(...)` is the first manually
+started span anywhere in this codebase — every other one comes from
+`otelhttp`'s automatic instrumentation at the HTTP boundary — named for the
+package it instruments per the ordinary Go OpenTelemetry convention, since
+there was no existing local precedent to follow instead.
+
+`TestProjector_TraceContextPropagatesThroughKafkaHeaders` installs a real
+`sdktrace.TracerProvider` backed by `tracetest.SpanRecorder` as the
+process-global provider and propagator, for the test's own duration, and
+asserts the recorded consumer span's `TraceID` equals the producing span's —
+proving the SDK's own machinery genuinely linked the two, which a comparison
+of `outbox.trace_id` against a logged string could not: two independently
+computed values that happen to match is a weaker claim than "the propagator
+extracted a real parent," and only the second is what the phase actually
+asked for.
+
+**Swapping `otel`'s global tracer provider and propagator inside one test in
+a package that runs many tests in parallel is safe, and the reasoning is
+worth recording because it looks unsafe.** The test does not call
+`t.Parallel()`. Go's test runner does not begin executing ANY `t.Parallel()`
+test's body in a package until every non-parallel test — this one included,
+cleanup and all — has already returned; a parallel test that has reached its
+own `Parallel()` call is paused, not running, for the whole of that window.
+`TestProjector_ConsumesAndAppliesTransactionPosted` and its neighbours are
+already non-parallel in this same file, for the unrelated reason that each
+spins its own Redpanda container, which is what made this test's placement
+unremarkable rather than a special case.
+
+**Deployment: Prometheus and Grafana are new `docker-compose.yml` services,
+provisioned rather than clicked together.** `deploy/prometheus/prometheus.yml`
+scrapes every service that exposes `/metrics` by its compose-internal
+hostname and port — the same ports each service's own admin listener binds
+to, not the host-mapped ones, because Prometheus runs on the same compose
+network rather than the host. `mock-gateway` is deliberately absent from the
+scrape list: it stands in for an external gateway (D45), and a real one would
+not let this stack scrape it either. Grafana's datasource and dashboard are
+both auto-provisioned (`deploy/grafana/provisioning/`), so `docker compose up`
+produces a working, populated dashboard rather than an empty Grafana asking
+to be configured by hand — consistent with the Definition of Done's own
+requirement that the stack come up clean from scratch, not clean-plus-manual-steps.
+
+**The five alerts `deploy/prometheus/alerts.yml` defines are exactly the five
+the phase names, no more.** Each one is backed by a metric this phase built
+specifically to make it possible to write honestly — see this entry and D49
+above for which. One is worth flagging on its own:
+**`LedgerReconciliationExceptions` uses `increase(...[1d]) > 0`, not a bare
+`> 0`.** `ledger_reconciliation_exceptions_total` is a counter, and counters
+never go down; a bare `> 0` threshold would fire once, on the first exception
+this deployment ever records, and then never resolve again regardless of
+whether the ledger is fine for the next five years. `increase` over the
+reconciliation job's own default interval is what the phase's "reconciliation
+exceptions > 0" wording actually means: a NEW exception, not the existence of
+history.
+
+**`docs/RUNBOOK.md` is one section per alert, in the order they appear in
+`alerts.yml`**, each covering what firing means, how to confirm and localise
+it (mostly the exact SQL the alerting metric's own Go query runs, so an
+operator is never left re-deriving a query this codebase already wrote), and
+what to actually do. None of the five sections ends in "restart the
+service" — restarting fixes nothing about an unbalanced journal, a drifted
+balance, or an unresolved reconciliation exception, and a runbook that
+suggests otherwise teaches the wrong reflex for the one class of alert this
+system is built to take seriously.
+
+**What remains open.** Structured logs already carry a correlation id on
+every HTTP-originated line (`chimiddleware.RequestID`, threaded through by
+`requestLogger`) — that half of the phase's ask predates this entry and
+needed nothing added. The fault-injection harness and its chaos test are the
+one item of Phase 6 this entry does not touch.
+
+### D51. The fault-injection harness: six faults, and why clock skew is only two of them
+
+**Decided.** `cmd/chaos-harness` is a new, deliberately separate binary
+(`deploy/Dockerfile.chaos-harness`, never the shared one every real service
+uses) that injects the six faults the phase names, live, against a running
+`docker compose` stack — never against `go test`'s own Testcontainers, and
+never against production. Every fault is one of exactly two kinds:
+something real actually happening (`docker pause`/`unpause` over the Docker
+Engine API's own Unix socket, or a real transaction genuinely holding a real
+row lock), or a control call into a mechanism this codebase already built
+for the purpose (mock-gateway's `/control/behaviour`, D45; the new
+`internal/http.HandleClockSkew`, below). `.claude/rules/testing.md`'s own
+rule for failure tests — "they actually kill things... they do not simulate
+failure with a boolean flag" — is written for tests, but it applies with
+more force to a tool tests are built on, so it governs every fault here
+identically.
+
+**DB connection failure and Kafka unavailability: `docker pause`, exactly
+the mechanism D36 already validated.** `TestOutboxPublish_KafkaOutage`
+established that pausing (the cgroup freezer, freezing an
+already-running process) is the faithful way to simulate an outage against
+this specific Redpanda testcontainers module, because a stop/start cycle
+leaves its custom entrypoint waiting for a lifecycle hook that only runs
+once. The harness reuses the identical mechanism against the compose
+stack's real `postgres` and `redpanda` containers, addressed by name over
+the Docker socket — which is why those two services gained a pinned
+`container_name` in `docker-compose.yml`: Compose's own auto-generated name
+depends on which directory the repo happens to be checked out into, and a
+chaos harness whose default target name is wrong on every machine but the
+one it was tuned on is not a tool, it is a trap for the next person who runs
+it.
+
+**Gateway timeout and gateway 500: zero new mechanism.** Both are
+`POST /control/behaviour` calls to mock-gateway (D45), which already changes
+real HTTP behaviour rather than a flag an orchestrator checks internally.
+The harness's only job is to drive it and restore `{"outcome":"succeed"}`
+afterward — a proxy, not a reimplementation.
+
+**Slow query: a real held row lock, not `time.Sleep`.** The harness opens
+its own connection, takes `FOR UPDATE` on a real, configurable "hot"
+account's `account_balances` row (default `platform-bank-inr`), and runs
+`SELECT pg_sleep($1)` *inside that same transaction* before committing. Any
+real posting transaction that touches the same account queues behind it
+exactly as it would under genuine contention — the same row-lock mechanism
+D11's ordered locking already depends on, made slow on purpose rather than
+merely described as slow in a log line.
+
+**Clock skew has exactly two legitimate targets, discovered by looking for
+them rather than assumed.** The obvious design — an injectable `Clock`
+threaded through the reconciler's timing-window comparison and the saga
+sweeper's timeout checks — turned out to test nothing: the reconciler
+compares two already-fixed, already-recorded timestamps (never "now" at
+all), and every saga deadline *after* the first is deliberately computed by
+PostgreSQL's own `now()`, specifically because "deadlines computed from a Go
+process's wall clock and compared against the database's would drift" (see
+`saga.Transition`'s own doc comment, Phase 5). Threading a fault into either
+would have exercised a seam that does not affect any real decision — a
+vulnerability manufactured to have something to test, not a real one made
+testable.
+
+Two places do read a Go process's own clock for a decision that matters, and
+both were found by grepping for `time.Now()` and asking, for each hit,
+"is this compared against something Postgres computed with its own clock?"
+— `internal/idempotency.Manager.resolveExisting`'s `expires_at` check, and
+`payout.Orchestrator.Start`'s very first `step_deadline_at` (every
+subsequent one is server-computed; this one cannot be, because the saga does
+not exist in the database yet to compute it against). `internal/clock` makes
+exactly these two calls injectable (`clock.Now()` in place of `time.Now()`)
+and nowhere else — a log timestamp or a metrics timer skewing along with an
+injected fault would be noise, not signal, and the whole value of a narrow
+seam is that everything outside it keeps behaving normally while the fault
+runs.
+
+**The clock-skew endpoint is deliberately not part of `Deps`/`NewMux`.**
+Every route registered there ends up on either the public API listener
+(`cmd/api`) or a worker's one-and-only listener — and a clock a stranger on
+the internet could skew is not a chaos-testing feature, it is a
+vulnerability wearing one. `internal/http.HandleClockSkew` is mounted
+directly on each process's admin/metrics mux, standalone, gated by
+`LEDGER_FAULT_INJECTION_ENABLED` (default `false`, flipped to `true` only by
+`deploy/docker-compose.chaos.yml`'s override of the two services that have a
+genuine clock fault to offer). `cmd/api`'s admin listener in particular
+carries no other routes at all today — this is the first thing mounted
+there beyond `/metrics` — which is exactly why it could not be added to the
+shared router: that router is also what `cmd/api`'s *public* listener serves.
+
+**Why an overlay compose file, not a Compose profile alone.** A profile
+controls whether a service starts; it cannot conditionally change an
+*already-defined* service's environment. Flipping
+`LEDGER_FAULT_INJECTION_ENABLED` on `api` and `saga-orchestrator` needed
+that second thing, so `deploy/docker-compose.chaos.yml` is a genuine overlay
+(`-f docker-compose.yml -f docker-compose.chaos.yml`, or `make chaos-up`),
+relying on Compose's own key-by-key merge of `environment:` maps across
+`-f` files — every other setting those two services already have survives
+untouched, only the one named flag changes. The base file states the
+default explicitly (`LEDGER_FAULT_INJECTION_ENABLED: "false"`) rather than
+leaving it merely absent, so the compose file itself documents what the
+overlay is overriding *from*.
+
+**Why `chaos-harness` gets its own Dockerfile and runs as root.** Every real
+service's image runs as an unprivileged uid specifically so that "this
+image needs no elevated privilege" stays a property CLAUDE.md's own
+Definition of Done can rely on. `chaos-harness` cannot make that claim: it
+holds `/var/run/docker.sock`, which is root-equivalent access to the host by
+construction, regardless of which uid the process inside the container
+reports. Giving it the same non-root `USER` as everything else would not
+make it safe, it would make it broken (permission denied against the
+socket) in a way that looks like a security posture and is not one. A
+second, visibly different Dockerfile makes the divergence the point rather
+than a thing to notice only by diffing two otherwise-identical files.
+
+**The chaos test drives an already-running stack; it does not orchestrate
+one.** `TestChaos_InvariantHoldsUnderRandomFaults` is unlike every other
+test in this suite in one specific way: it does not use Testcontainers.
+It cannot — `cmd/chaos-harness` pauses and unpauses containers *by name*
+over the Docker Engine API, which only means something against a stack
+`docker compose` actually started, not one Testcontainers spun up in
+isolation for this one test. The alternative — teaching
+`testcontainers-go`'s `compose` module to drive the entire real
+`docker-compose.yml` (Postgres, Redpanda, Kafka Connect, every service, the
+chaos harness itself) from inside Go, fully automated — was considered and
+rejected as disproportionate: real value at a small fraction of the
+complexity is what a `t.Skip` with a clear message and a `make chaos-up` /
+`make chaos-test` pair buys instead, and the trade is recorded here rather
+than discovered later as an unexplained gap. Reused directly rather than
+reimplemented: `newAccount`, `newTypedAccount`, `assertGlobalInvariant` and
+`internal/consistency`'s own checks, all of which already take a
+`*pgxpool.Pool` as a parameter rather than reaching for the test suite's
+`sharedPool` — the one design choice in the existing test helpers that made
+pointing them at a different, real database (`localhost:5432`, the chaos
+stack's own host-mapped port) a parameter change rather than a rewrite.
+
+**The load generator tolerates failure on purpose, and asserts something
+narrower and stronger instead.** The test does not assert most transfers
+succeed — some are SUPPOSED to fail while a fault is active, and asserting
+otherwise would just be asserting the faults do nothing. What it asserts is
+that after forty seconds of real faults fired at random against real load,
+`assertGlobalInvariant` and `internal/consistency.CheckGlobalInvariant`/
+`CheckOrphans` are still true. That is the one claim this whole phase is
+built to make defensible under pressure, and it is the only one this test
+makes.
+
+**A real defect surfaced only by actually running the full suite again
+after this entry's own new test was added — recorded per D35's own
+precedent.** `TestIdempotency_ClockSkewCausesReadPathToTreatALiveRecordAsExpired`
+posts one real transaction and, unlike every other test that touches Kafka,
+runs no publisher against it. Its outbox rows sat unpublished when the test
+ended, and `TestOutboxPublish_KafkaOutage` — whose polling publisher drains
+the *entire* shared `outbox` table by design, not merely the rows its own
+test created — swept them up during its own pre-outage drain and inflated
+its before/after delta by exactly one transfer's worth (three rows: one
+`TransactionPosted`, two `BalanceUpdated`), failing an assertion about a
+code path this entry never touched. Not a race and not flaky: fully
+deterministic, reproduced identically across three separate runs, because
+Go orders test files alphabetically and `idempotency_test.go` precedes
+`outbox_publish_test.go`. Fixed by having the offending test delete its own
+unpublished rows in `t.Cleanup` rather than leave them for the next
+publisher-running test to trip over — the correct owner of the fix, since
+the alternative (loosening `TestOutboxPublish_KafkaOutage`'s own assertion)
+would have weakened a real zero-loss guarantee to work around a different
+test's mess rather than cleaning up the mess.

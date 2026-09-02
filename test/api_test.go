@@ -31,6 +31,7 @@ import (
 	"github.com/satyamsipah/ledger-core/internal/idempotency"
 	"github.com/satyamsipah/ledger-core/internal/ledger"
 	"github.com/satyamsipah/ledger-core/internal/observability"
+	"github.com/satyamsipah/ledger-core/internal/reconciliation/pgreconciliation"
 	"github.com/satyamsipah/ledger-core/internal/saga/pgsaga"
 )
 
@@ -769,14 +770,15 @@ func TestOpenAPI_MatchesTheRegisteredRoutes(t *testing.T) {
 	// left nil here would silently exempt its routes from the comparison.
 	orchestrator, _, _ := newOrchestrator(t, sharedPool, "http://gateway.invalid", nil)
 	mux := ledgerhttp.NewMux(ledgerhttp.Deps{
-		Service:     "test",
-		Logger:      logger,
-		Metrics:     observability.NewMetrics("test"),
-		Ledger:      service,
-		Idempotency: newIdempotencyManager(t, sharedPool, idempotency.DefaultLease),
-		Payout:      orchestrator,
-		Sagas:       pgsaga.New(sharedPool, 30*time.Second),
-		Auth:        pgauth.New(sharedPool, 30*time.Second),
+		Service:        "test",
+		Logger:         logger,
+		Metrics:        observability.NewMetrics("test"),
+		Ledger:         service,
+		Idempotency:    newIdempotencyManager(t, sharedPool, idempotency.DefaultLease),
+		Payout:         orchestrator,
+		Sagas:          pgsaga.New(sharedPool, 30*time.Second),
+		Reconciliation: pgreconciliation.New(sharedPool, 30*time.Second),
+		Auth:           pgauth.New(sharedPool, 30*time.Second),
 	})
 
 	registered := map[string]struct{}{}

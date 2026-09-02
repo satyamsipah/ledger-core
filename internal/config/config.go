@@ -32,7 +32,17 @@ type Config struct {
 	Saga          Saga
 	Gateway       Gateway
 	Redis         Redis
+	Reconciler    Reconciler
 	Observability Observability
+
+	// FaultInjectionEnabled mounts internal/http.HandleClockSkew on this
+	// process's admin listener. Off by default and never set by
+	// docker-compose.yml's default services -- only cmd/chaos-harness's own
+	// compose profile sets it, and only on the two processes that have a
+	// genuine clock-skew fault to offer (see internal/clock's doc comment
+	// for which two, and why only those). A process running with this true
+	// is, by construction, one nothing but a chaos run should ever start.
+	FaultInjectionEnabled bool
 }
 
 // Ledger configures the write path's concurrency behaviour and the idempotency
@@ -183,6 +193,21 @@ type Outbox struct {
 	// connect-init service) to report the health of.
 	ConnectURL    string
 	ConnectorName string
+
+	// ReplicationSlotName names the logical replication slot Debezium reads
+	// from (migration 000008's CREATE PUBLICATION and
+	// deploy/debezium/outbox-connector.json's slot.name agree on this value).
+	// Used only by cmd/outbox-publisher's Debezium-arm backlog monitor -- see
+	// its own comment for why this, and not outbox.published_at, is what that
+	// arm has to watch instead.
+	ReplicationSlotName string
+
+	// BacklogCheckInterval is how often cmd/outbox-publisher checks its own
+	// monitoring metrics (ledger_outbox_backlog, ledger_outbox_lag_seconds).
+	// Runs regardless of which publisher arm is selected above, but the two
+	// arms watch genuinely different things to produce them -- see
+	// runBacklogMonitor's doc comment.
+	BacklogCheckInterval time.Duration
 }
 
 // Redis configures the idempotency fast path. Redis is a latency optimisation
@@ -190,6 +215,41 @@ type Outbox struct {
 type Redis struct {
 	Addr string
 	DB   int
+}
+
+// Reconciler configures the three-way-match job cmd/reconciler runs on a
+// schedule.
+type Reconciler struct {
+	// PSPStatementPath is where the mock settlement CSV is read from. Empty
+	// means the job is disabled -- a process with nothing to reconcile
+	// against should not run a ticker that fails on every tick.
+	PSPStatementPath string
+
+	// Interval is how often a new run starts. Daily in production, per the
+	// phase's own framing ("daily reconciliation report"); short in local
+	// development, per docker-compose.yml, so `docker compose up` produces a
+	// visible run instead of a day-long wait.
+	Interval time.Duration
+
+	// TimingWindow is classify's auto-resolve threshold -- see
+	// internal/reconciliation.DefaultTimingWindow for the default and the
+	// reasoning.
+	TimingWindow time.Duration
+
+	// Lookback bounds how far back Match considers ledger transactions when
+	// looking for MISSING_IN_PSP references. See
+	// internal/reconciliation.DefaultLookback.
+	Lookback time.Duration
+
+	// ConsistencyInterval is how often the internal structural checks
+	// (internal/consistency: the global invariant, projection drift, orphan
+	// detection) run. Unlike the PSP match above, this needs no external file
+	// and no config to enable -- it always runs, because "is our own data
+	// internally consistent" should never be gated on an operator having
+	// pointed this process at a settlement file. Short by default: these are
+	// bounded, read-only queries, and the global invariant check in
+	// particular exists to page quickly if it ever trips.
+	ConsistencyInterval time.Duration
 }
 
 // Observability configures the three signals: logs, metrics, traces.
@@ -247,11 +307,13 @@ func Load(service string) (Config, error) {
 			ConsumerGroup: env("KAFKA_CONSUMER_GROUP", "ledger-"+service),
 		},
 		Outbox: Outbox{
-			Publisher:     env("OUTBOX_PUBLISHER", "debezium"),
-			PollInterval:  envDuration("OUTBOX_POLL_INTERVAL", 500*time.Millisecond, fail),
-			BatchSize:     envInt("OUTBOX_BATCH_SIZE", 100, fail),
-			ConnectURL:    env("OUTBOX_CONNECT_URL", "http://localhost:8083"),
-			ConnectorName: env("OUTBOX_CONNECTOR_NAME", "ledger-outbox"),
+			Publisher:            env("OUTBOX_PUBLISHER", "debezium"),
+			PollInterval:         envDuration("OUTBOX_POLL_INTERVAL", 500*time.Millisecond, fail),
+			BatchSize:            envInt("OUTBOX_BATCH_SIZE", 100, fail),
+			ConnectURL:           env("OUTBOX_CONNECT_URL", "http://localhost:8083"),
+			ConnectorName:        env("OUTBOX_CONNECTOR_NAME", "ledger-outbox"),
+			ReplicationSlotName:  env("OUTBOX_REPLICATION_SLOT_NAME", "ledger_outbox_slot"),
+			BacklogCheckInterval: envDuration("OUTBOX_BACKLOG_CHECK_INTERVAL", 5*time.Second, fail),
 		},
 		Saga: Saga{
 			WorkerID:                env("SAGA_WORKER_ID", defaultWorkerID()),
@@ -273,12 +335,20 @@ func Load(service string) (Config, error) {
 			Addr: env("REDIS_ADDR", "localhost:6379"),
 			DB:   envInt("REDIS_DB", 0, fail),
 		},
+		Reconciler: Reconciler{
+			PSPStatementPath:    env("RECONCILER_PSP_CSV_PATH", ""),
+			Interval:            envDuration("RECONCILER_INTERVAL", 24*time.Hour, fail),
+			TimingWindow:        envDuration("RECONCILER_TIMING_WINDOW", 2*time.Hour, fail),
+			Lookback:            envDuration("RECONCILER_LOOKBACK", 7*24*time.Hour, fail),
+			ConsistencyInterval: envDuration("RECONCILER_CONSISTENCY_INTERVAL", time.Minute, fail),
+		},
 		Observability: Observability{
 			LogLevel:         envLogLevel("LOG_LEVEL", slog.LevelInfo, fail),
 			MetricsAddr:      env("METRICS_ADDR", ":9090"),
 			OTLPEndpoint:     env("OTLP_ENDPOINT", ""),
 			TraceSampleRatio: envFloat("TRACE_SAMPLE_RATIO", 1.0, fail),
 		},
+		FaultInjectionEnabled: envBool("FAULT_INJECTION_ENABLED", false, fail),
 	}
 
 	if cfg.Postgres.DSN == "" {

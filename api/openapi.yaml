@@ -418,6 +418,19 @@ paths:
               schema: { $ref: '#/components/schemas/Problem' }
 
 components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: lk_live_<64 hex characters>
+      description: |
+        A key minted by `cmd/issue-api-key`. Presented as
+        `Authorization: Bearer <key>`. Required on every write route; read
+        routes take none, because there is no per-principal authorization
+        model on this schema yet (see docs/DECISIONS.md D47) -- authentication
+        alone is what scopes the idempotency namespace, which is all this
+        header exists to provide today.
+
   parameters:
     IdempotencyKey:
       name: Idempotency-Key
@@ -426,10 +439,12 @@ components:
       description: |
         A UUID naming this logical operation.
 
-        A UUID rather than any opaque string, because keys share one namespace:
-        a client picking `order-1` would collide with a different client that
-        picked the same obvious value, and the second would be handed the
-        first's response.
+        A UUID rather than any opaque string, because keys share a namespace
+        WITHIN one authenticated principal: a client picking `order-1` would
+        collide with its own earlier `order-1`, and the second would be handed
+        the first's response. Two different principals may use the identical
+        key without either affecting the other -- the namespace is
+        (principal, key), never key alone.
 
         Retry semantics, in the order they are decided:
 
@@ -778,6 +793,8 @@ components:
         - currency-mismatch
         - idempotency-key-expired
         - idempotency-key-reused
+        - invalid-api-key
+        - missing-api-key
         - insufficient-funds
         - internal
         - invalid-currency

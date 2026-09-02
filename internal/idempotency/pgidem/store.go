@@ -63,13 +63,13 @@ func (s *Store) Reserve(ctx context.Context, r idempotency.Reservation) (bool, e
 
 	tag, err := s.pool.Exec(ctx, `
 		INSERT INTO idempotency_keys
-		    (key, request_fingerprint, status, request_method, request_route,
-		     expires_at, lease_expires_at)
-		VALUES ($1, $2, 'IN_PROGRESS', $3, $4,
-		        now() + make_interval(secs => $5),
-		        now() + make_interval(secs => $6))
-		ON CONFLICT (key) DO NOTHING`,
-		r.Key, r.Fingerprint.Bytes(), r.Method, r.Route,
+		    (principal_id, key, request_fingerprint, status, request_method,
+		     request_route, expires_at, lease_expires_at)
+		VALUES ($1, $2, $3, 'IN_PROGRESS', $4, $5,
+		        now() + make_interval(secs => $6),
+		        now() + make_interval(secs => $7))
+		ON CONFLICT (principal_id, key) DO NOTHING`,
+		r.PrincipalID, r.Key, r.Fingerprint.Bytes(), r.Method, r.Route,
 		r.TTL.Seconds(), r.Lease.Seconds())
 	if err != nil {
 		return false, fmt.Errorf("insert idempotency key %s: %w", r.Key, err)
@@ -84,7 +84,7 @@ func (s *Store) Reserve(ctx context.Context, r idempotency.Reservation) (bool, e
 // key's response has aged out" lead to opposite outcomes -- executing afresh
 // against refusing to -- and a query that folded them together would make the
 // difference unrecoverable.
-func (s *Store) Lookup(ctx context.Context, key string) (*idempotency.Record, error) {
+func (s *Store) Lookup(ctx context.Context, principalID, key string) (*idempotency.Record, error) {
 	ctx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
@@ -97,12 +97,12 @@ func (s *Store) Lookup(ctx context.Context, key string) (*idempotency.Record, er
 		route          *string
 	)
 	err := s.pool.QueryRow(ctx, `
-		SELECT key, request_fingerprint, status, response_status, response_body,
-		       transaction_id, request_method, request_route,
+		SELECT principal_id, key, request_fingerprint, status, response_status,
+		       response_body, transaction_id, request_method, request_route,
 		       created_at, expires_at, lease_expires_at
 		  FROM idempotency_keys
-		 WHERE key = $1`, key).
-		Scan(&record.Key, &fingerprint, &record.Status, &responseStatus, &responseBody,
+		 WHERE principal_id = $1 AND key = $2`, principalID, key).
+		Scan(&record.PrincipalID, &record.Key, &fingerprint, &record.Status, &responseStatus, &responseBody,
 			&record.TransactionID, &method, &route,
 			&record.CreatedAt, &record.ExpiresAt, &record.LeaseExpiresAt)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -145,16 +145,16 @@ func (s *Store) Lookup(ctx context.Context, key string) (*idempotency.Record, er
 // LEAST(..., expires_at) keeps idempotency_keys_lease_within_ttl_check
 // satisfied: a record two seconds from aging out cannot be handed a
 // thirty-second lease.
-func (s *Store) Reclaim(ctx context.Context, key string, lease time.Duration) (bool, error) {
+func (s *Store) Reclaim(ctx context.Context, principalID, key string, lease time.Duration) (bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE idempotency_keys
-		   SET lease_expires_at = LEAST(now() + make_interval(secs => $2), expires_at)
-		 WHERE key = $1
+		   SET lease_expires_at = LEAST(now() + make_interval(secs => $3), expires_at)
+		 WHERE principal_id = $1 AND key = $2
 		   AND status = 'IN_PROGRESS'
-		   AND lease_expires_at <= now()`, key, lease.Seconds())
+		   AND lease_expires_at <= now()`, principalID, key, lease.Seconds())
 	if err != nil {
 		return false, fmt.Errorf("reclaim idempotency key %s: %w", key, err)
 	}
@@ -168,15 +168,15 @@ func (s *Store) Reclaim(ctx context.Context, key string, lease time.Duration) (b
 // rolled back by the time this runs, so there is nothing left to be atomic
 // with. What is being made durable is the rejection itself, which describes work
 // that deliberately did not happen.
-func (s *Store) Fail(ctx context.Context, key string, responseStatus int, responseBody []byte) error {
+func (s *Store) Fail(ctx context.Context, principalID, key string, responseStatus int, responseBody []byte) error {
 	ctx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE idempotency_keys
-		   SET status = 'FAILED', response_status = $2, response_body = $3
-		 WHERE key = $1 AND status = 'IN_PROGRESS'`,
-		key, responseStatus, responseBody)
+		   SET status = 'FAILED', response_status = $3, response_body = $4
+		 WHERE principal_id = $1 AND key = $2 AND status = 'IN_PROGRESS'`,
+		principalID, key, responseStatus, responseBody)
 	if err != nil {
 		return fmt.Errorf("mark idempotency key %s failed: %w", key, err)
 	}
@@ -194,13 +194,13 @@ func (s *Store) Fail(ctx context.Context, key string, responseStatus int, respon
 // response, the row is already COMPLETED -- and an unguarded DELETE here would
 // erase the record of a transaction that really did post, freeing the key to
 // post a second one. The guard turns that from a double spend into a no-op.
-func (s *Store) Release(ctx context.Context, key string) error {
+func (s *Store) Release(ctx context.Context, principalID, key string) error {
 	ctx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
 	_, err := s.pool.Exec(ctx, `
 		DELETE FROM idempotency_keys
-		 WHERE key = $1 AND status = 'IN_PROGRESS'`, key)
+		 WHERE principal_id = $1 AND key = $2 AND status = 'IN_PROGRESS'`, principalID, key)
 	if err != nil {
 		return fmt.Errorf("release idempotency key %s: %w", key, err)
 	}
@@ -263,11 +263,11 @@ func Complete(ctx context.Context, tx pgx.Tx, c idempotency.Completion) error {
 	tag, err := tx.Exec(ctx, `
 		UPDATE idempotency_keys
 		   SET status          = 'COMPLETED',
-		       response_status = $2,
-		       response_body   = $3,
-		       transaction_id  = $4
-		 WHERE key = $1 AND status = 'IN_PROGRESS'`,
-		c.Key, c.ResponseStatus, c.ResponseBody, c.TransactionID)
+		       response_status = $3,
+		       response_body   = $4,
+		       transaction_id  = $5
+		 WHERE principal_id = $1 AND key = $2 AND status = 'IN_PROGRESS'`,
+		c.PrincipalID, c.Key, c.ResponseStatus, c.ResponseBody, c.TransactionID)
 	if err != nil {
 		return fmt.Errorf("complete idempotency key %s: %w", c.Key, err)
 	}

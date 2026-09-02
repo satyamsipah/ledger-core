@@ -414,48 +414,71 @@ reversing it removes the trigger. Deleting balance rows on the way down would
 discard live balances for every account created while it was installed, which is
 data loss dressed up as a rollback.
 
-### D19. `chi middleware.RealIP` is a known vulnerability, deliberately left in place
+### D19. Client IP: bounded trusted-hop parsing replaces `chi middleware.RealIP`
 
-**Not decided.** Deferred to Phase 3, when the HTTP gateway design specifies what
-sits in front of this service.
+**Decided, resolving the gap this entry carried since Phase 1.** The deferral's
+own reasoning was sound at the time — getting this right needs a real topology,
+and guessing one and encoding the guess as a security control is how these
+holes are created — but three phases is long enough for "we don't know the
+topology yet" to become indistinguishable from "we never will," and the actual
+fix does not require knowing it after all. It requires being **honest** about
+not knowing it, which is a different and answerable problem.
 
-`internal/http/router.go` uses `chi`'s `middleware.RealIP`, which upstream has
-deprecated as a security issue rather than merely as an old API
-(GHSA-3fxj-6jh8-hvhx, GHSA-rjr7-jggh-pgcp, GHSA-9g5q-2w5x-hmxf). It overwrites
-`r.RemoteAddr` from the leftmost `X-Forwarded-For` value, or from
-`True-Client-IP` / `X-Real-IP`, **whether or not the infrastructure in front
-actually sets those headers**. Every one of them is client-controlled, so with
-no trusted proxy stripping them, any caller can assert any source address.
+**What was wrong, restated for the record.** `chi`'s `middleware.RealIP`
+(deprecated upstream as a security issue: GHSA-3fxj-6jh8-hvhx,
+GHSA-rjr7-jggh-pgcp, GHSA-9g5q-2w5x-hmxf) overwrote `r.RemoteAddr` from the
+leftmost `X-Forwarded-For` entry or from `X-Real-IP`, **unconditionally** —
+whether or not anything in front of this service actually set those headers.
+Every one of them is client-controlled by default, so any caller could assert
+any source address, evading an IP-based control and attributing its own traffic
+to someone else's address in the same motion.
 
-**Why this matters here specifically.** `r.RemoteAddr` is what the request log
-records, and it is what per-IP rate limiting and fraud signals will read once
-they exist. A spoofable client IP means an attacker can both evade an IP-based
-limit and attribute their own requests to somebody else's address in the audit
-trail — and an audit trail that can be written by the party being audited is
-worse than none, because it is trusted.
+**The fix: `internal/http/clientip.go`, a bounded trusted-hop parser of
+`X-Forwarded-For`, configured by `LEDGER_TRUSTED_PROXY_HOPS` (default `0`).**
+Each proxy between a client and this service appends the address it received
+the request *from* to the right of the header. With `hops` proxies this
+deployment actually trusts, the real client address sits exactly `hops`
+positions from the right; anything further left was written by the client
+itself or by an untrusted hop. `hops=0` — today's actual deployment, nothing
+sits in front of this service — means the header is **ignored outright** and
+the resolved address is always the raw TCP peer, which a caller cannot forge
+without controlling the network path itself. That is what makes `0` a safe
+default rather than a placeholder: it closes the vulnerability without
+asserting a topology that does not exist.
 
-**Why it is not fixed in this phase.** The correct behaviour is not a library
-choice, it is a deployment fact. Getting it right means either trusting exactly
-the *n* rightmost hops of `X-Forwarded-For`, where *n* is the number of proxies
-actually in the path, or trusting one specific header that one specific load
-balancer is known to set and to strip from inbound requests. Both require
-knowing the topology — which reverse proxy or load balancer, how many hops,
-whether the service is ever reachable directly — and that is exactly what the
-Phase 3 gateway design has to pin down. Picking a header now would mean guessing
-the topology and encoding the guess as a security control, which is how these
-holes are created in the first place.
+**`X-Real-IP` and `True-Client-IP` are no longer read, at any hop count.**
+Both are single-value headers with no chaining semantics: trusting one means
+trusting that a specific proxy unconditionally *overwrites* whatever the
+client sent, a claim this code has no way to verify from where it sits.
+`X-Forwarded-For`'s comma-separated chain is the one signal whose trustworthy
+prefix is actually computable from a hop count, which is why it is the only
+header this bounds. This is a strictly narrower trust surface than `RealIP`
+had, not merely a reimplementation of it.
 
-**Status:** the call site carries a scoped `//nolint:staticcheck` pointing back
-at this entry, so CI is green and a real regression elsewhere is still visible —
-a permanently red required job stops being a signal within about a week, and the
-next genuine failure hides inside it.
+**Rejected: dropping IP trust entirely, with no replacement and no config
+knob.** `r.RemoteAddr` would always be the raw socket peer, correct in every
+deployment this service runs in today. Rejected because it reproduces the
+exact shape of gap this entry already went through once: the day a real
+reverse proxy is placed in front of this service, someone has to come back and
+touch this code again rather than set an environment variable. A config knob
+that defaults to the safe answer costs nothing today and removes that future
+trip entirely.
 
-The cost of that is honest: the reminder is now a comment rather than a failing
-build, and comments are easier to walk past. Two things carry it instead. The
-suppression is on the single line, so it expires the moment the middleware is
-touched. And **until the trust model is chosen, `r.RemoteAddr` must not be
-treated as trustworthy** — not for rate limiting, not for fraud signals, not for
-audit. Anything built on it before Phase 3 inherits the spoofability.
+**Consequence: `remote_addr` is now logged.** The request logger
+(`internal/http/middleware.go`) previously recorded no client address at all —
+the promise that `r.RemoteAddr` "is what the request log records" was aspirational,
+not actual. It is safe to make good on now: every value reaching the logger has
+already passed through `clientIP`, so it is either the unforgeable TCP peer or
+an address a configured, trusted hop actually vouched for, never raw client
+input.
+
+**Verification.** `TestClientIP_IgnoresSpoofedHeadersByDefault` sends
+`X-Forwarded-For`, `X-Real-IP` and `True-Client-IP` all carrying a spoofed
+address at `hops=0` and asserts the resolved address is the real TCP peer — the
+exact scenario `chi.RealIP` got wrong. `TestClientIP_TrustsExactlyTheConfiguredHopCount`
+covers one and two trusted hops, a chain shorter than the configured hop
+count (falls back to the socket peer rather than guessing), a missing header,
+and a trusted entry that fails to parse as an address.
 
 ### Known gaps carried into Phase 3
 
@@ -615,37 +638,104 @@ and `ledger_idempotency_outcomes_total{outcome="cache_hit"}` against
 it. A dependency added before the measurement that justifies it is one nobody
 ever removes.
 
-### D24. The idempotency key namespace is global, and there is no authentication
+### D24. Idempotency keys, and saga instances, are scoped to an authenticated principal
 
-**Not decided. A known gap, recorded in the same spirit as D19.**
+**Decided, resolving the gap this entry carried since Phase 3.** The gap's own
+text specified the fix in advance — a composite primary key of
+`(principal, key)`, so a cross-tenant probe cannot even observe that a key
+exists — and that is exactly what shipped, once there was a principal to key
+by.
 
-The fingerprint covers the canonicalized body, the HTTP method and the route
-pattern. It does **not** cover the authenticated principal, because there is no
-authentication in this service yet.
+**`internal/auth` and `api_keys`.** A new, deliberately small package and
+table: server-generated secrets (`auth.GenerateKey`, 256 bits, prefixed
+`lk_live_` so a leaked key is recognisable at a glance), stored only as a
+SHA-256 hash — the same reasoning `idempotency_keys.request_fingerprint`
+already uses, for the same reason: a database that is read (a backup, a
+replica, a careless `SELECT *`) must not hand out a working credential.
+Callers present `Authorization: Bearer <key>`; `requireAuth`
+(`internal/http/auth.go`) resolves it to a `principalID` and makes it available
+to everything downstream. This is what the gap's own text rejected a
+placeholder for: a value the caller cannot merely assert, because possessing it
+requires a secret this service issued and never stored.
 
-**What that permits, stated plainly.** Keys share one namespace across every
-caller. Anyone who learns or guesses another caller's `Idempotency-Key` can send
-it and be handed that caller's stored response body — a transaction id, its
-accounts, and its amounts. Requiring a UUID makes an *accidental* collision
-essentially impossible; it does nothing about a deliberate one.
+**What this package deliberately is not.** There is no expiry, no scope, no
+rate limit, and the only mutation `auth.Store` exposes is `Issue` — no
+revocation-by-API, no listing, no rotation. `cmd/issue-api-key` is the entire
+provisioning surface, a one-shot CLI in the shape of `migrate` and
+`kafka-init`, because those are real admin-surface features that belong with
+the admin dashboard when it exists, and building them here would be Phase 6
+work wearing a Phase 3 bugfix's clothes. Revocation itself works today — flip
+`api_keys.status` to `'REVOKED'` — it is only the *API* for doing so that is
+absent.
 
-**Why a placeholder principal was considered and rejected.** Threading a
-constant, or a client-supplied header, into the fingerprint would make the code
-look as though it had a tenant boundary. It would not have one: a value the
-caller controls is not an identity, and the first reader to see
-`principal` in the digest would reasonably assume the problem was solved. A gap
-that looks closed is worse than one that is visibly open, which is the same
-argument D19 makes about `RealIP`.
+**The composite key, exactly as specified, plus one place the original
+analysis did not reach.** `idempotency_keys`' primary key is now
+`(principal_id, key)` (migration `000016_authentication`). But D20 — a
+different, separately-decided entry — documents `transactions_idempotency_key_key`
+as a **third, independent** defence of invariant 5, "the one that would still
+be standing if the other two were deleted." Scoping `idempotency_keys` alone
+and leaving that constraint global would still let two different principals
+collide there: principal B submitting principal A's exact key would pass B's
+own, now-scoped reservation, then fail at `transactions_idempotency_key_key`
+with "already exists" — the identical existence leak, one layer down. This
+migration scopes that constraint too, by the same mechanism, plus
+`saga_instances_idempotency_key_key` for the saga-level dedupe D24's own text
+already named as inheriting the gap. All three tables now carry a
+`principal_id` column and a composite unique constraint over it.
 
-**What has to happen when auth lands**, so the work is not rediscovered:
-`idempotency_keys.key` becomes a composite primary key of
-`(principal, key)` — namespacing rather than merely fingerprinting, so a
-cross-tenant probe cannot even observe that a key exists. Adding the principal
-to the fingerprint alone would turn the leak into a 422, which is safe but still
-tells the prober that the key is in use.
+**Why `NOT NULL DEFAULT ''`, not a nullable column.** Postgres never treats two
+NULLs as equal for uniqueness, so a nullable `principal_id` would silently
+*exempt* every unauthenticated or pre-migration row from the composite
+constraint — reopening precisely the hole this migration exists to close, for
+exactly the rows most likely to still be colliding. `''` is a real,
+comparable value: two legacy rows sharing a key still collide with each other,
+which is correct, because before this migration they shared one namespace on
+purpose.
 
-**Until then:** this service must not be exposed to mutually untrusting callers.
-That is a deployment constraint, and it belongs in the runbook alongside D19's.
+**Rejected: composing a scoped string (`principal + ":" + key`) and storing it
+in the existing single `key`/`idempotency_key` columns, with no schema
+restructuring at all.** This was seriously considered — it is provably
+unambiguous given `key` is always a canonical 36-character UUID, and it avoids
+touching `transactions` and `saga_instances` at all. It was rejected because it
+was not the design put to the user for approval, which showed real
+`principal_id` columns and composite constraints, and because a real column
+beats an encoded one on every axis that matters for a payments ledger:
+`principal_id` is directly queryable ("every key this principal holds"),
+directly indexable, and directly auditable, where a composed string requires
+parsing to answer any of those questions. The smaller migration was available
+and was not taken, on purpose.
+
+**Verification.** `TestAPI_WriteRoutesRequireAuthentication` covers a missing
+and an unrecognised key. `TestAPI_IdempotencyKeysAreScopedToThePrincipal` has
+two real, distinct principals hold the identical key at once with different
+bodies and asserts both succeed as two distinct transactions — the scenario
+that previously hit `ErrIdempotencyConflict`. `TestAPI_ACallerCannotReplayAnothersResponseWithTheSameKey`
+goes further: principal B sends A's exact key *and* A's exact body, and the
+response must not carry `Idempotent-Replay` or A's transaction id — the leak
+D24 named, stated as a byte-level assertion.
+`TestSagaPayout_IdempotencyKeysAreScopedToThePrincipal` is the same proof at
+the saga layer. `TestAuth_RevokedKeyStopsAuthenticating` and
+`TestAuth_UnknownKeyDoesNotAuthenticate` cover the store directly.
+
+**Confirmed against the running stack, not only the test suite.** Two real
+principals (`local-dev`, seeded; `tenant-b`, issued live) posted transactions
+under the identical `Idempotency-Key`, with different bodies, over HTTP against
+the actual `docker compose` deployment: both returned `201` with two distinct
+transaction ids. The same run also confirmed the down migration's own honesty —
+having just made `transactions.idempotency_key` non-unique across principals on
+purpose, `migrate down` on `000016` refused, loudly, exactly as its leading
+comment says it will rather than silently collapsing two principals' history
+into one row.
+
+**What remains open.** There is still no authorization model — an
+authenticated principal may read or write against *any* account, because this
+schema has no notion of which accounts a principal may touch. D24 was
+specifically about the idempotency namespace, and closing it did not require
+solving that; building it here would again be Phase 6 work borrowing this
+bugfix's authority. `GET /v1/sagas/{id}` also remains unauthenticated — its
+exposure is a different, narrower gap (an unguessable-ID lookup, not an
+idempotency-key collision) and is recorded separately below rather than folded
+into a D24 fix it was never part of.
 
 ### D25. Sharding preserves invariant 4 and weakens liveness
 
@@ -1548,12 +1638,9 @@ path — so backlog must be judged from the topic, not from that column.
 
 ### Known gaps carried into Phase 6
 
-- **The client IP is still spoofable (D19).** Unchanged, now two phases overdue.
-  Nothing added here reads `r.RemoteAddr`.
-- **The idempotency key namespace is still global and unauthenticated (D24).**
-  `saga_instances.idempotency_key` inherits it exactly: anyone who guesses
-  another caller's key can read that caller's saga, which now includes account
-  ids and amounts. It needs the same `(principal, key)` composite treatment.
+- **D19 and D24 are closed**, ahead of Phase 6 rather than as part of it — see
+  D19 and D24 above for the fix, and D47 below for two gaps the fix
+  deliberately left open rather than folding into a standalone security patch.
 - **Redis is still unimplemented (D23).**
 - **A shard rebalancer still does not exist (D25).** A sharded payout suspense
   account would be subject to the same false refusals; the seeded one is not
@@ -1575,3 +1662,47 @@ path — so backlog must be judged from the topic, not from that column.
 - **The reconciliation invariant from D38 is documented, not enforced.** Nothing
   yet compares `suspense.pending_minor` against the sum of non-terminal sagas.
   It belongs in the reconciliation engine, which is still a Phase 1 skeleton.
+
+---
+
+## Standalone fix — D19 and D24, ahead of Phase 6
+
+### D47. What closing D19 and D24 deliberately left open
+
+Two gaps, named rather than folded silently into "done," per the same
+discipline D19 and D24 themselves modeled: a gap that looks closed is worse
+than one that is visibly open.
+
+**There is still no authorization model.** `requireAuth` establishes *who* a
+caller is; nothing establishes *what* that caller may touch. An authenticated
+principal may read or post against any account in the schema, because
+`accounts` has no notion of principal ownership distinct from `owner_id`
+(free-text domain metadata, not a security boundary). D24 was scoped to the
+idempotency-key collision specifically — one principal being handed another's
+*stored response* — and closing that did not require solving general
+authorization. Building it here would be exactly the trap D24's own original
+text warned about: a placeholder that looks like a real boundary invites the
+next reader to assume the problem is solved.
+
+**`GET /v1/sagas/{id}` remains unauthenticated.** It was flagged as a
+Phase-5-adjacent concern when D24 was first widened to include
+`saga_instances`, and on inspection it is a **different** gap, not the one D24
+names: this endpoint dedupes nothing and completes no idempotency key, so
+there is no collision to scope. Its exposure is an unguessable-ID problem — a
+UUIDv7 saga id is not secret, only hard to enumerate — the same category as
+any resource addressed by primary key with no ownership check. It is left open
+because authorization (the gap above) is what actually closes it, and a
+narrower, saga-specific patch here would be one more placeholder to walk past
+later.
+
+**Why this was scoped as a standalone fix rather than the start of Phase 6.**
+Both D19 and D24 were three phases overdue and named specific, exploitable
+holes — a spoofable audit trail, a cross-tenant response leak — with proven
+minimal fixes available (a config default, a composite key). The two gaps
+above are neither: they are the honest boundary of what "authentication
+exists" implies, not implies *authorization does*, and building the latter
+needs the same design discussion CLAUDE.md asks for before any new subsystem —
+which accounts a principal owns, whether ownership is single- or multi-tenant,
+how it interacts with sharding's `parent_account_id`. That is real Phase 6
+work, and this fix does not pre-empt it by picking an answer under the cover
+of a security patch.

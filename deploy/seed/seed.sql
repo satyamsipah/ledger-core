@@ -11,6 +11,19 @@
 
 BEGIN;
 
+-- A fixed, well-known local-dev API key, so `curl` examples in the README and
+-- ad hoc local testing do not require a round trip through cmd/issue-api-key
+-- first. The raw value is deliberately obvious (`lk_live_dev00...`) so it is
+-- unmistakable in a log line or a diff, and it authenticates ONLY against a
+-- database seeded from this file -- there is nothing "live" about it despite
+-- the KeyPrefix. Real principals are issued through cmd/issue-api-key, never
+-- through this file.
+INSERT INTO api_keys (id, principal_id, key_hash, status)
+VALUES
+    ('01920000-0000-7000-8000-0000000000f1', 'local-dev',
+     '\x4679851119d8ac9c02d65ed27cf78d64c1ad0cc1de65057a0e6c701d7b7d25ae', 'ACTIVE')
+ON CONFLICT (id) DO NOTHING;
+
 INSERT INTO accounts (id, external_ref, account_type, normal_balance, currency, owner_id, allow_negative, status)
 VALUES
     -- Platform's own cash at the bank. The asset side of every pay-in.

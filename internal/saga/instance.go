@@ -22,8 +22,15 @@ const EventVersion int16 = 1
 
 // Instance is one row of saga_instances: a single in-flight or finished saga.
 type Instance struct {
-	ID             uuid.UUID
-	SagaType       string
+	ID       uuid.UUID
+	SagaType string
+
+	// PrincipalID is the authenticated caller this saga was started for. Empty
+	// only for internally-started sagas, of which there are none today -- every
+	// saga reaches this package through an authenticated HTTP request. Scoped
+	// alongside IdempotencyKey in saga_instances' composite unique index; see
+	// docs/DECISIONS.md D24 for why the saga-level dedupe needed this too.
+	PrincipalID    string
 	CurrentStep    Step
 	Status         Status
 	Payload        json.RawMessage

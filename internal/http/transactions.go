@@ -54,12 +54,17 @@ func handlePostTransaction(service LedgerService) nethttp.HandlerFunc {
 			return
 		}
 
+		// requireAuth has already run on this route, so state.principalID is
+		// the caller this transaction and its idempotency key are scoped to.
+		request.PrincipalID = state.principalID
+
 		// The rendered response is what a retry will be handed, so it is built
 		// here -- inside the transaction, via this callback -- and stored with
 		// the journal entries it describes.
 		request.Idempotency = &ledger.Idempotent{
-			Key:    state.key,
-			Render: renderCreated,
+			PrincipalID: state.principalID,
+			Key:         state.key,
+			Render:      renderCreated,
 		}
 
 		posted, err := service.PostTransaction(r.Context(), request)
@@ -104,7 +109,7 @@ func handleReverseTransaction(service LedgerService) nethttp.HandlerFunc {
 		}
 
 		reversal, err := service.ReverseTransactionIdempotent(r.Context(), transactionID, body.Reason,
-			&ledger.Idempotent{Key: state.key, Render: renderCreated})
+			&ledger.Idempotent{PrincipalID: state.principalID, Key: state.key, Render: renderCreated})
 		if err != nil {
 			status, problem := writeProblem(w, r, err)
 			state.reject(r.Context(), err, status, problem)

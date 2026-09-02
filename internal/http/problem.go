@@ -9,6 +9,7 @@ import (
 
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 
+	"github.com/satyamsipah/ledger-core/internal/auth"
 	"github.com/satyamsipah/ledger-core/internal/idempotency"
 	"github.com/satyamsipah/ledger-core/internal/ledger"
 	"github.com/satyamsipah/ledger-core/internal/saga"
@@ -61,6 +62,12 @@ type Problem struct {
 // thing the client has to fix.
 func problemFor(err error) (int, string, string) {
 	switch {
+	// ---- Authentication ---------------------------------------------------
+	case errors.Is(err, auth.ErrMissingAPIKey):
+		return nethttp.StatusUnauthorized, "missing-api-key", "Authorization header required"
+	case errors.Is(err, auth.ErrInvalidAPIKey):
+		return nethttp.StatusUnauthorized, "invalid-api-key", "The presented API key did not authenticate"
+
 	// ---- Idempotency ----------------------------------------------------
 	case errors.Is(err, idempotency.ErrMissingKey):
 		return nethttp.StatusBadRequest, "missing-idempotency-key", "Idempotency key required"

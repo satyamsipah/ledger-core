@@ -27,7 +27,7 @@ var _ saga.Store = (*Store)(nil)
 
 // instanceColumns is the projection every instance read shares, so a column
 // added to the table is added in exactly one place.
-const instanceColumns = `id, saga_type, current_step, status, payload, retry_count,
+const instanceColumns = `id, saga_type, principal_id, current_step, status, payload, retry_count,
 	COALESCE(last_error, ''), idempotency_key, lease_owner, lease_expires_at,
 	step_deadline_at, created_at, updated_at`
 
@@ -82,13 +82,13 @@ func (s *Store) Create(ctx context.Context, in saga.Instance) (*saga.Instance, e
 
 	rows, err := s.pool.Query(ctx, `
 		INSERT INTO saga_instances
-		    (id, saga_type, current_step, status, payload, idempotency_key,
-		     step_deadline_at)
-		VALUES ($1, $2, $3, $4, $5, $6, now() + make_interval(secs => $7))
-		ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL
+		    (id, saga_type, principal_id, current_step, status, payload,
+		     idempotency_key, step_deadline_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, now() + make_interval(secs => $8))
+		ON CONFLICT (principal_id, idempotency_key) WHERE idempotency_key IS NOT NULL
 		DO NOTHING
 		RETURNING `+instanceColumns,
-		in.ID, in.SagaType, in.CurrentStep, in.Status, in.Payload,
+		in.ID, in.SagaType, in.PrincipalID, in.CurrentStep, in.Status, in.Payload,
 		in.IdempotencyKey, time.Until(in.StepDeadlineAt).Seconds())
 	if err != nil {
 		return nil, fmt.Errorf("insert saga %s: %w", in.ID, err)
@@ -106,12 +106,16 @@ func (s *Store) Create(ctx context.Context, in saga.Instance) (*saga.Instance, e
 	if in.IdempotencyKey == nil {
 		return nil, fmt.Errorf("insert saga %s: no row returned and no idempotency key to look it up by", in.ID)
 	}
-	return s.getByIdempotencyKey(ctx, *in.IdempotencyKey)
+	return s.getByIdempotencyKey(ctx, in.PrincipalID, *in.IdempotencyKey)
 }
 
-func (s *Store) getByIdempotencyKey(ctx context.Context, key string) (*saga.Instance, error) {
+// getByIdempotencyKey is scoped by principal so that the fallback read after a
+// DO NOTHING never returns a different principal's saga -- the same property
+// D24 requires of idempotency_keys, extended to this table's own dedupe.
+func (s *Store) getByIdempotencyKey(ctx context.Context, principalID, key string) (*saga.Instance, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT `+instanceColumns+` FROM saga_instances WHERE idempotency_key = $1`, key)
+		`SELECT `+instanceColumns+` FROM saga_instances WHERE principal_id = $1 AND idempotency_key = $2`,
+		principalID, key)
 	if err != nil {
 		return nil, fmt.Errorf("read saga by idempotency key %s: %w", key, err)
 	}
@@ -464,7 +468,7 @@ func collectInstances(rows pgx.Rows) ([]saga.Instance, error) {
 	var found []saga.Instance
 	for rows.Next() {
 		var in saga.Instance
-		if err := rows.Scan(&in.ID, &in.SagaType, &in.CurrentStep, &in.Status, &in.Payload,
+		if err := rows.Scan(&in.ID, &in.SagaType, &in.PrincipalID, &in.CurrentStep, &in.Status, &in.Payload,
 			&in.RetryCount, &in.LastError, &in.IdempotencyKey, &in.LeaseOwner,
 			&in.LeaseExpiresAt, &in.StepDeadlineAt, &in.CreatedAt, &in.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan saga instance: %w", err)

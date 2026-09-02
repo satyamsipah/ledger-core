@@ -26,6 +26,7 @@ import (
 	"go.yaml.in/yaml/v3"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/satyamsipah/ledger-core/internal/auth/pgauth"
 	ledgerhttp "github.com/satyamsipah/ledger-core/internal/http"
 	"github.com/satyamsipah/ledger-core/internal/idempotency"
 	"github.com/satyamsipah/ledger-core/internal/ledger"
@@ -51,6 +52,7 @@ func newAPI(t *testing.T, lease time.Duration) *httptest.Server {
 		Metrics:     observability.NewMetrics("test"),
 		Ledger:      service,
 		Idempotency: newIdempotencyManager(t, sharedPool, lease),
+		Auth:        pgauth.New(sharedPool, 30*time.Second),
 	})
 
 	server := httptest.NewServer(handler)
@@ -92,6 +94,11 @@ func do(t *testing.T, ctx context.Context, server *httptest.Server, method, path
 	if key != "" {
 		request.Header.Set("Idempotency-Key", key)
 	}
+	// Every request in this suite authenticates as the shared test principal
+	// unless a test explicitly overrides it (see doAs), so the many existing
+	// write-path assertions below needed no changes when D24's auth
+	// requirement landed.
+	request.Header.Set("Authorization", "Bearer "+sharedAPIKey)
 
 	response, err := server.Client().Do(request)
 	require.NoError(t, err)
@@ -106,6 +113,44 @@ func do(t *testing.T, ctx context.Context, server *httptest.Server, method, path
 func post(t *testing.T, ctx context.Context, server *httptest.Server, path, key, body string) (apiResponse, []byte) {
 	t.Helper()
 	return do(t, ctx, server, nethttp.MethodPost, path, key, body)
+}
+
+// doAs is do, but authenticated as a caller-chosen API key rather than the
+// shared test principal -- the seam D24's tests need to prove two different
+// principals cannot collide on an identical idempotency key.
+func doAs(t *testing.T, ctx context.Context, server *httptest.Server, apiKey, method, path, key, body string) (apiResponse, []byte) {
+	t.Helper()
+
+	var reader io.Reader
+	if body != "" {
+		reader = strings.NewReader(body)
+	}
+
+	request, err := nethttp.NewRequestWithContext(ctx, method, server.URL+path, reader)
+	require.NoError(t, err)
+	if body != "" {
+		request.Header.Set("Content-Type", "application/json")
+	}
+	if key != "" {
+		request.Header.Set("Idempotency-Key", key)
+	}
+	if apiKey != "" {
+		request.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+
+	response, err := server.Client().Do(request)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, response.Body.Close()) }()
+
+	payload, err := io.ReadAll(response.Body)
+	require.NoError(t, err)
+
+	return apiResponse{StatusCode: response.StatusCode, Header: response.Header}, payload
+}
+
+func postAs(t *testing.T, ctx context.Context, server *httptest.Server, apiKey, path, key, body string) (apiResponse, []byte) {
+	t.Helper()
+	return doAs(t, ctx, server, apiKey, nethttp.MethodPost, path, key, body)
 }
 
 func get(t *testing.T, ctx context.Context, server *httptest.Server, path string) (apiResponse, []byte) {
@@ -731,6 +776,7 @@ func TestOpenAPI_MatchesTheRegisteredRoutes(t *testing.T) {
 		Idempotency: newIdempotencyManager(t, sharedPool, idempotency.DefaultLease),
 		Payout:      orchestrator,
 		Sagas:       pgsaga.New(sharedPool, 30*time.Second),
+		Auth:        pgauth.New(sharedPool, 30*time.Second),
 	})
 
 	registered := map[string]struct{}{}

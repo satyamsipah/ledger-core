@@ -37,7 +37,7 @@ func TestSagaPayout_HappyPathSettlesToMerchantAndFees(t *testing.T) {
 	gatewayServer, listener := startMockGateway(t)
 	orchestrator, _, _ := newOrchestrator(t, sharedPool, listener.URL, nil)
 
-	instance, err := orchestrator.Start(ctx, accounts.payload(payoutAmount, payoutFee), nil)
+	instance, err := orchestrator.Start(ctx, accounts.payload(payoutAmount, payoutFee), "test-principal", nil)
 	require.NoError(t, err)
 
 	final := driveTo(t, ctx, orchestrator, instance.ID, saga.StatusCompleted)
@@ -90,7 +90,7 @@ func TestSagaPayout_GatewayFailureCompensatesToTheExactPreSagaState(t *testing.T
 
 	before := takeSnapshot(t, ctx, accounts)
 
-	instance, err := orchestrator.Start(ctx, accounts.payload(payoutAmount, payoutFee), nil)
+	instance, err := orchestrator.Start(ctx, accounts.payload(payoutAmount, payoutFee), "test-principal", nil)
 	require.NoError(t, err)
 
 	driveTo(t, ctx, orchestrator, instance.ID, saga.StatusCompensated)
@@ -143,7 +143,7 @@ func TestSagaPayout_AmbiguousGatewayOutcomeIsResolvedByQueryNotByGuess(t *testin
 
 		orchestrator, metrics, _ := newOrchestrator(t, sharedPool, listener.URL, nil)
 
-		instance, err := orchestrator.Start(ctx, accounts.payload(payoutAmount, payoutFee), nil)
+		instance, err := orchestrator.Start(ctx, accounts.payload(payoutAmount, payoutFee), "test-principal", nil)
 		require.NoError(t, err)
 
 		unresolved := driveTo(t, ctx, orchestrator, instance.ID, saga.StatusGatewayPending)
@@ -188,7 +188,7 @@ func TestSagaPayout_AmbiguousGatewayOutcomeIsResolvedByQueryNotByGuess(t *testin
 		orchestrator, _, _ := newOrchestrator(t, sharedPool, listener.URL, nil)
 
 		before := takeSnapshot(t, ctx, accounts)
-		instance, err := orchestrator.Start(ctx, accounts.payload(payoutAmount, payoutFee), nil)
+		instance, err := orchestrator.Start(ctx, accounts.payload(payoutAmount, payoutFee), "test-principal", nil)
 		require.NoError(t, err)
 
 		driveTo(t, ctx, orchestrator, instance.ID, saga.StatusGatewayPending)
@@ -213,7 +213,7 @@ func TestSagaPayout_AmbiguousGatewayOutcomeIsResolvedByQueryNotByGuess(t *testin
 
 		orchestrator, metrics, _ := newOrchestrator(t, sharedPool, listener.URL, nil)
 
-		instance, err := orchestrator.Start(ctx, accounts.payload(payoutAmount, payoutFee), nil)
+		instance, err := orchestrator.Start(ctx, accounts.payload(payoutAmount, payoutFee), "test-principal", nil)
 		require.NoError(t, err)
 
 		driveTo(t, ctx, orchestrator, instance.ID, saga.StatusGatewayPending)
@@ -260,7 +260,7 @@ func TestSagaPayout_CompensationExhaustionNeedsManualReview(t *testing.T) {
 
 	orchestrator, metrics, _ := newOrchestrator(t, sharedPool, listener.URL, nil)
 
-	instance, err := orchestrator.Start(ctx, accounts.payload(payoutAmount, payoutFee), nil)
+	instance, err := orchestrator.Start(ctx, accounts.payload(payoutAmount, payoutFee), "test-principal", nil)
 	require.NoError(t, err)
 
 	// Reserve first, so there is something to compensate, and only then make
@@ -320,7 +320,7 @@ func TestSagaPayout_CrashMidFlightResumesExactlyOnce(t *testing.T) {
 	gatewayServer, listener := startMockGateway(t)
 	survivor, _, sagaType := newOrchestrator(t, sharedPool, listener.URL, nil)
 
-	instance, err := survivor.Start(ctx, accounts.payload(payoutAmount, payoutFee), nil)
+	instance, err := survivor.Start(ctx, accounts.payload(payoutAmount, payoutFee), "test-principal", nil)
 	require.NoError(t, err)
 
 	driveTo(t, ctx, survivor, instance.ID, saga.StatusGatewaySucceeded)
@@ -427,7 +427,7 @@ func TestSagaPayout_ConcurrentSagasOnOneWalletCannotDoubleSpend(t *testing.T) {
 	for i := range sagas {
 		group.Go(func() error {
 			<-start
-			instance, err := orchestrator.Start(groupCtx, accounts.payload(amount, fee), nil)
+			instance, err := orchestrator.Start(groupCtx, accounts.payload(amount, fee), "test-principal", nil)
 			if err != nil {
 				return err
 			}

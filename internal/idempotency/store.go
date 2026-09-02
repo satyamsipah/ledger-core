@@ -40,25 +40,32 @@ type Store interface {
 	// caller won the key. It commits immediately and on its own.
 	Reserve(ctx context.Context, r Reservation) (won bool, err error)
 
-	// Lookup reads a record by key, INCLUDING one past its expires_at. The
-	// caller decides what expiry means; a store that filtered expired rows out
-	// would make "expired" and "absent" indistinguishable, and those two
-	// demand different answers -- 409 against executing afresh.
-	Lookup(ctx context.Context, key string) (*Record, error)
+	// Lookup reads a record by (principal, key), INCLUDING one past its
+	// expires_at. The caller decides what expiry means; a store that filtered
+	// expired rows out would make "expired" and "absent" indistinguishable,
+	// and those two demand different answers -- 409 against executing afresh.
+	//
+	// Scoped by principal, not merely by key: a lookup under one principal for
+	// another's key must return exactly what an absent key returns -- nil,
+	// nothing -- so that a cross-tenant probe cannot even observe that a key
+	// exists. See docs/DECISIONS.md D24.
+	Lookup(ctx context.Context, principalID, key string) (*Record, error)
 
 	// Reclaim takes over a lease that has run out, returning whether this
 	// caller won it. Guarded so that only one of several simultaneous
 	// reclaimers proceeds.
-	Reclaim(ctx context.Context, key string, lease time.Duration) (won bool, err error)
+	Reclaim(ctx context.Context, principalID, key string, lease time.Duration) (won bool, err error)
 
 	// Fail records a deterministic rejection so it can be replayed.
-	Fail(ctx context.Context, key string, responseStatus int, responseBody []byte) error
+	Fail(ctx context.Context, principalID, key string, responseStatus int, responseBody []byte) error
 
 	// Release deletes this request's reservation, guarded on IN_PROGRESS so it
 	// can never remove a completed record.
-	Release(ctx context.Context, key string) error
+	Release(ctx context.Context, principalID, key string) error
 
 	// Sweep deletes up to batch expired records, returning how many went.
+	// Unscoped by principal on purpose: expiry is a property of time, not of
+	// who owns the record, so one sweep clears every principal's stale keys.
 	Sweep(ctx context.Context, batch int) (int64, error)
 }
 
@@ -77,11 +84,13 @@ type Store interface {
 type Cache interface {
 	// Get returns a cached terminal record, or false on any miss, error or
 	// timeout. It does not return an error: there is no cache failure a caller
-	// could usefully act on, since the answer is always "ask Postgres".
+	// could usefully act on, since the answer is always "ask Postgres". key is
+	// always produced by cacheKey, composing (principal, key) into one string.
 	Get(ctx context.Context, key string) (*Record, bool)
 
-	// Put stores a terminal record. Callers ignore failures.
-	Put(ctx context.Context, record *Record, ttl time.Duration)
+	// Put stores a terminal record under key (see cacheKey). Callers ignore
+	// failures.
+	Put(ctx context.Context, key string, record *Record, ttl time.Duration)
 }
 
 // NoopCache is a Cache that stores nothing.
@@ -97,7 +106,7 @@ type NoopCache struct{}
 func (NoopCache) Get(context.Context, string) (*Record, bool) { return nil, false }
 
 // Put discards the record.
-func (NoopCache) Put(context.Context, *Record, time.Duration) {}
+func (NoopCache) Put(context.Context, string, *Record, time.Duration) {}
 
 // Manager runs the idempotency state machine over a Store and a Cache.
 //
@@ -156,7 +165,7 @@ func (m *Manager) Acquire(ctx context.Context, r Reservation) (*Record, Disposit
 	// The cache is consulted before Postgres and can only ever hold terminal
 	// records, so a hit is either a replay or a conflict -- never a decision
 	// that depends on anything still moving.
-	if cached, ok := m.cache.Get(ctx, r.Key); ok {
+	if cached, ok := m.cache.Get(ctx, cacheKey(r.PrincipalID, r.Key)); ok {
 		m.count("cache_hit")
 		return m.resolveExisting(ctx, cached, r)
 	}
@@ -171,7 +180,7 @@ func (m *Manager) Acquire(ctx context.Context, r Reservation) (*Record, Disposit
 		return nil, Proceed, nil
 	}
 
-	existing, err := m.store.Lookup(ctx, r.Key)
+	existing, err := m.store.Lookup(ctx, r.PrincipalID, r.Key)
 	if err != nil {
 		return nil, Proceed, fmt.Errorf("look up idempotency key %s: %w", r.Key, err)
 	}
@@ -217,7 +226,7 @@ func (m *Manager) resolveExisting(ctx context.Context, existing *Record, r Reser
 	}
 
 	if existing.Status.Terminal() {
-		m.cache.Put(ctx, existing, time.Until(existing.ExpiresAt))
+		m.cache.Put(ctx, cacheKey(existing.PrincipalID, existing.Key), existing, time.Until(existing.ExpiresAt))
 		m.count("replayed")
 		return existing, Replay, nil
 	}
@@ -234,7 +243,7 @@ func (m *Manager) resolveExisting(ctx context.Context, existing *Record, r Reser
 	// The lease is dead, so its owner never committed -- IN_PROGRESS proves it.
 	// Taking over is therefore safe without any coordination beyond the guarded
 	// UPDATE, which is also what stops two simultaneous reclaimers both winning.
-	won, err := m.store.Reclaim(ctx, existing.Key, r.Lease)
+	won, err := m.store.Reclaim(ctx, existing.PrincipalID, existing.Key, r.Lease)
 	if err != nil {
 		return nil, Proceed, fmt.Errorf("reclaim idempotency key %s: %w", existing.Key, err)
 	}
@@ -249,8 +258,8 @@ func (m *Manager) resolveExisting(ctx context.Context, existing *Record, r Reser
 
 // Fail caches a deterministic rejection so a retry gets the same answer without
 // re-running work whose outcome cannot change.
-func (m *Manager) Fail(ctx context.Context, key string, responseStatus int, responseBody []byte) error {
-	if err := m.store.Fail(ctx, key, responseStatus, responseBody); err != nil {
+func (m *Manager) Fail(ctx context.Context, principalID, key string, responseStatus int, responseBody []byte) error {
+	if err := m.store.Fail(ctx, principalID, key, responseStatus, responseBody); err != nil {
 		return fmt.Errorf("record failure for idempotency key %s: %w", key, err)
 	}
 	m.count("failed")
@@ -264,8 +273,8 @@ func (m *Manager) Fail(ctx context.Context, key string, responseStatus int, resp
 // unreachable -- leaves a lease that expires on its own. Both failure modes cost
 // a delay, neither costs correctness, which is why this returns an error for
 // logging rather than for handling.
-func (m *Manager) Release(ctx context.Context, key string) error {
-	if err := m.store.Release(ctx, key); err != nil {
+func (m *Manager) Release(ctx context.Context, principalID, key string) error {
+	if err := m.store.Release(ctx, principalID, key); err != nil {
 		return fmt.Errorf("release idempotency key %s: %w", key, err)
 	}
 	m.count("released")
@@ -282,7 +291,18 @@ func (m *Manager) CacheCompleted(ctx context.Context, record *Record) {
 	if record == nil || !record.Status.Terminal() {
 		return
 	}
-	m.cache.Put(ctx, record, time.Until(record.ExpiresAt))
+	m.cache.Put(ctx, cacheKey(record.PrincipalID, record.Key), record, time.Until(record.ExpiresAt))
+}
+
+// cacheKey composes the cache's lookup string from a principal and a key.
+//
+// Unambiguous despite being plain concatenation: key is always a canonical
+// UUID string, fixed at 36 characters (idempotency.ParseKey guarantees this),
+// so two different (principal, key) pairs can never produce the same composed
+// string -- the fixed-width suffix pins where the delimiter falls regardless
+// of what characters principalID itself contains.
+func cacheKey(principalID, key string) string {
+	return principalID + ":" + key
 }
 
 func (m *Manager) count(outcome string) {

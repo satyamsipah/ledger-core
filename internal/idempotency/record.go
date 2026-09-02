@@ -43,6 +43,7 @@ func (s Status) Terminal() bool {
 
 // Record is one row of idempotency_keys.
 type Record struct {
+	PrincipalID    string
 	Key            string
 	Fingerprint    Fingerprint
 	Status         Status
@@ -58,6 +59,11 @@ type Record struct {
 
 // Reservation is the request to take a key, as issued before any work starts.
 type Reservation struct {
+	// PrincipalID is the authenticated caller this key is scoped to. Two
+	// different principals may hold the identical Key at once -- see
+	// docs/DECISIONS.md D24 -- because the namespace this key lives in is
+	// (PrincipalID, Key), never Key alone.
+	PrincipalID string
 	Key         string
 	Fingerprint Fingerprint
 	Method      string
@@ -80,6 +86,7 @@ type Reservation struct {
 // retrying across a deploy would get a different body for the same key, which
 // is the one thing an idempotent endpoint promises not to do.
 type Completion struct {
+	PrincipalID    string
 	Key            string
 	ResponseStatus int
 	ResponseBody   []byte

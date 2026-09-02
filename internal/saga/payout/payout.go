@@ -181,7 +181,7 @@ func (o *Orchestrator) WithCrashHook(fn func()) { o.beforeSettleCommit = fn }
 // idempotencyKey, when set, makes a retried request return the saga it already
 // started rather than starting a second one -- the saga-level counterpart of
 // invariant 5.
-func (o *Orchestrator) Start(ctx context.Context, p Payload, idempotencyKey *string) (*saga.Instance, error) {
+func (o *Orchestrator) Start(ctx context.Context, p Payload, principalID string, idempotencyKey *string) (*saga.Instance, error) {
 	if err := p.validate(); err != nil {
 		return nil, err
 	}
@@ -199,6 +199,7 @@ func (o *Orchestrator) Start(ctx context.Context, p Payload, idempotencyKey *str
 	created, err := o.store.Create(ctx, saga.Instance{
 		ID:             id,
 		SagaType:       o.cfg.SagaType,
+		PrincipalID:    principalID,
 		CurrentStep:    saga.StepReserve,
 		Status:         saga.StatusPending,
 		Payload:        payload,

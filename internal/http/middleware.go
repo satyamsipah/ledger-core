@@ -37,6 +37,10 @@ func requestLogger(logger *slog.Logger) func(nethttp.Handler) nethttp.Handler {
 				slog.Int("bytes", ww.BytesWritten()),
 				slog.Duration("duration", time.Since(started)),
 				slog.String("request_id", chimiddleware.GetReqID(r.Context())),
+				// Safe to log now: clientIP (D19) has already reduced this to
+				// either an unforgeable TCP peer or an address a configured,
+				// trusted hop actually vouched for -- never raw client input.
+				slog.String("remote_addr", r.RemoteAddr),
 			}
 			if sc := trace.SpanContextFromContext(r.Context()); sc.IsValid() {
 				attrs = append(attrs, slog.String("trace_id", sc.TraceID().String()))

@@ -51,6 +51,12 @@ type Deps struct {
 	Payout PayoutService
 	Sagas  SagaReader
 
+	// Reconciliation is nil in a process that does not expose reconciliation
+	// reports. Registered independently of the ledger routes for the same
+	// reason Sagas is: cmd/reconciler produces the reports, cmd/api serves
+	// them, and neither process needs the other's dependencies to do its job.
+	Reconciliation ReconciliationReader
+
 	// TrustedProxyHops configures clientIP. Zero -- the default -- trusts
 	// nothing in X-Forwarded-For and always uses the raw socket peer. See D19.
 	TrustedProxyHops int
@@ -124,6 +130,16 @@ func NewMux(deps Deps) chi.Router {
 			r.Route("/sagas", func(r chi.Router) {
 				r.Get("/", handleListSagas(deps.Sagas))
 				r.Get("/{id}", handleGetSaga(deps.Sagas))
+			})
+		}
+
+		// Reads only, and authenticated: a reconciliation exception carries
+		// amounts and external references, the same class of information
+		// D24 scoped idempotency responses to a principal to protect.
+		if deps.Reconciliation != nil && deps.Auth != nil {
+			r.Route("/reconciliation/runs", func(r chi.Router) {
+				r.With(requireAuth(deps.Auth)).Get("/", handleListReconciliationRuns(deps.Reconciliation))
+				r.With(requireAuth(deps.Auth)).Get("/{id}", handleGetReconciliationRun(deps.Reconciliation))
 			})
 		}
 

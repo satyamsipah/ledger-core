@@ -22,6 +22,7 @@ import (
 	"github.com/satyamsipah/ledger-core/internal/ledger"
 	"github.com/satyamsipah/ledger-core/internal/ledger/pgledger"
 	"github.com/satyamsipah/ledger-core/internal/observability"
+	"github.com/satyamsipah/ledger-core/internal/reconciliation/pgreconciliation"
 	"github.com/satyamsipah/ledger-core/internal/saga/payout"
 	"github.com/satyamsipah/ledger-core/internal/saga/pgsaga"
 )
@@ -114,6 +115,11 @@ func run() error {
 		StepTimeout: cfg.Saga.StepTimeout,
 	})
 
+	// The API reads reconciliation reports; it never runs a reconciliation.
+	// cmd/reconciler owns the job, the same split this process already makes
+	// for sagas: it starts and reads them but never drives the state machine.
+	reconciliationStore := pgreconciliation.New(pool.Pool, cfg.Postgres.QueryTimeout)
+
 	router := ledgerhttp.NewRouter(ledgerhttp.Deps{
 		Service:          serviceName,
 		Logger:           logger,
@@ -123,6 +129,7 @@ func run() error {
 		Idempotency:      idempotencyManager,
 		Payout:           payoutStarter,
 		Sagas:            sagaStore,
+		Reconciliation:   reconciliationStore,
 		TrustedProxyHops: cfg.HTTP.TrustedProxyHops,
 		Auth:             authStore,
 	})

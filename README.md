@@ -653,6 +653,60 @@ docker compose -f deploy/docker-compose.yml pause mock-gateway
 make sagas-stuck                                           # the triage list
 ```
 
+## Reconciliation
+
+`cmd/reconciler` proves the ledger correct against a source of truth this
+service does not control: a PSP settlement statement. On a schedule (daily by
+default, `LEDGER_RECONCILER_INTERVAL`) it reads a CSV from
+`LEDGER_RECONCILER_PSP_CSV_PATH` and three-way matches it against this
+ledger's own `transactions` and the saga orchestrator's `saga_instances`,
+keyed on `external_ref`.
+
+Every mismatch is classified into one of six categories:
+
+| Category | Meaning |
+|---|---|
+| `MISSING_IN_LEDGER` | The statement names a reference no transaction carries |
+| `MISSING_IN_PSP` | The ledger posted it; the statement never mentions it |
+| `AMOUNT_MISMATCH` | The amount or currency disagrees |
+| `STATUS_MISMATCH` | e.g. the ledger says `POSTED`, the PSP says `FAILED` |
+| `TIMING_DIFFERENCE` | Only the settlement instant disagrees |
+| `DUPLICATE` | The statement lists one reference more than once |
+
+Only `TIMING_DIFFERENCE` auto-resolves, and only when the gap is inside
+`LEDGER_RECONCILER_TIMING_WINDOW` (default two hours). Every other category
+becomes an `OPEN` exception requiring review. The report is
+`GET /v1/reconciliation/runs/{id}` — a run's own counts, a breakdown by
+category, and every exception it raised.
+
+**What counts as "the ledger's amount" for a reference.** A single payout saga
+posts two transactions sharing one `external_ref` (RESERVE and SETTLE), so the
+match takes the *latest* transaction per reference and reads its amount as the
+sum of its `DEBIT`-side entries — safe for any balanced transaction, because
+invariant 1 already guarantees debits equal credits, not a rule specific to
+payouts.
+
+```bash
+curl -H "Authorization: Bearer $KEY" localhost:8080/v1/reconciliation/runs
+```
+
+Authenticated, unlike the saga read routes — see [Authentication](#authentication)
+for `$KEY`. An exception carries amounts and external references, the same
+class of information D24 already scopes idempotency responses to a principal
+to protect.
+
+See `docs/DECISIONS.md` (Phase 6) for the match query, the classification
+priority order, and why the join runs in SQL while classification runs in Go.
+
+`deploy/seed/psp_statement.example.csv` shows the format and one row per
+category. It is not wired into `docker compose up` by default — unlike
+`deploy/seed/seed.sql`, which seeds accounts with no transactions, a
+meaningful reconciliation demo needs transactions actually posted with
+matching `external_ref` values first. To try it: post a few transactions with
+`external_ref` set (e.g. `demo-clean`, `demo-amount-mismatch`), copy the
+example file, edit its rows to match what you posted, then point
+`LEDGER_RECONCILER_PSP_CSV_PATH` at it and restart `cmd/reconciler`.
+
 ## Tests
 
 No mocks for database behaviour — every test runs against real PostgreSQL via

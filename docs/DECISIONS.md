@@ -1706,3 +1706,128 @@ which accounts a principal owns, whether ownership is single- or multi-tenant,
 how it interacts with sharding's `parent_account_id`. That is real Phase 6
 work, and this fix does not pre-empt it by picking an answer under the cover
 of a security patch.
+
+---
+
+## Phase 6 — Proving the ledger correct, continuously
+
+### D48. The reconciliation engine: what a three-way match actually checks, and why
+
+**The gap every other invariant in this codebase leaves open.** Everything
+before this phase checks the ledger against *itself* — the deferred trigger,
+the overdraft `CHECK`, the projector's rebuild-and-diff against
+`balance_projections` (D33, `make rebuild`). None of that can catch this
+system agreeing with itself while disagreeing with the bank: a transaction the
+gateway silently dropped, one it silently duplicated, an amount that drifted
+in transit. `internal/reconciliation` and `cmd/reconciler` exist to find
+exactly that, by matching three independently-maintained records on
+`external_ref`: the ledger's own `transactions`, the saga orchestrator's
+`saga_instances`, and a PSP settlement statement this service does not
+control.
+
+**Decided: the join is SQL, the classification is Go.** Assembling the three
+sides by `external_ref` is a join, and it runs in one query
+(`pgreconciliation.Repository.Match`) for the same reason
+`internal/projector.Rebuild` already does its own comparison in SQL: loading a
+day's transactions into Go to match by hand against a CSV a fraction of its
+size would mean holding the larger side in memory to compare it against the
+smaller one, for no benefit. Deciding *which category* a mismatch falls into,
+and whether a timing gap is small enough to auto-resolve, is a business rule
+with a configurable parameter (the timing window) — exactly the kind of
+decision this codebase's layering (`handler -> service -> repository`) already
+keeps out of SQL. `classify` (`internal/reconciliation/classify.go`) is the
+one place that decision is made, and it is pure — no database, no clock
+outside what it is handed — so every rule in the table below is pinned by
+`TestClassify` without a container.
+
+**What "the ledger's amount" means for one `external_ref`, and why it needed a
+rule at all.** A single marketplace payout posts *two* transactions sharing
+one `external_ref` — RESERVE (D39's suspense debit) and SETTLE (D41) — so
+`external_ref` does not name a transaction uniquely. Two things were rejected
+before the one that shipped:
+
+- **Hard-code the payout shape** (read `metadata->>'saga_step'`, prefer
+  `SETTLE`). Rejected because it makes this package know something about
+  payouts specifically, and the whole point of keying on `external_ref` rather
+  than on saga internals is that a second saga type — or a transaction posted
+  outside any saga at all — should reconcile through the identical path.
+- **Sum every transaction sharing the reference.** Rejected because RESERVE
+  and SETTLE are not two payments to add together; they are the same payout's
+  two ledger-internal legs, and summing them double-counts it.
+
+**Decided: the *latest* transaction by `created_at`, and its amount is the sum
+of its `DEBIT`-side entries.** "Latest" needs no knowledge of payouts —
+"whatever the ledger most recently believes about this reference" is a
+generically correct answer for any workflow that corrects itself with a
+second transaction under one reference, and it happens to coincide with
+SETTLE for a payout because SETTLE is created after RESERVE. The amount
+definition is the more interesting piece: summing `DEBIT`-side entries is safe
+for *any* balanced transaction, of *any* type, because invariant 1 already
+guarantees debits equal credits per `(transaction_id, currency)` — that is not
+a fact this package asserts, it is a fact the deferred trigger already
+enforces on every row that exists. A reconciliation engine that had to be told
+what "amount" means per transaction type would need updating every time a new
+`transaction_type` shipped; this one does not.
+
+**Decided: `Match` is bounded by a lookback window, not the whole table.**
+Finding `MISSING_IN_PSP` references requires considering every ledger
+transaction that carries an `external_ref`, not only the ones the statement
+mentions — that is inherent to the check, not an implementation shortcut. Left
+unbounded, every run would scan `transactions` in full, forever, for a table
+this codebase otherwise never scans outside a migration. `since` (default
+seven days, `LEDGER_RECONCILER_LOOKBACK`) keeps it a bounded scan against a
+partial-index-backed column (`transactions (external_ref) WHERE NOT NULL`,
+D1) instead.
+
+**Decided: classification priority is DUPLICATE, then MISSING\_\*, then
+AMOUNT_MISMATCH, then STATUS_MISMATCH, then TIMING_DIFFERENCE.** More than one
+condition can describe the same reference, and a caller needs exactly one
+category. DUPLICATE goes first because a PSP statement listing one reference
+twice is a defect in the *statement*, independent of what the ledger says —
+reporting it as an amount mismatch instead would send an operator
+investigating the wrong system. AMOUNT_MISMATCH outranks STATUS_MISMATCH
+because a transaction whose amount is simply wrong is the more actionable
+defect, and a status disagreement alongside a wrong amount is very likely the
+same underlying problem wearing two symptoms, not two problems.
+TIMING_DIFFERENCE is last because it is the only category this function ever
+resolves on the spot, and everything checked before it (amount, status) must
+already agree for a timing gap to be the *only* thing wrong.
+
+**Decided: only `TIMING_DIFFERENCE`, and only inside the window, auto-resolves
+— and it is still recorded, as `AUTO_RESOLVED`, not silently dropped.** The
+alternative — matching cleanly and writing nothing — was rejected because it
+would make a run's exception count a lossy summary: an operator re-deriving
+"how many references had *any* timing gap" from a report that only shows the
+gaps that mattered would get it wrong. Recording the resolution and closing it
+in the same motion is what keeps `exception_count` on `reconciliation_runs`
+an honest total of everything the run found, not just what it left open.
+
+**Rejected: an authorization hold on the reference used as a lock, mirroring
+D39's own rejection.** Not applicable here — there is no write path in this
+package at all. `Engine.Run` reads `transactions` and `saga_instances`; it
+never posts, reverses, or updates either. That is also why several replicas of
+`cmd/reconciler` running the identical statement concurrently is a nuisance
+(duplicate runs, duplicate exception rows) rather than a correctness bug: two
+reads racing each other cannot double-spend anything. Compare D40's
+claim-based coordination for the saga orchestrator, which exists precisely
+because *that* process moves money and this one does not.
+
+**Decided: the report is read-only HTTP, and authenticated from day one.**
+`GET /v1/reconciliation/runs` and `GET /v1/reconciliation/runs/{id}` require
+`requireAuth`, unlike `GET /v1/sagas/{id}` — which D47 named as an open gap,
+not a template to repeat. A reconciliation exception carries external
+references and amounts, the same class of information D24 scoped idempotency
+responses to a principal to protect; there was no reason to reopen that
+question for a new endpoint when the answer was already settled.
+
+**What remains open, carried forward rather than folded in here.** Scheduled
+internal consistency checks (the global invariant page, projection-drift
+detection beyond `make rebuild`'s manual invocation, orphan detection),
+full OpenTelemetry/Kafka-header trace propagation, the fault-injection harness
+and its chaos test, and the Grafana/Prometheus deployment itself are the rest
+of Phase 6 and are not implemented by this entry — see the phase's own
+tracking for status. `NEEDS_MANUAL_REVIEW`-style resolution for an `OPEN`
+reconciliation exception also does not exist yet, for the identical reason
+D43 gives for sagas: an admin surface for "I have investigated this, mark it
+resolved" is real work belonging with the admin dashboard, not a field bolted
+onto this phase's first cut.

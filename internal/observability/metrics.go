@@ -132,6 +132,20 @@ type Metrics struct {
 	// themselves are listed through the API, which is the right tool for
 	// unbounded identifiers.
 	SagaInstances *prometheus.GaugeVec
+
+	// ReconciliationRuns counts completed three-way-match runs by outcome
+	// (completed/failed). A run is a daily job; this is what answers "did
+	// today's reconciliation even happen" without reading logs.
+	ReconciliationRuns *prometheus.CounterVec
+
+	// ReconciliationExceptions counts unresolved findings by category. THIS IS
+	// THE ALERT the phase asks for: reconciliation_exceptions_total > 0 pages,
+	// because every category above TIMING_DIFFERENCE-within-window represents
+	// a disagreement between this ledger and money that actually moved
+	// somewhere else. A counter, not a gauge, for the same reason
+	// SagaManualReview is one -- an exception later marked RESOLVED must not
+	// erase the fact that it happened.
+	ReconciliationExceptions *prometheus.CounterVec
 }
 
 // NewMetrics builds the registry and registers the process collectors.
@@ -274,6 +288,22 @@ func NewMetrics(service string) *Metrics {
 			Help:        "Saga instances by status.",
 			ConstLabels: prometheus.Labels{"service": service},
 		}, []string{"status"}),
+
+		ReconciliationRuns: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace:   "ledger",
+			Subsystem:   "reconciliation",
+			Name:        "runs_total",
+			Help:        "Three-way-match reconciliation runs, by outcome.",
+			ConstLabels: prometheus.Labels{"service": service},
+		}, []string{"status"}),
+
+		ReconciliationExceptions: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace:   "ledger",
+			Subsystem:   "reconciliation",
+			Name:        "exceptions_total",
+			Help:        "Reconciliation findings by category. Alert on any category other than an auto-resolved timing difference.",
+			ConstLabels: prometheus.Labels{"service": service},
+		}, []string{"category"}),
 	}
 
 	registry.MustRegister(
@@ -284,6 +314,7 @@ func NewMetrics(service string) *Metrics {
 		m.ProjectorConsumerLag, m.ProjectorEventsProcessed,
 		m.ProjectorDuplicatesSkipped, m.ProjectorDLQTotal,
 		m.SagaSteps, m.SagaGatewayProbes, m.SagaManualReview, m.SagaInstances,
+		m.ReconciliationRuns, m.ReconciliationExceptions,
 	)
 	return m
 }

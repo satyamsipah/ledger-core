@@ -363,6 +363,40 @@ services:
       retries: 10
       start_period: 5s
 
+  reconciler:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        SERVICE: reconciler
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      LEDGER_ENV: local
+      # 9095: 9090-9094 are taken by api, outbox-publisher, redpanda's host
+      # Kafka port, the projector and the saga orchestrator respectively.
+      LEDGER_METRICS_ADDR: ":9095"
+      LEDGER_POSTGRES_DSN: postgres://ledger:ledger@postgres:5432/ledger?sslmode=disable
+      LEDGER_LOG_LEVEL: debug
+      # Empty by default: this container has no PSP statement to reconcile
+      # against out of the box, and a reconciler that failed every tick on a
+      # missing file would be a worse default than one that says so once and
+      # idles. See README.md's Reconciliation section for how to point this
+      # at deploy/seed/psp_statement.example.csv once you have posted matching
+      # transactions to try it against.
+      LEDGER_RECONCILER_PSP_CSV_PATH: ""
+    ports:
+      - "9095:9095"
+    healthcheck:
+      # Health and metrics share the metrics listener, as in every worker
+      # here; there is no separate HTTP_ADDR port to point this at. See D35.
+      test: ["CMD", "wget", "-qO-", "http://localhost:9095/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
 volumes:
   postgres-data:
   redpanda-data:

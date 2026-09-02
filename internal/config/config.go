@@ -32,6 +32,7 @@ type Config struct {
 	Saga          Saga
 	Gateway       Gateway
 	Redis         Redis
+	Reconciler    Reconciler
 	Observability Observability
 }
 
@@ -192,6 +193,31 @@ type Redis struct {
 	DB   int
 }
 
+// Reconciler configures the three-way-match job cmd/reconciler runs on a
+// schedule.
+type Reconciler struct {
+	// PSPStatementPath is where the mock settlement CSV is read from. Empty
+	// means the job is disabled -- a process with nothing to reconcile
+	// against should not run a ticker that fails on every tick.
+	PSPStatementPath string
+
+	// Interval is how often a new run starts. Daily in production, per the
+	// phase's own framing ("daily reconciliation report"); short in local
+	// development, per docker-compose.yml, so `docker compose up` produces a
+	// visible run instead of a day-long wait.
+	Interval time.Duration
+
+	// TimingWindow is classify's auto-resolve threshold -- see
+	// internal/reconciliation.DefaultTimingWindow for the default and the
+	// reasoning.
+	TimingWindow time.Duration
+
+	// Lookback bounds how far back Match considers ledger transactions when
+	// looking for MISSING_IN_PSP references. See
+	// internal/reconciliation.DefaultLookback.
+	Lookback time.Duration
+}
+
 // Observability configures the three signals: logs, metrics, traces.
 type Observability struct {
 	LogLevel         slog.Level
@@ -272,6 +298,12 @@ func Load(service string) (Config, error) {
 		Redis: Redis{
 			Addr: env("REDIS_ADDR", "localhost:6379"),
 			DB:   envInt("REDIS_DB", 0, fail),
+		},
+		Reconciler: Reconciler{
+			PSPStatementPath: env("RECONCILER_PSP_CSV_PATH", ""),
+			Interval:         envDuration("RECONCILER_INTERVAL", 24*time.Hour, fail),
+			TimingWindow:     envDuration("RECONCILER_TIMING_WINDOW", 2*time.Hour, fail),
+			Lookback:         envDuration("RECONCILER_LOOKBACK", 7*24*time.Hour, fail),
 		},
 		Observability: Observability{
 			LogLevel:         envLogLevel("LOG_LEVEL", slog.LevelInfo, fail),

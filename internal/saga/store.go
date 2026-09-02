@@ -129,4 +129,15 @@ type Store interface {
 	// than one per status, because the gauge is refreshed on a ticker and a
 	// ten-query refresh is ten chances to disagree with itself.
 	CountByStatus(ctx context.Context) (map[Status]int, error)
+
+	// OldestOverdueSeconds returns how long the most-overdue non-terminal saga
+	// has been past its own step_deadline_at, or zero when nothing is overdue.
+	//
+	// Feeds the "saga stuck" alert. NEEDS_MANUAL_REVIEW is excluded, along with
+	// every other terminal status, by the same partial index the sweeper's own
+	// claim query uses: a saga already escalated is alerted on separately
+	// (ledger_saga_manual_review_total), and including it here would let one
+	// old escalation that nobody has resolved yet permanently dominate this
+	// gauge and hide a second, freshly-stuck saga behind it.
+	OldestOverdueSeconds(ctx context.Context) (float64, error)
 }

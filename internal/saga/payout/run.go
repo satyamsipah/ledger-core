@@ -386,6 +386,13 @@ func (o *Orchestrator) refreshGauges(ctx context.Context) {
 	for _, status := range allStatuses {
 		o.metrics.SagaInstances.WithLabelValues(string(status)).Set(float64(counts[status]))
 	}
+
+	overdue, err := o.store.OldestOverdueSeconds(ctx)
+	if err != nil {
+		o.logger.WarnContext(ctx, "refresh saga oldest-overdue gauge", slog.String("error", err.Error()))
+		return
+	}
+	o.metrics.SagaOldestOverdueSeconds.Set(overdue)
 }
 
 var allStatuses = []saga.Status{

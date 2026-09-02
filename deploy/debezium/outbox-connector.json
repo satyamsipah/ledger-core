@@ -28,6 +28,8 @@
   "transforms.outbox.route.by.field": "aggregate_type",
   "transforms.outbox.route.topic.replacement": "ledger.events.${routedByValue}",
 
+  "transforms.outbox.table.fields.additional.placement": "trace_parent:header:traceparent",
+
   "key.converter": "org.apache.kafka.connect.storage.StringConverter",
   "value.converter": "org.apache.kafka.connect.json.JsonConverter",
   "value.converter.schemas.enable": "false",

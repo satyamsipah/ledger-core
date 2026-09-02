@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/satyamsipah/ledger-core/internal/idempotency"
+	"github.com/satyamsipah/ledger-core/internal/observability"
 	"github.com/satyamsipah/ledger-core/internal/outbox"
 )
 
@@ -157,12 +158,20 @@ type TransactionRequest struct {
 // and a service that carried per-account state in memory would be wrong the
 // moment a second replica started.
 type Service struct {
-	repo Repository
+	repo    Repository
+	metrics *observability.Metrics
 }
 
 // NewService wires a service to its repository.
-func NewService(repo Repository) *Service {
-	return &Service{repo: repo}
+//
+// metrics may be nil -- callers that only need PostTransaction's return
+// value and do not care about ledger_transactions_posted_total, chiefly
+// tests, are not required to construct a registry just to satisfy this
+// signature. Every read of it below is guarded accordingly, the same
+// nil-safe convention internal/db.Retrier already uses for the identical
+// reason.
+func NewService(repo Repository, metrics *observability.Metrics) *Service {
+	return &Service{repo: repo, metrics: metrics}
 }
 
 // CreateAccountRequest is a new account to open.
@@ -291,6 +300,44 @@ func (r CreateAccountRequest) validate() error {
 // commits with the journal it describes, which is what makes invariant 6 hold
 // without a distributed transaction.
 func (s *Service) PostTransaction(ctx context.Context, req TransactionRequest) (*Transaction, error) {
+	start := time.Now()
+	posted, err := s.postTransaction(ctx, req)
+	s.observeTransaction(req.Type, start, err)
+	return posted, err
+}
+
+// observeTransaction records ledger_transactions_posted_total and
+// ledger_transaction_duration_seconds for one PostTransaction or reverse
+// call, success or failure alike.
+//
+// Recorded here -- the funnel both the HTTP API and the saga orchestrator's
+// direct calls into this package pass through -- rather than in the HTTP
+// layer, because ledger_http_requests_total already exists for HTTP traffic
+// and would both double-count it and miss every saga-driven post entirely,
+// which never travels through an HTTP handler at all.
+func (s *Service) observeTransaction(t TransactionType, start time.Time, err error) {
+	if s.metrics == nil {
+		return
+	}
+
+	label := string(t)
+	if !t.Valid() {
+		// validate() runs inside postTransaction, after this label is read in
+		// the caller above, so an invalid type can reach here. Folding every
+		// invalid value into one label keeps a client sending garbage types
+		// from minting a new Prometheus series per string it tries.
+		label = "invalid"
+	}
+	status := "success"
+	if err != nil {
+		status = "error"
+	}
+
+	s.metrics.TransactionsPosted.WithLabelValues(label, status).Inc()
+	s.metrics.TransactionDuration.WithLabelValues(label).Observe(time.Since(start).Seconds())
+}
+
+func (s *Service) postTransaction(ctx context.Context, req TransactionRequest) (*Transaction, error) {
 	if err := req.validate(); err != nil {
 		return nil, err
 	}
@@ -471,6 +518,13 @@ func (s *Service) ReverseTransactionRecorded(
 }
 
 func (s *Service) reverse(ctx context.Context, txID uuid.UUID, reason string, idem *Idempotent, record Recorder) (*Transaction, error) {
+	start := time.Now()
+	reversal, err := s.doReverse(ctx, txID, reason, idem, record)
+	s.observeTransaction(TransactionTypeReversal, start, err)
+	return reversal, err
+}
+
+func (s *Service) doReverse(ctx context.Context, txID uuid.UUID, reason string, idem *Idempotent, record Recorder) (*Transaction, error) {
 	if reason == "" {
 		return nil, ErrReversalReasonRequired
 	}

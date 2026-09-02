@@ -1,0 +1,194 @@
+{
+  "title": "Ledger Core",
+  "uid": "ledger-core",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "timezone": "browser",
+  "time": { "from": "now-1h", "to": "now" },
+  "refresh": "10s",
+  "tags": ["ledger-core"],
+  "panels": [
+    { "id": 100, "type": "row", "title": "Overview", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }, "collapsed": false, "panels": [] },
+    {
+      "id": 1, "type": "timeseries", "title": "Transactions posted",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum by (type, status) (rate(ledger_transactions_posted_total[5m]))", "legendFormat": "{{type}} / {{status}}" }
+      ]
+    },
+    {
+      "id": 2, "type": "timeseries", "title": "Transaction duration (p50 / p99)",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.5, sum by (le, type) (rate(ledger_transaction_duration_seconds_bucket[5m])))", "legendFormat": "p50 {{type}}" },
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.99, sum by (le, type) (rate(ledger_transaction_duration_seconds_bucket[5m])))", "legendFormat": "p99 {{type}}" }
+      ]
+    },
+    {
+      "id": 3, "type": "timeseries", "title": "HTTP request rate by status class",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum by (status_class) (rate(ledger_http_requests_total[5m]))", "legendFormat": "{{status_class}}" }
+      ]
+    },
+
+    { "id": 101, "type": "row", "title": "Outbox & Kafka", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 }, "collapsed": false, "panels": [] },
+    {
+      "id": 10, "type": "stat", "title": "Outbox backlog",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 10 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short", "thresholds": { "mode": "absolute", "steps": [
+        { "color": "green", "value": null }, { "color": "yellow", "value": 100 }, { "color": "red", "value": 1000 }
+      ] } }, "overrides": [] },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "ledger_outbox_backlog" }]
+    },
+    {
+      "id": 11, "type": "stat", "title": "Outbox lag (oldest unpublished row)",
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 10 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s", "thresholds": { "mode": "absolute", "steps": [
+        { "color": "green", "value": null }, { "color": "yellow", "value": 15 }, { "color": "red", "value": 30 }
+      ] } }, "overrides": [] },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "ledger_outbox_lag_seconds" }]
+    },
+    {
+      "id": 12, "type": "timeseries", "title": "Projector consumer lag by partition",
+      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 10 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "ledger_projector_consumer_lag", "legendFormat": "{{topic}}/{{partition}}" }]
+    },
+    {
+      "id": 13, "type": "stat", "title": "Dead-letter messages (total)",
+      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 10 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short", "thresholds": { "mode": "absolute", "steps": [
+        { "color": "green", "value": null }, { "color": "red", "value": 1 }
+      ] } }, "overrides": [] },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "ledger_projector_dlq_total" }]
+    },
+    {
+      "id": 14, "type": "timeseries", "title": "Outbox published vs publish errors",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum by (publisher) (rate(ledger_outbox_published_total[5m]))", "legendFormat": "published ({{publisher}})" },
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum by (publisher) (rate(ledger_outbox_publish_errors_total[5m]))", "legendFormat": "errors ({{publisher}})" }
+      ]
+    },
+    {
+      "id": 15, "type": "timeseries", "title": "Events processed vs duplicates skipped",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum by (event_type) (rate(ledger_projector_events_processed_total[5m]))", "legendFormat": "{{event_type}}" },
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "rate(ledger_projector_duplicates_skipped_total[5m])", "legendFormat": "duplicates skipped" }
+      ]
+    },
+
+    { "id": 102, "type": "row", "title": "Sagas", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 24 }, "collapsed": false, "panels": [] },
+    {
+      "id": 20, "type": "timeseries", "title": "Saga instances by status",
+      "gridPos": { "h": 8, "w": 10, "x": 0, "y": 25 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "ledger_saga_instances", "legendFormat": "{{status}}" }]
+    },
+    {
+      "id": 21, "type": "stat", "title": "Oldest overdue saga",
+      "gridPos": { "h": 8, "w": 4, "x": 10, "y": 25 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s", "thresholds": { "mode": "absolute", "steps": [
+        { "color": "green", "value": null }, { "color": "yellow", "value": 60 }, { "color": "red", "value": 300 }
+      ] } }, "overrides": [] },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "ledger_saga_oldest_overdue_seconds" }]
+    },
+    {
+      "id": 22, "type": "timeseries", "title": "Manual review escalations",
+      "gridPos": { "h": 8, "w": 5, "x": 14, "y": 25 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum by (reason) (rate(ledger_saga_manual_review_total[1h]))", "legendFormat": "{{reason}}" }]
+    },
+    {
+      "id": 23, "type": "timeseries", "title": "Gateway resolution probes",
+      "gridPos": { "h": 8, "w": 5, "x": 19, "y": 25 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum by (outcome) (rate(ledger_saga_gateway_probes_total[5m]))", "legendFormat": "{{outcome}}" }]
+    },
+
+    { "id": 103, "type": "row", "title": "Reconciliation & consistency", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 33 }, "collapsed": false, "panels": [] },
+    {
+      "id": 30, "type": "stat", "title": "Global invariant (should be all zero)",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 34 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short", "thresholds": { "mode": "absolute", "steps": [
+        { "color": "green", "value": null }, { "color": "red", "value": 1 }, { "color": "red", "value": -1 }
+      ] } }, "overrides": [] },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "ledger_consistency_global_invariant_violation_minor", "legendFormat": "{{currency}}" }]
+    },
+    {
+      "id": 31, "type": "stat", "title": "Projection drift (accounts)",
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 34 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short", "thresholds": { "mode": "absolute", "steps": [
+        { "color": "green", "value": null }, { "color": "red", "value": 1 }
+      ] } }, "overrides": [] },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "ledger_consistency_projection_drift_accounts" }]
+    },
+    {
+      "id": 32, "type": "stat", "title": "Orphan transactions / entries",
+      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 34 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short", "thresholds": { "mode": "absolute", "steps": [
+        { "color": "green", "value": null }, { "color": "red", "value": 1 }
+      ] } }, "overrides": [] },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "ledger_consistency_orphan_transactions", "legendFormat": "transactions" },
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "ledger_consistency_orphan_entries", "legendFormat": "entries" }
+      ]
+    },
+    {
+      "id": 33, "type": "stat", "title": "Reconciliation exceptions (24h)",
+      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 34 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short", "thresholds": { "mode": "absolute", "steps": [
+        { "color": "green", "value": null }, { "color": "red", "value": 1 }
+      ] } }, "overrides": [] },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(increase(ledger_reconciliation_exceptions_total[1d]))" }]
+    },
+    {
+      "id": 34, "type": "timeseries", "title": "Reconciliation exceptions by category",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 40 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum by (category) (increase(ledger_reconciliation_exceptions_total[1d]))", "legendFormat": "{{category}}" }]
+    },
+
+    { "id": 104, "type": "row", "title": "Database", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 48 }, "collapsed": false, "panels": [] },
+    {
+      "id": 40, "type": "timeseries", "title": "Transaction retries by SQLSTATE (D11/D26 proof: should stay flat at zero)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 49 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum by (sqlstate, operation) (rate(ledger_db_tx_retries_total[5m]))", "legendFormat": "{{operation}} / {{sqlstate}}" }]
+    },
+    {
+      "id": 41, "type": "timeseries", "title": "Attempts required per transaction (p99)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 49 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [{ "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.99, sum by (le, operation) (rate(ledger_db_tx_attempts_bucket[5m])))", "legendFormat": "{{operation}}" }]
+    }
+  ]
+}

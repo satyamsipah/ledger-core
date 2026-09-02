@@ -124,7 +124,7 @@ func newOrchestrator(
 
 	orchestrator := payout.New(
 		pgsaga.New(pool, 30*time.Second),
-		ledger.NewService(pgledger.New(pool, 30*time.Second)),
+		ledger.NewService(pgledger.New(pool, 30*time.Second), metrics),
 		gateway.NewHTTPClient(gatewayURL, 2*time.Second, time.Second),
 		logger, metrics, cfg)
 

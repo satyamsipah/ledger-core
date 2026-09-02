@@ -740,6 +740,62 @@ rather than a persisted store like the PSP match, and why proving they
 actually *detect* a violation needed a private database rather than the test
 suite's shared one.
 
+## Observability
+
+`make up` now also starts Prometheus (`localhost:9099` — `9090` is the `api`
+container's own metrics port) and Grafana (`localhost:3001` — `3000` is
+Grafana's usual default, remapped here since it is a common port for
+unrelated local dev tooling this stack should not assume it owns; anonymous
+viewer access, `admin`/`admin` for changes), both provisioned automatically:
+the "Ledger Core" dashboard and the five alert rules below exist from first
+boot, nothing clicked together by hand.
+
+**Metrics** follow one convention throughout
+(`internal/observability/metrics.go`): every series is `ledger_<subsystem>_*`
+plus a `service` label naming which process emitted it. The ones added in
+this phase, beyond the reconciliation and consistency-check metrics described
+above:
+
+| Metric | What it answers |
+|---|---|
+| `ledger_transactions_posted_total{type,status}` | `PostTransaction`/`reverse` calls, success or error — recorded in `internal/ledger.Service` itself, so saga-originated posts are counted alongside HTTP ones rather than missed |
+| `ledger_transaction_duration_seconds{type}` | How long a post or reversal took, success or failure alike |
+| `ledger_outbox_lag_seconds` | Age of the OLDEST unpublished outbox row — the number `ledger_outbox_backlog`'s row *count* cannot give you: a thousand rows written a second ago is healthy, five rows sitting for ten minutes is not |
+| `ledger_saga_oldest_overdue_seconds` | Age of the most-overdue non-terminal saga — what actually backs the "saga stuck" alert, which a population-by-status gauge alone cannot express |
+
+**Tracing** now genuinely spans the async boundary. `outbox.trace_parent`
+(migration `000018`) carries the full W3C `traceparent` value; both outbox
+publishers promote it onto a Kafka message HEADER of the same name (the
+polling publisher sets it directly, the Debezium connector via
+`table.fields.additional.placement` in
+`deploy/debezium/outbox-connector.json`), and `internal/projector.Consumer`
+extracts it and starts its `projector.apply_event` span as a real CHILD of
+the request that produced the event — not merely a span tagged with a
+matching id. `TestProjector_TraceContextPropagatesThroughKafkaHeaders` proves
+this with an in-memory span recorder rather than a string comparison. Set
+`LEDGER_OTLP_ENDPOINT` on every service to see it in a real backend (Jaeger,
+Tempo, anything OTLP/gRPC); with nothing configured, tracing is a documented
+no-op (see `internal/observability.NewTracerProvider`) rather than a
+collector every request retries against and never reaches.
+
+**Alerts** (`deploy/prometheus/alerts.yml`), one per row, each backed by a
+metric this codebase computes specifically to make the alert honest:
+
+| Alert | Fires when |
+|---|---|
+| `LedgerGlobalInvariantBroken` | `journal_entries` stops summing to zero for some currency |
+| `LedgerOutboxLagHigh` | Oldest unpublished outbox row exceeds 30s |
+| `LedgerProjectionDrift` | `account_balances` disagrees with the journal for ≥1 account |
+| `LedgerSagaStuck` | The most-overdue saga has been stuck for over 5 minutes |
+| `LedgerReconciliationExceptions` | A reconciliation run recorded a NEW exception in the last day (`increase()`, not a bare threshold — see `docs/DECISIONS.md` D50 for why a raw `> 0` on a counter that never resets would misfire permanently) |
+
+`docs/RUNBOOK.md` has one section per alert: what it means, how to confirm
+and localise it, and what to actually do. See `docs/DECISIONS.md` D50 for the
+rest of the reasoning — in particular why `ledger_transactions_posted_total`
+lives in the service layer rather than the HTTP handler, and why testing the
+trace-propagation mechanism needed a real span recorder installed as the
+process-global provider for one non-parallel test.
+
 ## Tests
 
 No mocks for database behaviour — every test runs against real PostgreSQL via

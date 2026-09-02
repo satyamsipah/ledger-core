@@ -1,0 +1,14 @@
+# Points Grafana at deploy/grafana/dashboards, mounted into the container at
+# the path below -- the same auto-provisioning approach as the datasource, so
+# the dashboard exists on first boot rather than after a manual import.
+apiVersion: 1
+
+providers:
+  - name: ledger-core
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/provisioning/dashboards/files

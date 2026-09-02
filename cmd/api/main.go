@@ -82,7 +82,7 @@ func run() error {
 		pgledger.WithRetrier(retrier),
 		pgledger.WithAdvisoryLocks(cfg.Ledger.AdvisoryLocks))
 
-	ledgerService := ledger.NewService(repository)
+	ledgerService := ledger.NewService(repository, metrics)
 
 	// NoopCache: Redis is deliberately absent. Correctness never depended on it,
 	// and the cache hit-rate counter is what will decide whether the dependency

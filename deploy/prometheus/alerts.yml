@@ -1,0 +1,103 @@
+# The five alerts Phase 6's Definition of Done names explicitly. Each one
+# points at a metric this repository added specifically to make the alert
+# possible -- see docs/DECISIONS.md D49 (consistency checks) and D50
+# (observability) for why each metric is shaped the way it is.
+#
+# Every alert's `for` duration is a deliberate choice, not a placeholder --
+# see each rule's own comment for why that one and not zero.
+
+groups:
+  - name: ledger-core
+    rules:
+      # THE PAGE. journal_entries stopped summing to zero for some currency,
+      # which means invariant 1 -- the one CLAUDE.md calls non-negotiable --
+      # no longer holds somewhere in the journal. `for: 0m`: this check runs
+      # in-process every LEDGER_RECONCILER_CONSISTENCY_INTERVAL (default one
+      # minute) already, so by the time Prometheus has scraped a nonzero
+      # value, cmd/reconciler has already re-confirmed it at least once on
+      # its own ticker. There is no legitimate transient state to wait out.
+      - alert: LedgerGlobalInvariantBroken
+        expr: ledger_consistency_global_invariant_violation_minor != 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Global ledger invariant violated for currency {{ $labels.currency }}"
+          description: >
+            journal_entries does not sum to zero for {{ $labels.currency }}
+            (off by {{ $value }} minor units). Every individual transaction
+            is supposed to balance at COMMIT via the deferred trigger in
+            migration 000005 -- this means something wrote around it. See
+            docs/RUNBOOK.md.
+
+      # A backlog count alone cannot distinguish a healthy burst from a
+      # stalled publisher; this is the age of the OLDEST unpublished row.
+      # `for: 1m`: a single slow scrape crossing 30s during a genuine but
+      # brief burst should not page on its own -- the alert is for a
+      # publisher that has actually stopped keeping up, which this confirms.
+      - alert: LedgerOutboxLagHigh
+        expr: ledger_outbox_lag_seconds > 30
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Outbox publish lag exceeds 30s on {{ $labels.service }}"
+          description: >
+            The oldest unpublished outbox row is {{ $value }}s old. Either
+            publisher (LEDGER_OUTBOX_PUBLISHER) may be behind or stopped; see
+            docs/RUNBOOK.md.
+
+      # account_balances (the synchronous, write-path balance) disagrees with
+      # a full recomputation from journal_entries for at least one account.
+      # `for: 5m`: the check itself is a single atomic query with no window
+      # for a genuinely in-flight write to look like drift, so this is not
+      # waiting out a false positive -- it is waiting out one operator's
+      # instinct to not page on the very first tick, since a REAL drift does
+      # not resolve itself between checks the way a momentary blip might.
+      - alert: LedgerProjectionDrift
+        expr: ledger_consistency_projection_drift_accounts > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $value }} account(s) have drifted from the journal"
+          description: >
+            account_balances disagrees with journal_entries for at least one
+            account. See docs/RUNBOOK.md for the query that names which ones.
+
+      # A population count (ledger_saga_instances) cannot tell a healthy
+      # system with several sagas in flight from one where the oldest has
+      # been stuck for an hour -- this is that number instead: the age of the
+      # single most-overdue non-terminal saga. `for: 1m` for the same reason
+      # as the outbox lag alert: confirm it is not one slow scrape.
+      - alert: LedgerSagaStuck
+        expr: ledger_saga_oldest_overdue_seconds > 300
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A saga has been stuck for over 5 minutes"
+          description: >
+            The most-overdue non-terminal saga is {{ $value }}s past its
+            step deadline. GET /v1/sagas?status=NEEDS_MANUAL_REVIEW may not
+            show it yet -- it becomes overdue before the sweeper escalates
+            it. See docs/RUNBOOK.md.
+
+      # ledger_reconciliation_exceptions_total is a COUNTER: it never goes
+      # down, so a bare `> 0` would fire once and never resolve after the
+      # first exception this deployment ever recorded -- a permanently-firing
+      # alert is not an alert. increase() over one day -- the reconciliation
+      # job's own default interval (LEDGER_RECONCILER_INTERVAL) -- is what
+      # actually says "a run found a NEW exception," which is the condition
+      # the phase's "reconciliation exceptions > 0" wording means.
+      - alert: LedgerReconciliationExceptions
+        expr: increase(ledger_reconciliation_exceptions_total[1d]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Reconciliation found {{ $value }} new exception(s)"
+          description: >
+            At least one PSP reconciliation exception was recorded in the
+            last day, category {{ $labels.category }}. See
+            GET /v1/reconciliation/runs and docs/RUNBOOK.md.

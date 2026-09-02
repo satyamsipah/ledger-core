@@ -24,6 +24,24 @@ type Metrics struct {
 	// HTTPDuration records latency by route and method.
 	HTTPDuration *prometheus.HistogramVec
 
+	// TransactionsPosted counts every ledger.Service.PostTransaction and
+	// reverse call, by transaction type and outcome (success/error).
+	//
+	// Recorded in internal/ledger, not in the HTTP handler, because the HTTP
+	// API is not the only caller: the saga orchestrator posts and reverses
+	// transactions directly through this same service. Recording only at the
+	// HTTP layer would double-count nothing (there is no HTTP request for a
+	// saga's own posts) but would silently miss every one of them, which is
+	// worse -- a dashboard that looks complete and is not.
+	TransactionsPosted *prometheus.CounterVec
+
+	// TransactionDuration records how long one PostTransaction or reverse call
+	// took, by type, success or failure alike -- a slow rejection still held
+	// row locks for that long, and hiding it behind a success-only histogram
+	// would hide exactly the case (lock contention aborting into an error)
+	// most worth seeing.
+	TransactionDuration *prometheus.HistogramVec
+
 	// TxRetries counts database transactions retried, by SQLSTATE and by the
 	// operation that was retrying.
 	//
@@ -79,6 +97,16 @@ type Metrics struct {
 	// one non-zero value.
 	OutboxBacklog prometheus.Gauge
 
+	// OutboxLagSeconds is the age of the OLDEST unpublished outbox row, not
+	// merely the count. The two answer different questions: a thousand rows
+	// written a second ago is a healthy burst, and five rows sitting for ten
+	// minutes is a stalled publisher -- OutboxBacklog alone cannot tell those
+	// apart, and this is the alert the phase's Definition of Done actually
+	// asks for ("outbox lag > 30s"). Computed and set by whichever process
+	// owns the outbox table's monitoring query, regardless of which publisher
+	// arm (polling or Debezium) is actually draining it -- see cmd/outbox-publisher.
+	OutboxLagSeconds prometheus.Gauge
+
 	// ProjectorConsumerLag is the standard shape -- topic and partition,
 	// computed the way any Kafka consumer-lag exporter would (high watermark
 	// minus committed offset) rather than derived from client-side fetch
@@ -132,6 +160,14 @@ type Metrics struct {
 	// themselves are listed through the API, which is the right tool for
 	// unbounded identifiers.
 	SagaInstances *prometheus.GaugeVec
+
+	// SagaOldestOverdueSeconds is how long the most-overdue non-terminal saga
+	// has been past its step deadline, at last check. Zero when nothing is
+	// overdue. THIS IS THE "saga stuck" ALERT -- a population count
+	// (SagaInstances) cannot distinguish a healthy system with several sagas
+	// in flight from one where the oldest of them has been stuck for an
+	// hour, and this is the number that can.
+	SagaOldestOverdueSeconds prometheus.Gauge
 
 	// ReconciliationRuns counts completed three-way-match runs by outcome
 	// (completed/failed). A run is a daily job; this is what answers "did
@@ -196,6 +232,26 @@ func NewMetrics(service string) *Metrics {
 			// how the multi-second tail is shaped.
 			Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5},
 		}, []string{"route", "method"}),
+		TransactionsPosted: prometheus.NewCounterVec(prometheus.CounterOpts{
+			// No Subsystem: this is the core domain event, not a layer within
+			// the service the way "http" or "db" are, and "ledger_ledger_"
+			// reads as a typo rather than a namespace.
+			Namespace:   "ledger",
+			Name:        "transactions_posted_total",
+			Help:        "PostTransaction and reverse calls, by transaction type and outcome.",
+			ConstLabels: prometheus.Labels{"service": service},
+		}, []string{"type", "status"}),
+		TransactionDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace:   "ledger",
+			Name:        "transaction_duration_seconds",
+			Help:        "PostTransaction and reverse call latency, by transaction type.",
+			ConstLabels: prometheus.Labels{"service": service},
+			// Same skewed-low shape as HTTPDuration and for the same reason:
+			// this is the write path row locks are held under, and the
+			// question that matters is how many exceeded 100ms, not how the
+			// multi-second tail looks.
+			Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5},
+		}, []string{"type"}),
 		TxRetries: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace:   "ledger",
 			Subsystem:   "db",
@@ -246,6 +302,13 @@ func NewMetrics(service string) *Metrics {
 			Subsystem:   "outbox",
 			Name:        "backlog",
 			Help:        "Unpublished outbox rows at last check.",
+			ConstLabels: prometheus.Labels{"service": service},
+		}),
+		OutboxLagSeconds: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace:   "ledger",
+			Subsystem:   "outbox",
+			Name:        "lag_seconds",
+			Help:        "Age of the oldest unpublished outbox row, in seconds, at last check. Zero when nothing is unpublished.",
 			ConstLabels: prometheus.Labels{"service": service},
 		}),
 		ProjectorConsumerLag: prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -309,6 +372,14 @@ func NewMetrics(service string) *Metrics {
 			ConstLabels: prometheus.Labels{"service": service},
 		}, []string{"status"}),
 
+		SagaOldestOverdueSeconds: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace:   "ledger",
+			Subsystem:   "saga",
+			Name:        "oldest_overdue_seconds",
+			Help:        "Age in seconds of the most-overdue non-terminal saga, at last check. Zero when nothing is overdue.",
+			ConstLabels: prometheus.Labels{"service": service},
+		}),
+
 		ReconciliationRuns: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace:   "ledger",
 			Subsystem:   "reconciliation",
@@ -360,12 +431,14 @@ func NewMetrics(service string) *Metrics {
 
 	registry.MustRegister(
 		m.HTTPRequests, m.HTTPDuration,
+		m.TransactionsPosted, m.TransactionDuration,
 		m.TxRetries, m.TxAttempts,
 		m.IdempotencyOutcomes, m.IdempotencySwept,
-		m.OutboxPublished, m.OutboxPublishErrors, m.OutboxBacklog,
+		m.OutboxPublished, m.OutboxPublishErrors, m.OutboxBacklog, m.OutboxLagSeconds,
 		m.ProjectorConsumerLag, m.ProjectorEventsProcessed,
 		m.ProjectorDuplicatesSkipped, m.ProjectorDLQTotal,
 		m.SagaSteps, m.SagaGatewayProbes, m.SagaManualReview, m.SagaInstances,
+		m.SagaOldestOverdueSeconds,
 		m.ReconciliationRuns, m.ReconciliationExceptions,
 		m.GlobalInvariantViolation, m.ProjectionDriftAccounts,
 		m.OrphanTransactions, m.OrphanEntries,

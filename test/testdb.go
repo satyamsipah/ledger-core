@@ -135,7 +135,10 @@ func newPool(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 // accounts -- a production-sized budget would turn honest lock waiting into
 // spurious failures and hide whatever the test was actually looking for.
 func newLedgerService(pool *pgxpool.Pool) *ledger.Service {
-	return ledger.NewService(pgledger.New(pool, 30*time.Second))
+	// nil metrics: this helper is used by the large majority of tests, which
+	// have no reason to construct a registry just to satisfy the signature.
+	// newRetryingLedgerService below is the variant for tests that do care.
+	return ledger.NewService(pgledger.New(pool, 30*time.Second), nil)
 }
 
 // newRetryingLedgerService builds a service with the retrier installed, and
@@ -160,7 +163,7 @@ func newRetryingLedgerService(
 		pgledger.WithRetrier(retrier),
 		pgledger.WithAdvisoryLocks(advisoryLocks))
 
-	return ledger.NewService(repo), metrics
+	return ledger.NewService(repo, metrics), metrics
 }
 
 // counterValue sums a counter vector across the label sets matching want.

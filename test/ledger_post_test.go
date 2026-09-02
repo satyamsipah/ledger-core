@@ -170,6 +170,90 @@ func TestPostTransaction_PostsBalancedTransfer(t *testing.T) {
 // detected once account state has been read under a lock. Each case also
 // asserts that nothing at all was written, because a partial post is worse than
 // a rejected one.
+// TestPostTransaction_RecordsMetrics proves ledger_transactions_posted_total
+// and ledger_transaction_duration_seconds are wired all the way through --
+// not merely that the counters exist, but that a real post and a real
+// rejection each land in the label set an operator's dashboard would filter
+// on.
+func TestPostTransaction_RecordsMetrics(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	svc, metrics := newRetryingLedgerService(t, sharedPool, false)
+
+	source := newTypedAccount(t, ctx, sharedPool, ledger.AccountTypeLiability, "INR", true)
+	target := newTypedAccount(t, ctx, sharedPool, ledger.AccountTypeLiability, "INR", false)
+
+	before := counterValue(t, metrics, "ledger_transactions_posted_total",
+		map[string]string{"type": "TRANSFER", "status": "success"})
+
+	posted, err := svc.PostTransaction(ctx, ledger.TransactionRequest{
+		Type: ledger.TransactionTypeTransfer,
+		Entries: []ledger.EntryRequest{
+			{AccountID: source, Direction: ledger.DirectionDebit, Amount: ledger.MustNewMoney(100_00, "INR")},
+			{AccountID: target, Direction: ledger.DirectionCredit, Amount: ledger.MustNewMoney(100_00, "INR")},
+		},
+	})
+	require.NoError(t, err)
+
+	t.Run("should count a successful post by type and outcome", func(t *testing.T) {
+		after := counterValue(t, metrics, "ledger_transactions_posted_total",
+			map[string]string{"type": "TRANSFER", "status": "success"})
+		assert.Equal(t, before+1, after)
+	})
+
+	t.Run("should count a rejected post separately from a successful one", func(t *testing.T) {
+		before := counterValue(t, metrics, "ledger_transactions_posted_total",
+			map[string]string{"type": "TRANSFER", "status": "error"})
+
+		_, err := svc.PostTransaction(ctx, ledger.TransactionRequest{
+			Type: ledger.TransactionTypeTransfer,
+			Entries: []ledger.EntryRequest{
+				{AccountID: source, Direction: ledger.DirectionDebit, Amount: ledger.MustNewMoney(100_00, "INR")},
+				// Missing the credit leg: unbalanced, rejected before any lock
+				// is taken.
+			},
+		})
+		require.Error(t, err)
+
+		after := counterValue(t, metrics, "ledger_transactions_posted_total",
+			map[string]string{"type": "TRANSFER", "status": "error"})
+		assert.Equal(t, before+1, after)
+	})
+
+	t.Run("should count a reversal as its own type, not as the original transfer", func(t *testing.T) {
+		before := counterValue(t, metrics, "ledger_transactions_posted_total",
+			map[string]string{"type": "REVERSAL", "status": "success"})
+
+		_, err := svc.ReverseTransaction(ctx, posted.ID, "test reversal")
+		require.NoError(t, err)
+
+		after := counterValue(t, metrics, "ledger_transactions_posted_total",
+			map[string]string{"type": "REVERSAL", "status": "success"})
+		assert.Equal(t, before+1, after)
+	})
+
+	t.Run("should record duration observations for the transfer type", func(t *testing.T) {
+		families, err := metrics.Registry().Gather()
+		require.NoError(t, err)
+
+		var sampleCount uint64
+		for _, family := range families {
+			if family.GetName() != "ledger_transaction_duration_seconds" {
+				continue
+			}
+			for _, m := range family.GetMetric() {
+				for _, pair := range m.GetLabel() {
+					if pair.GetName() == "type" && pair.GetValue() == "TRANSFER" {
+						sampleCount += m.GetHistogram().GetSampleCount()
+					}
+				}
+			}
+		}
+		assert.Positive(t, sampleCount, "expected at least one TRANSFER duration observation")
+	})
+}
+
 func TestPostTransaction_RejectsBadRequests(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

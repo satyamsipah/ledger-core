@@ -1,0 +1,13 @@
+# Auto-provisions the Prometheus datasource so `docker compose up` produces a
+# working dashboard with nothing clicked by hand -- Grafana reads every file
+# in this directory on startup.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false

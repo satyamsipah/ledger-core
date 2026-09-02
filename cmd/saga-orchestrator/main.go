@@ -81,7 +81,7 @@ func run() error {
 
 	orchestrator := payout.New(
 		pgsaga.New(pool.Pool, cfg.Postgres.QueryTimeout),
-		ledger.NewService(repository),
+		ledger.NewService(repository, metrics),
 		gateway.NewHTTPClient(cfg.Gateway.URL, cfg.Gateway.Timeout, cfg.Gateway.ProbeTimeout),
 		logger,
 		metrics,

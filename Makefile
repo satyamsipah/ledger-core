@@ -15,7 +15,7 @@ help: ## List available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
 		| awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
 
-up: ## Start the whole stack (postgres, redpanda, connect, redis, api, outbox-publisher, projector, saga-orchestrator, reconciler, mock-gateway) and apply migrations
+up: ## Start the whole stack (postgres, redpanda, connect, redis, api, outbox-publisher, projector, saga-orchestrator, reconciler, mock-gateway, prometheus, grafana) and apply migrations
 	$(COMPOSE) up --build -d
 	@echo "api               http://localhost:8080/healthz"
 	@echo "api metrics       http://localhost:9090/metrics"
@@ -25,6 +25,8 @@ up: ## Start the whole stack (postgres, redpanda, connect, redis, api, outbox-pu
 	@echo "reconciler        http://localhost:9095/healthz  (health+metrics share one port; consistency checks always run, PSP match disabled until LEDGER_RECONCILER_PSP_CSV_PATH is set)"
 	@echo "mock-gateway      http://localhost:8090/healthz  (LOCAL ONLY; holds payments in memory)"
 	@echo "connect           http://localhost:8083/connectors"
+	@echo "prometheus        http://localhost:9099  (9090 is taken by the api container's own metrics port)"
+	@echo "grafana           http://localhost:3001  (anonymous viewer access; admin/admin)"
 
 rebuild: ## Recompute balances from journal_entries and diff against the live projection
 	# No leading /usr/local/bin/service here: the image's ENTRYPOINT already is

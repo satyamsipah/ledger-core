@@ -1,0 +1,46 @@
+# Scrape config for the local stack. Every target is this compose network's
+# internal service name and metrics port -- the same ports each service's own
+# /metrics listener binds to, never the host-mapped ones -- because Prometheus
+# runs as a container on this same network, not on the host.
+#
+# One job per service rather than one job with many targets: Prometheus
+# attaches the job name as a label on every series it scrapes from that
+# target, and per-service jobs are what let a dashboard or alert filter on
+# "which process" without parsing the const `service` label client_golang
+# already stamps on every metric (see internal/observability/metrics.go).
+# Carrying both is deliberate, not redundant -- job is Prometheus's own
+# scrape-time label and survives a service being renamed without touching a
+# single dashboard query; the `service` const label is what the metric itself
+# claims to be, which is a useful cross-check if the two ever disagree.
+
+global:
+  scrape_interval: 10s
+  evaluation_interval: 10s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: api
+    static_configs:
+      - targets: ["api:9090"]
+
+  - job_name: outbox-publisher
+    static_configs:
+      - targets: ["outbox-publisher:9091"]
+
+  - job_name: projector
+    static_configs:
+      - targets: ["projector:9093"]
+
+  - job_name: saga-orchestrator
+    static_configs:
+      - targets: ["saga-orchestrator:9094"]
+
+  - job_name: reconciler
+    static_configs:
+      - targets: ["reconciler:9095"]
+
+  # mock-gateway is intentionally absent: it is a local stand-in for an
+  # external payment gateway (see D45) and exposes no /metrics of its own --
+  # a real gateway would not let this stack scrape it either.

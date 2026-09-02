@@ -1,0 +1,18 @@
+-- Phase 6 observability: a real W3C trace context, propagated through Kafka
+-- message HEADERS, so one trace genuinely spans the HTTP request through the
+-- outbox and into the consumer that applies it.
+--
+-- outbox.trace_id (migration 000013) already exists and stays exactly as it
+-- is -- it is a JSON envelope field, informational, read by nothing but a
+-- human correlating a row to a trace by eye. This column is a DIFFERENT
+-- thing: the full "00-<trace-id>-<span-id>-<flags>" value the OpenTelemetry
+-- SDK's own TraceContext propagator produces, stored so it can be promoted to
+-- a Kafka HEADER named "traceparent" by both publishers -- see D31's own rule
+-- that the wire format cannot depend on which publisher wrote it, applied
+-- here to the header as much as to the JSON payload it already governed.
+--
+-- Nullable, exactly like trace_id: a caller running outside a traced context
+-- (a backfill script, a migration-adjacent tool, seed data) has no span, and
+-- that is a legitimate state rather than a defect to paper over with a
+-- placeholder value.
+ALTER TABLE outbox ADD COLUMN trace_parent TEXT;

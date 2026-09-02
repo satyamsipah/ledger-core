@@ -1931,3 +1931,183 @@ is untuned against real data volume — `CheckGlobalInvariant` and
 `CheckProjectionDrift` are both full scans of `journal_entries` with no index
 that makes them cheap at scale, and the honest answer to "what should this be
 in production" is "measured against a real database," not guessed here.
+
+### D50. Observability: the metrics that were missing, a real trace across the async boundary, and what got deployed
+
+Four pieces, tied together by one theme: closing gaps that looked closed. Every
+metric this phase's Definition of Done names by name already existed under a
+different, defensible name (`ledger_saga_instances` for "saga_state_total",
+`ledger_db_tx_retries_total` for "serialization_retries_total by sqlstate",
+`ledger_projector_consumer_lag` for "consumer_lag",
+`ledger_reconciliation_exceptions_total` for "reconciliation_exceptions_total
+by category" — already exact). What genuinely did not exist is recorded here.
+
+**`transactions_posted_total` and `transaction_duration` are recorded in
+`internal/ledger.Service`, not the HTTP layer.** `ledger_http_requests_total`
+already counts HTTP traffic; recording a second, domain-level counter at the
+handler would double-count every API-originated post while still missing
+every saga-originated one, since `payout.Orchestrator` calls
+`PostTransaction`/`ReverseTransaction*` directly and never passes through an
+HTTP handler. The instrumentation wraps `PostTransaction` and the shared
+`reverse` implementation with a two-line measuring shim
+(`postTransaction`/`doReverse` hold the unexported, untouched bodies) rather
+than threading `time.Now()` calls through either — the smallest diff against
+code that already carries a great deal of load-bearing commentary about
+ordering, and the two are behaviourally identical.
+
+**The type label is guarded against cardinality, not merely typed.**
+`TransactionType` is a small closed enum in practice, but `req.Type` is read
+for the metric label *before* `validate()` runs, so a caller sending garbage
+would otherwise mint one Prometheus series per distinct garbage string it
+tried. `observeTransaction` folds every `!t.Valid()` value into a single
+`"invalid"` label — cheap, and it is the same cardinality discipline
+`HTTPRequests`' own doc comment already states for routes ("route rather than
+raw path, so a UUID in the URL cannot explode cardinality").
+
+**`ledger.NewService` gained a `metrics` parameter, nil-safe.** The
+alternative — a setter, or a second constructor — was rejected because every
+other metrics-consuming type in this codebase (`db.Retrier`,
+`polling.Publisher`, `payout.Orchestrator`) takes it as a constructor argument,
+and a service built once at startup has no legitimate later point at which
+metrics would arrive. `nil` is accepted and checked, matching `Retrier`'s own
+convention, because the large majority of this codebase's tests construct a
+service purely to drive `PostTransaction` and have no reason to also build a
+registry — see `newLedgerService` in `test/testdb.go` versus
+`newRetryingLedgerService`, which already existed and already built one for
+the retrier; it now hands the same instance to `NewService` too, rather than
+constructing a second, disconnected one.
+
+**`ledger_outbox_lag_seconds` needed a place to run that both publisher arms
+share, and neither arm's own process had one.** The polling publisher already
+holds a pool; the Debezium arm is a pure HTTP status monitor over Kafka
+Connect's REST API and, before this entry, opened no direct connection to
+Postgres *at all* — D31 states plainly that Debezium's data path never touches
+this codebase, and that was taken further than intended: the *monitoring*
+path did not need to make the same abstention, and hadn't been given the
+chance not to. `cmd/outbox-publisher` now opens a pool unconditionally,
+regardless of which arm is selected, purely for
+`runBacklogMonitor` — a `SELECT count(*), EXTRACT(EPOCH FROM now() -
+min(created_at))` against `outbox_unpublished_idx`, the same partial index
+D4 built for "any future fallback publisher" and monitoring, finally used for
+the second of those two stated purposes. `ledger_outbox_backlog` existed as a
+declared, registered metric since Phase 4 and had never once been `.Set()` —
+found only because writing the lag gauge alongside it meant looking at the
+one query that should have been feeding both.
+
+**`ledger_saga_oldest_overdue_seconds` is a new `saga.Store` method, not a
+second query bolted onto the metric.** The phase asks to alert on "saga stuck
+> 5 min", and `ledger_saga_instances` — a population count by status — cannot
+express that: a healthy system with a dozen sagas in flight and a system with
+one saga stuck for an hour produce the same non-zero gauge. The new
+`OldestOverdueSeconds` query reuses `saga_instances_deadline_idx` exactly —
+the same partial index, same four excluded terminal statuses — that the
+sweeper's own `ClaimExpired` already relies on, so this is a read-only cousin
+of a query this package already had to get right. `NEEDS_MANUAL_REVIEW` is
+excluded on purpose: it is alerted on separately
+(`ledger_saga_manual_review_total`), and including it here would let one old,
+unresolved escalation permanently dominate the gauge and hide a second,
+freshly-stuck saga behind it. Wired into `refreshGauges`, which `SweepOnce`
+already called on every sweep tick — no new loop, no new ticker.
+
+**Kafka header trace propagation: a new column, not a repurposed one.**
+`outbox.trace_id` (D32) stays exactly what it was — an informational JSON
+envelope field nothing extracts back into a span. The gap named in this
+phase's own kickoff is real: "one trace spans the whole async flow" was not
+true before this entry, because nothing on the consumer side ever called
+`Extract`. Closing it needed the full W3C `traceparent` value (trace id *and*
+span id, plus flags), which `trace_id` alone cannot reconstruct into a valid
+remote `SpanContext`. `outbox.trace_parent` (migration `000018`) holds that
+value, computed once via `otel.GetTextMapPropagator().Inject` — reusing the
+exact propagator `NewTracerProvider` installs for HTTP, rather than
+hand-formatting the W3C string, so this can never drift from what `otelhttp`
+already relies on elsewhere in this codebase. Kept as a separate column
+alongside `trace_id` rather than replacing it: `trace_id` is read by nothing
+today, but it is a smaller, human-readable value a support engineer might
+grep a database dump for, and there was no correctness reason to delete it.
+
+**The wire format still cannot depend on which publisher wrote it (D31's own
+rule), so both arms promote the SAME column to the SAME header.** The polling
+publisher sets `traceparent` as a real `kgo.RecordHeader` when
+`trace_parent` is non-empty. The Debezium connector promotes it via the
+EventRouter SMT's `table.fields.additional.placement` config
+(`trace_parent:header:traceparent`) — a declarative connector-config change,
+not Go code, which is exactly the asymmetry D31 already documented between
+the two arms' data paths. Neither arm touches the JSON payload: the header is
+a purely transport-level addition, so every existing byte-for-byte assertion
+about the wire body (D28's reasoning for `response_body`, applied here to the
+event envelope) stays true unchanged.
+
+**The consumer extracts and starts a genuine child span, verified by an
+in-memory span recorder, not by comparing two independently-read strings.**
+`internal/projector.Consumer.handle` extracts `traceparent` from the record's
+headers into a `propagation.MapCarrier`, calls
+`otel.GetTextMapPropagator().Extract`, and starts `"projector.apply_event"`
+from the resulting context. `tracer := otel.Tracer(...)` is the first manually
+started span anywhere in this codebase — every other one comes from
+`otelhttp`'s automatic instrumentation at the HTTP boundary — named for the
+package it instruments per the ordinary Go OpenTelemetry convention, since
+there was no existing local precedent to follow instead.
+
+`TestProjector_TraceContextPropagatesThroughKafkaHeaders` installs a real
+`sdktrace.TracerProvider` backed by `tracetest.SpanRecorder` as the
+process-global provider and propagator, for the test's own duration, and
+asserts the recorded consumer span's `TraceID` equals the producing span's —
+proving the SDK's own machinery genuinely linked the two, which a comparison
+of `outbox.trace_id` against a logged string could not: two independently
+computed values that happen to match is a weaker claim than "the propagator
+extracted a real parent," and only the second is what the phase actually
+asked for.
+
+**Swapping `otel`'s global tracer provider and propagator inside one test in
+a package that runs many tests in parallel is safe, and the reasoning is
+worth recording because it looks unsafe.** The test does not call
+`t.Parallel()`. Go's test runner does not begin executing ANY `t.Parallel()`
+test's body in a package until every non-parallel test — this one included,
+cleanup and all — has already returned; a parallel test that has reached its
+own `Parallel()` call is paused, not running, for the whole of that window.
+`TestProjector_ConsumesAndAppliesTransactionPosted` and its neighbours are
+already non-parallel in this same file, for the unrelated reason that each
+spins its own Redpanda container, which is what made this test's placement
+unremarkable rather than a special case.
+
+**Deployment: Prometheus and Grafana are new `docker-compose.yml` services,
+provisioned rather than clicked together.** `deploy/prometheus/prometheus.yml`
+scrapes every service that exposes `/metrics` by its compose-internal
+hostname and port — the same ports each service's own admin listener binds
+to, not the host-mapped ones, because Prometheus runs on the same compose
+network rather than the host. `mock-gateway` is deliberately absent from the
+scrape list: it stands in for an external gateway (D45), and a real one would
+not let this stack scrape it either. Grafana's datasource and dashboard are
+both auto-provisioned (`deploy/grafana/provisioning/`), so `docker compose up`
+produces a working, populated dashboard rather than an empty Grafana asking
+to be configured by hand — consistent with the Definition of Done's own
+requirement that the stack come up clean from scratch, not clean-plus-manual-steps.
+
+**The five alerts `deploy/prometheus/alerts.yml` defines are exactly the five
+the phase names, no more.** Each one is backed by a metric this phase built
+specifically to make it possible to write honestly — see this entry and D49
+above for which. One is worth flagging on its own:
+**`LedgerReconciliationExceptions` uses `increase(...[1d]) > 0`, not a bare
+`> 0`.** `ledger_reconciliation_exceptions_total` is a counter, and counters
+never go down; a bare `> 0` threshold would fire once, on the first exception
+this deployment ever records, and then never resolve again regardless of
+whether the ledger is fine for the next five years. `increase` over the
+reconciliation job's own default interval is what the phase's "reconciliation
+exceptions > 0" wording actually means: a NEW exception, not the existence of
+history.
+
+**`docs/RUNBOOK.md` is one section per alert, in the order they appear in
+`alerts.yml`**, each covering what firing means, how to confirm and localise
+it (mostly the exact SQL the alerting metric's own Go query runs, so an
+operator is never left re-deriving a query this codebase already wrote), and
+what to actually do. None of the five sections ends in "restart the
+service" — restarting fixes nothing about an unbalanced journal, a drifted
+balance, or an unresolved reconciliation exception, and a runbook that
+suggests otherwise teaches the wrong reflex for the one class of alert this
+system is built to take seriously.
+
+**What remains open.** Structured logs already carry a correlation id on
+every HTTP-originated line (`chimiddleware.RequestID`, threaded through by
+`requestLogger`) — that half of the phase's ask predates this entry and
+needed nothing added. The fault-injection harness and its chaos test are the
+one item of Phase 6 this entry does not touch.

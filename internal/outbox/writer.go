@@ -8,6 +8,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -141,6 +143,20 @@ func Append(ctx context.Context, tx pgx.Tx, e Event) error {
 		traceID = sc.TraceID().String()
 	}
 
+	// traceParent is the full W3C value ("00-<trace-id>-<span-id>-<flags>"),
+	// built by the SAME propagator NewTracerProvider installs for HTTP --
+	// reused here rather than hand-formatted, so this can never drift from
+	// the format otelhttp already relies on elsewhere in this codebase. It is
+	// stored so both outbox publishers can promote it onto a Kafka HEADER
+	// named "traceparent" (see internal/outbox/publish/polling and
+	// deploy/debezium/outbox-connector.json), which is what actually lets the
+	// consumer resume this trace as a child span rather than merely log a
+	// matching id next to an unrelated one. An empty carrier -- no active
+	// span -- injects nothing, so this is empty exactly when traceID above is.
+	carrier := propagation.MapCarrier{}
+	otel.GetTextMapPropagator().Inject(ctx, carrier)
+	traceParent := carrier.Get("traceparent")
+
 	payload, err := json.Marshal(Envelope{
 		EventID:      eventID,
 		EventType:    e.EventType,
@@ -156,9 +172,9 @@ func Append(ctx context.Context, tx pgx.Tx, e Event) error {
 
 	_, err = tx.Exec(ctx, `
 		INSERT INTO outbox (aggregate_type, aggregate_id, event_type, event_id,
-		                    event_version, trace_id, payload)
-		VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''), $7)`,
-		e.AggregateType, e.AggregateID, e.EventType, eventID, e.EventVersion, traceID, []byte(payload))
+		                    event_version, trace_id, trace_parent, payload)
+		VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''), NULLIF($7, ''), $8)`,
+		e.AggregateType, e.AggregateID, e.EventType, eventID, e.EventVersion, traceID, traceParent, []byte(payload))
 	if err != nil {
 		return fmt.Errorf("append outbox event %s for %s: %w", e.EventType, e.AggregateID, err)
 	}

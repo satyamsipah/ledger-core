@@ -462,6 +462,26 @@ func (s *Store) CountByStatus(ctx context.Context) (map[saga.Status]int, error) 
 	return counts, nil
 }
 
+// OldestOverdueSeconds feeds the "saga stuck" alert. Excludes the same four
+// terminal statuses saga_instances_deadline_idx already does, so this reuses
+// that partial index rather than scanning the whole table.
+func (s *Store) OldestOverdueSeconds(ctx context.Context) (float64, error) {
+	ctx, cancel := context.WithTimeout(ctx, s.timeout)
+	defer cancel()
+
+	var seconds float64
+	err := s.pool.QueryRow(ctx, `
+		SELECT COALESCE(EXTRACT(EPOCH FROM now() - min(step_deadline_at)), 0)
+		  FROM saga_instances
+		 WHERE step_deadline_at < now()
+		   AND status NOT IN ('COMPLETED', 'COMPENSATED', 'FAILED', 'NEEDS_MANUAL_REVIEW')`).
+		Scan(&seconds)
+	if err != nil {
+		return 0, fmt.Errorf("compute oldest overdue saga age: %w", err)
+	}
+	return seconds, nil
+}
+
 func collectInstances(rows pgx.Rows) ([]saga.Instance, error) {
 	defer rows.Close()
 

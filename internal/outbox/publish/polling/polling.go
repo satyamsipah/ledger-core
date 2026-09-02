@@ -63,6 +63,15 @@ type row struct {
 	aggregateType string
 	aggregateID   string
 	payload       []byte
+
+	// traceParent is the W3C value internal/outbox.Append already computed
+	// and stored, promoted here onto a Kafka HEADER rather than folded into
+	// payload -- the wire body stays byte-for-byte what Append built,
+	// regardless of which publisher moves it, and the header is what lets the
+	// projector's consumer resume this trace as a child span. Empty for any
+	// row written outside a traced context, in which case no header is set at
+	// all (see the record-building loop in publishBatch).
+	traceParent string
 }
 
 // Publisher is the polling implementation of publish.Publisher.
@@ -181,7 +190,7 @@ func (p *Publisher) publishBatch(ctx context.Context) (int, error) {
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
 
 	rows, err := tx.Query(ctx, `
-		SELECT id, aggregate_type, aggregate_id, payload
+		SELECT id, aggregate_type, aggregate_id, payload, COALESCE(trace_parent, '')
 		  FROM outbox
 		 WHERE published_at IS NULL
 		 ORDER BY id
@@ -202,11 +211,19 @@ func (p *Publisher) publishBatch(ctx context.Context) (int, error) {
 	records := make([]*kgo.Record, len(claimed))
 	ids := make([]int64, len(claimed))
 	for i, r := range claimed {
-		records[i] = &kgo.Record{
+		rec := &kgo.Record{
 			Topic: kafka.TopicForAggregate(r.aggregateType),
 			Key:   []byte(r.aggregateID),
 			Value: r.payload,
 		}
+		// Only set when non-empty: a row written outside a traced context
+		// (seed data, a backfill) has nothing to propagate, and an empty
+		// header is worse than no header at all -- a consumer would have to
+		// distinguish "absent" from "present but empty" for no benefit.
+		if r.traceParent != "" {
+			rec.Headers = []kgo.RecordHeader{{Key: "traceparent", Value: []byte(r.traceParent)}}
+		}
+		records[i] = rec
 		ids[i] = r.id
 	}
 
@@ -241,7 +258,7 @@ func scanRows(rows pgx.Rows) ([]row, error) {
 	var claimed []row
 	for rows.Next() {
 		var r row
-		if err := rows.Scan(&r.id, &r.aggregateType, &r.aggregateID, &r.payload); err != nil {
+		if err := rows.Scan(&r.id, &r.aggregateType, &r.aggregateID, &r.payload, &r.traceParent); err != nil {
 			return nil, fmt.Errorf("scan claimed outbox row: %w", err)
 		}
 		claimed = append(claimed, r)

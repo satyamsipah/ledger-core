@@ -184,6 +184,21 @@ type Outbox struct {
 	// connect-init service) to report the health of.
 	ConnectURL    string
 	ConnectorName string
+
+	// ReplicationSlotName names the logical replication slot Debezium reads
+	// from (migration 000008's CREATE PUBLICATION and
+	// deploy/debezium/outbox-connector.json's slot.name agree on this value).
+	// Used only by cmd/outbox-publisher's Debezium-arm backlog monitor -- see
+	// its own comment for why this, and not outbox.published_at, is what that
+	// arm has to watch instead.
+	ReplicationSlotName string
+
+	// BacklogCheckInterval is how often cmd/outbox-publisher checks its own
+	// monitoring metrics (ledger_outbox_backlog, ledger_outbox_lag_seconds).
+	// Runs regardless of which publisher arm is selected above, but the two
+	// arms watch genuinely different things to produce them -- see
+	// runBacklogMonitor's doc comment.
+	BacklogCheckInterval time.Duration
 }
 
 // Redis configures the idempotency fast path. Redis is a latency optimisation
@@ -283,11 +298,13 @@ func Load(service string) (Config, error) {
 			ConsumerGroup: env("KAFKA_CONSUMER_GROUP", "ledger-"+service),
 		},
 		Outbox: Outbox{
-			Publisher:     env("OUTBOX_PUBLISHER", "debezium"),
-			PollInterval:  envDuration("OUTBOX_POLL_INTERVAL", 500*time.Millisecond, fail),
-			BatchSize:     envInt("OUTBOX_BATCH_SIZE", 100, fail),
-			ConnectURL:    env("OUTBOX_CONNECT_URL", "http://localhost:8083"),
-			ConnectorName: env("OUTBOX_CONNECTOR_NAME", "ledger-outbox"),
+			Publisher:            env("OUTBOX_PUBLISHER", "debezium"),
+			PollInterval:         envDuration("OUTBOX_POLL_INTERVAL", 500*time.Millisecond, fail),
+			BatchSize:            envInt("OUTBOX_BATCH_SIZE", 100, fail),
+			ConnectURL:           env("OUTBOX_CONNECT_URL", "http://localhost:8083"),
+			ConnectorName:        env("OUTBOX_CONNECTOR_NAME", "ledger-outbox"),
+			ReplicationSlotName:  env("OUTBOX_REPLICATION_SLOT_NAME", "ledger_outbox_slot"),
+			BacklogCheckInterval: envDuration("OUTBOX_BACKLOG_CHECK_INTERVAL", 5*time.Second, fail),
 		},
 		Saga: Saga{
 			WorkerID:                env("SAGA_WORKER_ID", defaultWorkerID()),

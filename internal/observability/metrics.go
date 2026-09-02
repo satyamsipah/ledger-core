@@ -146,6 +146,26 @@ type Metrics struct {
 	// SagaManualReview is one -- an exception later marked RESOLVED must not
 	// erase the fact that it happened.
 	ReconciliationExceptions *prometheus.CounterVec
+
+	// GlobalInvariantViolation is the signed total CheckGlobalInvariant found
+	// for one currency, zero when that currency's journal balances. THIS IS
+	// AN ALERT: the phase's own framing is "if ever non-zero, page
+	// immediately," because a nonzero value here means invariant 1 -- the
+	// one CLAUDE.md calls non-negotiable -- no longer holds somewhere in the
+	// journal. Reset to zero every check so a currency that stops violating
+	// does not leave a stale series behind; see cmd/reconciler's consistency
+	// loop for where that reset happens.
+	GlobalInvariantViolation *prometheus.GaugeVec
+
+	// ProjectionDriftAccounts is how many accounts CheckProjectionDrift found
+	// disagreeing between account_balances and the journal, at last check.
+	ProjectionDriftAccounts prometheus.Gauge
+
+	// OrphanTransactions and OrphanEntries are CheckOrphans' two findings, at
+	// last check -- POSTED/REVERSED transactions with fewer than two entries,
+	// and journal_entries rows with no parent transaction respectively.
+	OrphanTransactions prometheus.Gauge
+	OrphanEntries      prometheus.Gauge
 }
 
 // NewMetrics builds the registry and registers the process collectors.
@@ -304,6 +324,38 @@ func NewMetrics(service string) *Metrics {
 			Help:        "Reconciliation findings by category. Alert on any category other than an auto-resolved timing difference.",
 			ConstLabels: prometheus.Labels{"service": service},
 		}, []string{"category"}),
+
+		GlobalInvariantViolation: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace:   "ledger",
+			Subsystem:   "consistency",
+			Name:        "global_invariant_violation_minor",
+			Help:        "Signed sum of journal_entries for one currency; nonzero means invariant 1 is broken. Alert on != 0.",
+			ConstLabels: prometheus.Labels{"service": service},
+		}, []string{"currency"}),
+
+		ProjectionDriftAccounts: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace:   "ledger",
+			Subsystem:   "consistency",
+			Name:        "projection_drift_accounts",
+			Help:        "Accounts where account_balances disagrees with the journal, at last check.",
+			ConstLabels: prometheus.Labels{"service": service},
+		}),
+
+		OrphanTransactions: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace:   "ledger",
+			Subsystem:   "consistency",
+			Name:        "orphan_transactions",
+			Help:        "POSTED or REVERSED transactions with fewer than two journal entries, at last check.",
+			ConstLabels: prometheus.Labels{"service": service},
+		}),
+
+		OrphanEntries: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace:   "ledger",
+			Subsystem:   "consistency",
+			Name:        "orphan_entries",
+			Help:        "journal_entries rows with no parent transaction, at last check. Should never be nonzero given the foreign key.",
+			ConstLabels: prometheus.Labels{"service": service},
+		}),
 	}
 
 	registry.MustRegister(
@@ -315,6 +367,8 @@ func NewMetrics(service string) *Metrics {
 		m.ProjectorDuplicatesSkipped, m.ProjectorDLQTotal,
 		m.SagaSteps, m.SagaGatewayProbes, m.SagaManualReview, m.SagaInstances,
 		m.ReconciliationRuns, m.ReconciliationExceptions,
+		m.GlobalInvariantViolation, m.ProjectionDriftAccounts,
+		m.OrphanTransactions, m.OrphanEntries,
 	)
 	return m
 }

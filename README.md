@@ -707,6 +707,39 @@ matching `external_ref` values first. To try it: post a few transactions with
 example file, edit its rows to match what you posted, then point
 `LEDGER_RECONCILER_PSP_CSV_PATH` at it and restart `cmd/reconciler`.
 
+## Consistency checks
+
+Alongside the PSP match, `cmd/reconciler` runs three structural checks
+against the ledger's own data on a short ticker
+(`LEDGER_RECONCILER_CONSISTENCY_INTERVAL`, default one minute) — no
+configuration required, unlike the PSP match, because "is our own data
+internally consistent" should not wait on an operator pointing this process
+at a settlement file:
+
+| Check | What it proves |
+|---|---|
+| Global invariant | `SUM` of every signed journal entry, per currency, is still zero across the *entire* journal — not merely for the one transaction the deferred trigger last fired on |
+| Projection drift | `account_balances` (the synchronous balance, updated under lock) agrees with a full recomputation from `journal_entries` |
+| Orphan detection | No `POSTED`/`REVERSED` transaction has fewer than two entries, and no journal entry lacks a parent transaction |
+
+Projection drift here is deliberately not the same check `make rebuild`
+already runs — that one diffs the journal against `balance_projections`, the
+Kafka-driven read model, to prove the async pipeline agrees with the ledger.
+This one diffs against `account_balances`, the write path's own synchronous
+balance, closing the three-way triangle D1 in `docs/DECISIONS.md` originally
+described.
+
+Each check reports itself as a Prometheus gauge (`ledger_consistency_*`,
+scraped from the metrics port) and, on a violation, an `ERROR` log line
+naming the offending currency, account, or transaction ids. The global
+invariant gauge is the one to page on: any nonzero value means invariant 1 no
+longer holds somewhere in the journal.
+
+See `docs/DECISIONS.md` D49 for why these three are plain query functions
+rather than a persisted store like the PSP match, and why proving they
+actually *detect* a violation needed a private database rather than the test
+suite's shared one.
+
 ## Tests
 
 No mocks for database behaviour — every test runs against real PostgreSQL via

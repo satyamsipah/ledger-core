@@ -216,6 +216,16 @@ type Reconciler struct {
 	// looking for MISSING_IN_PSP references. See
 	// internal/reconciliation.DefaultLookback.
 	Lookback time.Duration
+
+	// ConsistencyInterval is how often the internal structural checks
+	// (internal/consistency: the global invariant, projection drift, orphan
+	// detection) run. Unlike the PSP match above, this needs no external file
+	// and no config to enable -- it always runs, because "is our own data
+	// internally consistent" should never be gated on an operator having
+	// pointed this process at a settlement file. Short by default: these are
+	// bounded, read-only queries, and the global invariant check in
+	// particular exists to page quickly if it ever trips.
+	ConsistencyInterval time.Duration
 }
 
 // Observability configures the three signals: logs, metrics, traces.
@@ -300,10 +310,11 @@ func Load(service string) (Config, error) {
 			DB:   envInt("REDIS_DB", 0, fail),
 		},
 		Reconciler: Reconciler{
-			PSPStatementPath: env("RECONCILER_PSP_CSV_PATH", ""),
-			Interval:         envDuration("RECONCILER_INTERVAL", 24*time.Hour, fail),
-			TimingWindow:     envDuration("RECONCILER_TIMING_WINDOW", 2*time.Hour, fail),
-			Lookback:         envDuration("RECONCILER_LOOKBACK", 7*24*time.Hour, fail),
+			PSPStatementPath:    env("RECONCILER_PSP_CSV_PATH", ""),
+			Interval:            envDuration("RECONCILER_INTERVAL", 24*time.Hour, fail),
+			TimingWindow:        envDuration("RECONCILER_TIMING_WINDOW", 2*time.Hour, fail),
+			Lookback:            envDuration("RECONCILER_LOOKBACK", 7*24*time.Hour, fail),
+			ConsistencyInterval: envDuration("RECONCILER_CONSISTENCY_INTERVAL", time.Minute, fail),
 		},
 		Observability: Observability{
 			LogLevel:         envLogLevel("LOG_LEVEL", slog.LevelInfo, fail),

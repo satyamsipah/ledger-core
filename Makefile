@@ -22,7 +22,7 @@ up: ## Start the whole stack (postgres, redpanda, connect, redis, api, outbox-pu
 	@echo "outbox-publisher  http://localhost:9091/healthz  (health+metrics share one port; no separate app port)"
 	@echo "projector         http://localhost:9093/healthz  (health+metrics share one port; no separate app port)"
 	@echo "saga-orchestrator http://localhost:9094/healthz  (health+metrics share one port; no separate app port)"
-	@echo "reconciler        http://localhost:9095/healthz  (health+metrics share one port; disabled until LEDGER_RECONCILER_PSP_CSV_PATH is set)"
+	@echo "reconciler        http://localhost:9095/healthz  (health+metrics share one port; consistency checks always run, PSP match disabled until LEDGER_RECONCILER_PSP_CSV_PATH is set)"
 	@echo "mock-gateway      http://localhost:8090/healthz  (LOCAL ONLY; holds payments in memory)"
 	@echo "connect           http://localhost:8083/connectors"
 

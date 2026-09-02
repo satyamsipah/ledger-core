@@ -1831,3 +1831,103 @@ reconciliation exception also does not exist yet, for the identical reason
 D43 gives for sagas: an admin surface for "I have investigated this, mark it
 resolved" is real work belonging with the admin dashboard, not a field bolted
 onto this phase's first cut.
+
+### D49. The internal consistency checks: a query package, not a second store
+
+**Decided.** `internal/consistency` adds three functions —
+`CheckGlobalInvariant`, `CheckProjectionDrift`, `CheckOrphans` — each taking a
+bare `*pgxpool.Pool` and returning a result struct. `cmd/reconciler` runs all
+three on one ticker (`LEDGER_RECONCILER_CONSISTENCY_INTERVAL`, default one
+minute) alongside the PSP match loop D48 already added, and turns the outcome
+into a Prometheus gauge plus, on a violation, an `ERROR` log line.
+
+**Rejected: the same `Store`/persisted-run shape D48 used for the PSP
+match.** Seriously considered, since it is already built and already wired
+into this exact process. Rejected because the two jobs answer different kinds
+of question. A PSP mismatch is an audit finding — evidence someone reviews
+later, with a lifecycle (`OPEN` → resolved) worth persisting and worth an API
+to browse historically. A structural check is a yes/no question about the
+ledger's own state *right now*: "does the journal still sum to zero" has no
+useful history beyond its current answer, and a table of a year of "yes, it
+balanced" rows would be pure write load with no reader. `internal/projector`'s
+own `Rebuild` function already established the right shape for this — a plain
+function over a pool, called from `make rebuild` and now from a ticker — and
+these three functions follow it rather than reinventing D48's heavier
+machinery for a job that does not need it.
+
+**The three checks answer three different questions, and conflating any two
+of them would quietly lose one:**
+
+- `CheckGlobalInvariant` proves the deferred trigger (migration 000005) is
+  still holding across the *entire* journal, not merely for the one
+  transaction it last fired on. Grouped by currency, not summed globally —
+  invariant 1 balances per `(transaction_id, currency)`, so a bug that is
+  simultaneously +100 in one currency and −100 in another would net to zero
+  and hide behind a single ungrouped total. Two unrelated defects must not be
+  able to cancel each other out of the one check meant to catch either of
+  them.
+- `CheckProjectionDrift` recomputes every account's balance from
+  `journal_entries` and diffs it against `account_balances` — the
+  *synchronous* balance the write path updates under lock (D1). This is
+  deliberately **not** the comparison `internal/projector.Rebuild` already
+  makes, which diffs the same recomputation against `balance_projections`,
+  the *Kafka-driven* read model. D1 names three independently derived
+  balances specifically so any two agreeing while a third dissents localises
+  the bug; Phase 4 built the async-pipeline leg of that triangle, and this is
+  the write-path leg nothing before Phase 6 checked on a schedule. Running
+  both is what actually closes D1's original design, not a duplicate of
+  either alone.
+- `CheckOrphans` proves two structural claims: no `POSTED` or `REVERSED`
+  transaction has fewer than two entries (excluding `PENDING`, which is a
+  legitimate transient state per Phase 1's own carried-forward gap — a saga
+  writing a header before its legs), and no `journal_entries` row lacks a
+  parent transaction. The second is unconstructible given the foreign key the
+  table already carries, and is checked anyway: one query, and it is what
+  would catch a future migration that weakened that constraint by mistake,
+  which a schema-level promise nobody re-verifies at runtime cannot.
+
+**Every result is capped at `maxReported` (200) offending rows, with the true
+count carried alongside the capped list.** A check that found fifty thousand
+violations has a much bigger problem than this process's memory or a log line
+can usefully describe, and the failure mode to avoid is a check that makes
+things worse by holding an unbounded result set during an incident that is
+already resource-constrained. The true count is never lost — `TotalDrifted`,
+`TotalFewEntry`, `TotalOrphanEntries` are separate fields from the capped
+slices — so "3 accounts drifted" and "50,000 accounts drifted" stay
+distinguishable even when only the first 200 are named.
+
+**The gauge is `Reset()` before every tick, not merely overwritten.**
+`GlobalInvariantViolation` is labelled by currency; without the reset, a
+currency that stops violating would leave a stale nonzero series on the
+dashboard forever, because nothing would ever write a `0` for a label that
+has simply stopped being reported. `Reset` followed by setting only today's
+actual violations makes "never seen" and "checked and clean" the same,
+correct state: absent from the series entirely, which is also what makes the
+Prometheus alert this sets up for (Phase 6's observability item, not yet
+written) a simple `!= 0` rather than a stateful "was previously nonzero"
+query.
+
+**Verification had to defeat the very safeguards being verified, which is
+why this test does not run against the shared suite database.**
+`TestConsistency_Checks` proves each check actually *detects* a violation, not
+merely that it reports clean against healthy data — and the only way to
+produce a genuinely unbalanced journal or a genuinely drifted balance is to
+write around the deferred trigger and the append-only trigger that make both
+otherwise unreachable through any real write path. Doing that against
+`sharedPool` would corrupt every other test in the suite running concurrently
+against it. `TestMigrations_RoundTrip` already established the precedent of a
+private container for exactly this reason ("it tears the schema down"); this
+test tears the *safety* down instead, which is no less disqualifying for a
+database other tests depend on staying clean. `ALTER TABLE journal_entries
+DISABLE TRIGGER journal_entries_balanced` (and, for the same subtest's own
+cleanup, `journal_entries_no_mutation`) is scoped to that one private
+database, re-enabled before the subtest ends, and never touches `sharedPool`
+at all.
+
+**What remains open.** The Prometheus alert rules that turn these gauges into
+an actual page, and the Grafana dashboard, are Phase 6's observability item
+and are not written by this entry. `ConsistencyInterval`'s one-minute default
+is untuned against real data volume — `CheckGlobalInvariant` and
+`CheckProjectionDrift` are both full scans of `journal_entries` with no index
+that makes them cheap at scale, and the honest answer to "what should this be
+in production" is "measured against a real database," not guessed here.

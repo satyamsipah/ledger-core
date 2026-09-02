@@ -11,6 +11,7 @@ package pgreconciliation
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -270,7 +271,7 @@ func (r *Repository) SaveExceptions(ctx context.Context, exceptions []reconcilia
 	}
 
 	results := r.pool.SendBatch(ctx, batch)
-	defer results.Close()
+	defer func() { _ = results.Close() }()
 
 	for range exceptions {
 		if _, err := results.Exec(); err != nil {
@@ -296,7 +297,7 @@ func (r *Repository) GetRun(ctx context.Context, id uuid.UUID) (*reconciliation.
 		Scan(&run.ID, &run.Source, &run.StartedAt, &run.FinishedAt, &run.Status,
 			&run.PSPRowCount, &run.MatchedCount, &run.AutoResolvedCount, &run.ExceptionCount, &errMsg)
 	if err != nil {
-		if err == pgx.ErrNoRows {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, fmt.Errorf("run %s: %w", id, reconciliation.ErrRunNotFound)
 		}
 		return nil, fmt.Errorf("read reconciliation run %s: %w", id, err)

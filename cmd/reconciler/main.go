@@ -227,12 +227,16 @@ func runReconciliationLoop(ctx context.Context, engine *reconciliation.Engine, p
 		slog.String("psp_statement_path", path), slog.Duration("interval", interval))
 
 	runOnce := func() {
+		//nolint:gosec // G304: path is operator-supplied configuration
+		// (LEDGER_RECONCILER_PSP_CSV_PATH), not attacker-controlled request
+		// input -- the same trust boundary every other config-driven file
+		// path in this codebase (migrations, seed SQL) already sits inside.
 		f, err := os.Open(path)
 		if err != nil {
 			logger.ErrorContext(ctx, "open PSP statement", slog.String("path", path), slog.String("error", err.Error()))
 			return
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 
 		records, err := reconciliation.ParsePSPStatement(f)
 		if err != nil {

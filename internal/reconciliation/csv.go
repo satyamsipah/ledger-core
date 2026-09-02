@@ -2,6 +2,7 @@ package reconciliation
 
 import (
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -50,7 +51,7 @@ func ParsePSPStatement(r io.Reader) ([]PSPRecord, error) {
 
 	header, err := reader.Read()
 	if err != nil {
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			return nil, ErrEmptyStatement
 		}
 		return nil, fmt.Errorf("read PSP statement header: %w", err)
@@ -63,7 +64,7 @@ func ParsePSPStatement(r io.Reader) ([]PSPRecord, error) {
 	var records []PSPRecord
 	for line := 2; ; line++ {
 		row, err := reader.Read()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {

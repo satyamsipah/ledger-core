@@ -45,6 +45,8 @@ const (
 // RunStatus is where one reconciliation run stands.
 type RunStatus string
 
+// The three statuses a run passes through, matching
+// reconciliation_runs_status_check.
 const (
 	RunStatusRunning   RunStatus = "RUNNING"
 	RunStatusCompleted RunStatus = "COMPLETED"

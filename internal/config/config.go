@@ -34,6 +34,15 @@ type Config struct {
 	Redis         Redis
 	Reconciler    Reconciler
 	Observability Observability
+
+	// FaultInjectionEnabled mounts internal/http.HandleClockSkew on this
+	// process's admin listener. Off by default and never set by
+	// docker-compose.yml's default services -- only cmd/chaos-harness's own
+	// compose profile sets it, and only on the two processes that have a
+	// genuine clock-skew fault to offer (see internal/clock's doc comment
+	// for which two, and why only those). A process running with this true
+	// is, by construction, one nothing but a chaos run should ever start.
+	FaultInjectionEnabled bool
 }
 
 // Ledger configures the write path's concurrency behaviour and the idempotency
@@ -339,6 +348,7 @@ func Load(service string) (Config, error) {
 			OTLPEndpoint:     env("OTLP_ENDPOINT", ""),
 			TraceSampleRatio: envFloat("TRACE_SAMPLE_RATIO", 1.0, fail),
 		},
+		FaultInjectionEnabled: envBool("FAULT_INJECTION_ENABLED", false, fail),
 	}
 
 	if cfg.Postgres.DSN == "" {

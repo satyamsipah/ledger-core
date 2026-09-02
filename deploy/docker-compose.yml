@@ -11,6 +11,13 @@ name: ledger-core
 services:
   postgres:
     image: postgres:16-alpine
+    # Pinned rather than left to Compose's own auto-naming (normally
+    # <project>-<service>-<n>): cmd/chaos-harness pauses this container by
+    # name over the Docker Engine API, and a name that changes with whatever
+    # directory this repo happens to be checked out into would make its
+    # default CHAOS_POSTGRES_CONTAINER wrong on every machine but the one it
+    # was set on.
+    container_name: ledger-postgres
     command:
       - postgres
       # wal_level=logical is what makes CDC possible at all. Debezium decodes
@@ -59,6 +66,9 @@ services:
 
   redpanda:
     image: redpandadata/redpanda:v24.2.7
+    # Pinned for the identical reason postgres above is: cmd/chaos-harness
+    # addresses this container by name.
+    container_name: ledger-redpanda
     command:
       - redpanda
       - start
@@ -209,6 +219,11 @@ services:
       LEDGER_REDIS_ADDR: redis:6379
       LEDGER_KAFKA_BROKERS: redpanda:29092
       LEDGER_LOG_LEVEL: debug
+      # Off by default, deliberately explicit rather than merely absent:
+      # deploy/docker-compose.chaos.yml overrides this to "true" for a chaos
+      # run, and stating the default here says what it is being overridden
+      # FROM, not just that it happens to default to false somewhere in Go.
+      LEDGER_FAULT_INJECTION_ENABLED: "false"
     ports:
       - "8080:8080"
       - "9090:9090"
@@ -352,6 +367,9 @@ services:
       LEDGER_POSTGRES_DSN: postgres://ledger:ledger@postgres:5432/ledger?sslmode=disable
       LEDGER_GATEWAY_URL: http://mock-gateway:8090
       LEDGER_LOG_LEVEL: debug
+      # See the identical flag on the api service above -- same default,
+      # same override file, same reasoning.
+      LEDGER_FAULT_INJECTION_ENABLED: "false"
     ports:
       - "9094:9094"
     healthcheck:

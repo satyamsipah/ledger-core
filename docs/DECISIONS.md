@@ -2111,3 +2111,165 @@ every HTTP-originated line (`chimiddleware.RequestID`, threaded through by
 `requestLogger`) — that half of the phase's ask predates this entry and
 needed nothing added. The fault-injection harness and its chaos test are the
 one item of Phase 6 this entry does not touch.
+
+### D51. The fault-injection harness: six faults, and why clock skew is only two of them
+
+**Decided.** `cmd/chaos-harness` is a new, deliberately separate binary
+(`deploy/Dockerfile.chaos-harness`, never the shared one every real service
+uses) that injects the six faults the phase names, live, against a running
+`docker compose` stack — never against `go test`'s own Testcontainers, and
+never against production. Every fault is one of exactly two kinds:
+something real actually happening (`docker pause`/`unpause` over the Docker
+Engine API's own Unix socket, or a real transaction genuinely holding a real
+row lock), or a control call into a mechanism this codebase already built
+for the purpose (mock-gateway's `/control/behaviour`, D45; the new
+`internal/http.HandleClockSkew`, below). `.claude/rules/testing.md`'s own
+rule for failure tests — "they actually kill things... they do not simulate
+failure with a boolean flag" — is written for tests, but it applies with
+more force to a tool tests are built on, so it governs every fault here
+identically.
+
+**DB connection failure and Kafka unavailability: `docker pause`, exactly
+the mechanism D36 already validated.** `TestOutboxPublish_KafkaOutage`
+established that pausing (the cgroup freezer, freezing an
+already-running process) is the faithful way to simulate an outage against
+this specific Redpanda testcontainers module, because a stop/start cycle
+leaves its custom entrypoint waiting for a lifecycle hook that only runs
+once. The harness reuses the identical mechanism against the compose
+stack's real `postgres` and `redpanda` containers, addressed by name over
+the Docker socket — which is why those two services gained a pinned
+`container_name` in `docker-compose.yml`: Compose's own auto-generated name
+depends on which directory the repo happens to be checked out into, and a
+chaos harness whose default target name is wrong on every machine but the
+one it was tuned on is not a tool, it is a trap for the next person who runs
+it.
+
+**Gateway timeout and gateway 500: zero new mechanism.** Both are
+`POST /control/behaviour` calls to mock-gateway (D45), which already changes
+real HTTP behaviour rather than a flag an orchestrator checks internally.
+The harness's only job is to drive it and restore `{"outcome":"succeed"}`
+afterward — a proxy, not a reimplementation.
+
+**Slow query: a real held row lock, not `time.Sleep`.** The harness opens
+its own connection, takes `FOR UPDATE` on a real, configurable "hot"
+account's `account_balances` row (default `platform-bank-inr`), and runs
+`SELECT pg_sleep($1)` *inside that same transaction* before committing. Any
+real posting transaction that touches the same account queues behind it
+exactly as it would under genuine contention — the same row-lock mechanism
+D11's ordered locking already depends on, made slow on purpose rather than
+merely described as slow in a log line.
+
+**Clock skew has exactly two legitimate targets, discovered by looking for
+them rather than assumed.** The obvious design — an injectable `Clock`
+threaded through the reconciler's timing-window comparison and the saga
+sweeper's timeout checks — turned out to test nothing: the reconciler
+compares two already-fixed, already-recorded timestamps (never "now" at
+all), and every saga deadline *after* the first is deliberately computed by
+PostgreSQL's own `now()`, specifically because "deadlines computed from a Go
+process's wall clock and compared against the database's would drift" (see
+`saga.Transition`'s own doc comment, Phase 5). Threading a fault into either
+would have exercised a seam that does not affect any real decision — a
+vulnerability manufactured to have something to test, not a real one made
+testable.
+
+Two places do read a Go process's own clock for a decision that matters, and
+both were found by grepping for `time.Now()` and asking, for each hit,
+"is this compared against something Postgres computed with its own clock?"
+— `internal/idempotency.Manager.resolveExisting`'s `expires_at` check, and
+`payout.Orchestrator.Start`'s very first `step_deadline_at` (every
+subsequent one is server-computed; this one cannot be, because the saga does
+not exist in the database yet to compute it against). `internal/clock` makes
+exactly these two calls injectable (`clock.Now()` in place of `time.Now()`)
+and nowhere else — a log timestamp or a metrics timer skewing along with an
+injected fault would be noise, not signal, and the whole value of a narrow
+seam is that everything outside it keeps behaving normally while the fault
+runs.
+
+**The clock-skew endpoint is deliberately not part of `Deps`/`NewMux`.**
+Every route registered there ends up on either the public API listener
+(`cmd/api`) or a worker's one-and-only listener — and a clock a stranger on
+the internet could skew is not a chaos-testing feature, it is a
+vulnerability wearing one. `internal/http.HandleClockSkew` is mounted
+directly on each process's admin/metrics mux, standalone, gated by
+`LEDGER_FAULT_INJECTION_ENABLED` (default `false`, flipped to `true` only by
+`deploy/docker-compose.chaos.yml`'s override of the two services that have a
+genuine clock fault to offer). `cmd/api`'s admin listener in particular
+carries no other routes at all today — this is the first thing mounted
+there beyond `/metrics` — which is exactly why it could not be added to the
+shared router: that router is also what `cmd/api`'s *public* listener serves.
+
+**Why an overlay compose file, not a Compose profile alone.** A profile
+controls whether a service starts; it cannot conditionally change an
+*already-defined* service's environment. Flipping
+`LEDGER_FAULT_INJECTION_ENABLED` on `api` and `saga-orchestrator` needed
+that second thing, so `deploy/docker-compose.chaos.yml` is a genuine overlay
+(`-f docker-compose.yml -f docker-compose.chaos.yml`, or `make chaos-up`),
+relying on Compose's own key-by-key merge of `environment:` maps across
+`-f` files — every other setting those two services already have survives
+untouched, only the one named flag changes. The base file states the
+default explicitly (`LEDGER_FAULT_INJECTION_ENABLED: "false"`) rather than
+leaving it merely absent, so the compose file itself documents what the
+overlay is overriding *from*.
+
+**Why `chaos-harness` gets its own Dockerfile and runs as root.** Every real
+service's image runs as an unprivileged uid specifically so that "this
+image needs no elevated privilege" stays a property CLAUDE.md's own
+Definition of Done can rely on. `chaos-harness` cannot make that claim: it
+holds `/var/run/docker.sock`, which is root-equivalent access to the host by
+construction, regardless of which uid the process inside the container
+reports. Giving it the same non-root `USER` as everything else would not
+make it safe, it would make it broken (permission denied against the
+socket) in a way that looks like a security posture and is not one. A
+second, visibly different Dockerfile makes the divergence the point rather
+than a thing to notice only by diffing two otherwise-identical files.
+
+**The chaos test drives an already-running stack; it does not orchestrate
+one.** `TestChaos_InvariantHoldsUnderRandomFaults` is unlike every other
+test in this suite in one specific way: it does not use Testcontainers.
+It cannot — `cmd/chaos-harness` pauses and unpauses containers *by name*
+over the Docker Engine API, which only means something against a stack
+`docker compose` actually started, not one Testcontainers spun up in
+isolation for this one test. The alternative — teaching
+`testcontainers-go`'s `compose` module to drive the entire real
+`docker-compose.yml` (Postgres, Redpanda, Kafka Connect, every service, the
+chaos harness itself) from inside Go, fully automated — was considered and
+rejected as disproportionate: real value at a small fraction of the
+complexity is what a `t.Skip` with a clear message and a `make chaos-up` /
+`make chaos-test` pair buys instead, and the trade is recorded here rather
+than discovered later as an unexplained gap. Reused directly rather than
+reimplemented: `newAccount`, `newTypedAccount`, `assertGlobalInvariant` and
+`internal/consistency`'s own checks, all of which already take a
+`*pgxpool.Pool` as a parameter rather than reaching for the test suite's
+`sharedPool` — the one design choice in the existing test helpers that made
+pointing them at a different, real database (`localhost:5432`, the chaos
+stack's own host-mapped port) a parameter change rather than a rewrite.
+
+**The load generator tolerates failure on purpose, and asserts something
+narrower and stronger instead.** The test does not assert most transfers
+succeed — some are SUPPOSED to fail while a fault is active, and asserting
+otherwise would just be asserting the faults do nothing. What it asserts is
+that after forty seconds of real faults fired at random against real load,
+`assertGlobalInvariant` and `internal/consistency.CheckGlobalInvariant`/
+`CheckOrphans` are still true. That is the one claim this whole phase is
+built to make defensible under pressure, and it is the only one this test
+makes.
+
+**A real defect surfaced only by actually running the full suite again
+after this entry's own new test was added — recorded per D35's own
+precedent.** `TestIdempotency_ClockSkewCausesReadPathToTreatALiveRecordAsExpired`
+posts one real transaction and, unlike every other test that touches Kafka,
+runs no publisher against it. Its outbox rows sat unpublished when the test
+ended, and `TestOutboxPublish_KafkaOutage` — whose polling publisher drains
+the *entire* shared `outbox` table by design, not merely the rows its own
+test created — swept them up during its own pre-outage drain and inflated
+its before/after delta by exactly one transfer's worth (three rows: one
+`TransactionPosted`, two `BalanceUpdated`), failing an assertion about a
+code path this entry never touched. Not a race and not flaky: fully
+deterministic, reproduced identically across three separate runs, because
+Go orders test files alphabetically and `idempotency_test.go` precedes
+`outbox_publish_test.go`. Fixed by having the offending test delete its own
+unpublished rows in `t.Cleanup` rather than leave them for the next
+publisher-running test to trip over — the correct owner of the fix, since
+the alternative (loosening `TestOutboxPublish_KafkaOutage`'s own assertion)
+would have weakened a real zero-loss guarantee to work around a different
+test's mess rather than cleaning up the mess.

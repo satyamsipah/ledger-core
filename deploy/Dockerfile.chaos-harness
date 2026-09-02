@@ -1,0 +1,43 @@
+# A DELIBERATELY SEPARATE Dockerfile from deploy/Dockerfile, which every real
+# service shares specifically so they cannot drift apart in base image or
+# build flags. chaos-harness is not a real service: it needs the Docker
+# socket, which is a root-equivalent capability on whatever host owns it, and
+# giving it the same unprivileged, non-root USER every other image runs as
+# would just mean it fails to connect to that socket rather than meaning it
+# is safe. Sharing this Dockerfile with the real services would either force
+# every one of them to run as root to keep the file identical, or force this
+# one to silently diverge inside a shared file where the divergence is easy
+# to miss. A second, short, obviously-different Dockerfile makes the
+# divergence the whole point instead of a surprise.
+#
+# Built and run ONLY under docker-compose.yml's "chaos" profile -- see that
+# file's chaos-harness service and docs/DECISIONS.md D51.
+FROM golang:1.25-alpine AS build
+
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+RUN CGO_ENABLED=0 GOOS=linux go build \
+        -trimpath \
+        -ldflags='-s -w' \
+        -o /out/chaos-harness \
+        ./cmd/chaos-harness
+
+FROM alpine:3.20
+
+RUN apk add --no-cache ca-certificates
+
+COPY --from=build /out/chaos-harness /usr/local/bin/chaos-harness
+
+# No USER directive: this process must read and write /var/run/docker.sock,
+# which on the overwhelming majority of Docker hosts is owned root:root or
+# root:docker with no access for an arbitrary unprivileged uid. Root here is
+# not an oversight, it is the honest acknowledgment of what this binary
+# already is by virtue of the socket it holds.
+EXPOSE 9199
+
+ENTRYPOINT ["/usr/local/bin/chaos-harness"]

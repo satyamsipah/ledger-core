@@ -1,0 +1,62 @@
+# Chaos-testing overlay. Never included by plain `docker compose up` /
+# `make up` -- only by explicitly naming this file alongside the base one:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.chaos.yml up -d
+#   (or: make chaos-up)
+#
+# Two things happen here that must never happen in the base stack: two
+# already-running services get LEDGER_FAULT_INJECTION_ENABLED flipped to
+# true, and a new service gets the Docker socket mounted into it. Compose
+# merges `environment:` maps key by key across -f files, so api and
+# saga-orchestrator keep every other setting the base file already gives
+# them; only the one flag named below changes.
+
+services:
+  api:
+    environment:
+      LEDGER_FAULT_INJECTION_ENABLED: "true"
+
+  saga-orchestrator:
+    environment:
+      LEDGER_FAULT_INJECTION_ENABLED: "true"
+
+  chaos-harness:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.chaos-harness
+    depends_on:
+      api:
+        condition: service_healthy
+      saga-orchestrator:
+        condition: service_healthy
+      mock-gateway:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      CHAOS_ADDR: ":9199"
+      CHAOS_POSTGRES_DSN: postgres://ledger:ledger@postgres:5432/ledger?sslmode=disable
+      # Matches the container_name pins on postgres and redpanda in the base
+      # compose file -- see those services' own comments for why the names
+      # are pinned at all.
+      CHAOS_POSTGRES_CONTAINER: ledger-postgres
+      CHAOS_REDPANDA_CONTAINER: ledger-redpanda
+      CHAOS_HOT_ACCOUNT_REF: platform-bank-inr
+      CHAOS_MOCK_GATEWAY_URL: http://mock-gateway:8090
+      CHAOS_API_ADMIN_URL: http://api:9090
+      CHAOS_SAGA_ORCHESTRATOR_URL: http://saga-orchestrator:9094
+    volumes:
+      # The Docker socket. This is the one line in this entire repository
+      # that grants root-equivalent access to the host -- see
+      # deploy/Dockerfile.chaos-harness's own comment on why this service
+      # runs as root at all, and why it lives in this overlay rather than
+      # the base compose file where every other service does not.
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "9199:9199"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9199/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s

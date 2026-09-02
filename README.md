@@ -796,6 +796,50 @@ lives in the service layer rather than the HTTP handler, and why testing the
 trace-propagation mechanism needed a real span recorder installed as the
 process-global provider for one non-parallel test.
 
+## Fault injection and chaos testing
+
+`cmd/chaos-harness` injects the six faults a production ledger actually
+needs to survive — DB connection failure, Kafka unavailability, a slow
+query, gateway timeout, gateway 500, clock skew — against a real running
+stack. Every one is a real mechanism, never a boolean an orchestrator checks
+internally: `docker pause`/`unpause` for the first two (the same mechanism
+`docs/DECISIONS.md` D36 already validated), a real held row lock for the
+third, `mock-gateway`'s own `/control/behaviour` (D45) for the two gateway
+faults, and a genuine, narrowly-scoped clock override
+(`internal/http.HandleClockSkew`) for the last — see D51 for why clock skew
+turned out to have exactly two legitimate targets in this codebase and not
+the ones an obvious design would have picked.
+
+Off by default. Nothing above runs, and nothing in the default stack even
+exposes the surface to run it, unless you explicitly opt in:
+
+```bash
+make chaos-up      # docker-compose.yml + docker-compose.chaos.yml
+make chaos-fault FAULT=slow-query BODY='{"duration_seconds":10}'
+make chaos-test    # runs the automated chaos test against the running stack
+make chaos-down
+```
+
+`make chaos-up` layers `deploy/docker-compose.chaos.yml` on top of the
+normal stack: it flips `LEDGER_FAULT_INJECTION_ENABLED` to `true` on `api`
+and `saga-orchestrator` only, and starts `chaos-harness` — built from its
+own `deploy/Dockerfile.chaos-harness`, which runs as root because it holds
+`/var/run/docker.sock`, a capability no other image in this repo has or
+needs.
+
+`TestChaos_InvariantHoldsUnderRandomFaults` (`test/chaos_test.go`) posts
+real transfers against the real API while firing random faults for forty
+seconds, tolerating individual request failures — a fault is doing its job
+when some of those fail — and asserting only the one thing that must never
+be false regardless: the global invariant, checked both the way every
+write-path test in this suite already does
+(`assertGlobalInvariant`) and via `internal/consistency`'s own checks. It
+skips itself with an explanation, rather than failing confusingly, when
+`LEDGER_CHAOS_HARNESS_URL`/`LEDGER_CHAOS_API_URL` are not set — it drives an
+already-running `docker compose` stack rather than Testcontainers, because
+`chaos-harness` pauses containers by name and that only means something
+against a stack that is actually running.
+
 ## Tests
 
 No mocks for database behaviour — every test runs against real PostgreSQL via

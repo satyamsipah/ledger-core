@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/satyamsipah/ledger-core/internal/clock"
 	"github.com/satyamsipah/ledger-core/internal/observability"
 )
 
@@ -212,7 +213,12 @@ func (m *Manager) resolveExisting(ctx context.Context, existing *Record, r Reser
 		return nil, Proceed, err
 	}
 
-	now := time.Now()
+	// clock.Now(), not time.Now(): this is a direct comparison against
+	// expires_at, which PostgreSQL computed with ITS OWN clock. It is exactly
+	// the cross-process clock dependency internal/clock's own doc comment
+	// names, and the one place a skewed API process clock could genuinely
+	// treat a still-valid replay record as prematurely expired.
+	now := clock.Now()
 
 	// Expiry is checked after the fingerprint and before the status, because an
 	// expired record's stored response is gone even though its key is not: the

@@ -140,6 +140,13 @@ func run() error {
 	// through whatever fronts the public API.
 	metricsMux := nethttp.NewServeMux()
 	metricsMux.Handle("/metrics", metrics.Handler())
+	if cfg.FaultInjectionEnabled {
+		// Admin listener only, never the public one -- see
+		// ledgerhttp.HandleClockSkew's own doc comment for why this is not
+		// wired through Deps/NewMux like every other route.
+		metricsMux.Handle("/internal/faults/clock-skew", ledgerhttp.HandleClockSkew())
+		logger.Warn("fault injection enabled: /internal/faults/clock-skew is live on the admin listener")
+	}
 	metricsCfg := cfg.HTTP
 	metricsCfg.Addr = cfg.Observability.MetricsAddr
 	metricsServer := ledgerhttp.NewServer("metrics", metricsCfg, metricsMux, logger)

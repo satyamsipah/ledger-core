@@ -1,0 +1,46 @@
+{{- if .Values.migration.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "ledger-core.fullname" . }}-migrate
+  labels:
+    {{- include "ledger-core.labels" . | nindent 4 }}
+  annotations:
+    # weight "0": runs before kafka-init's "1" and before every Deployment
+    # (hooks run before the main install/upgrade proceeds at all). A Job
+    # name is not unique across "helm upgrade" runs by default, so
+    # hook-delete-policy removes the previous run's Job before creating
+    # this one rather than erroring on a name collision, and also cleans
+    # up after a successful run rather than leaving completed Jobs to
+    # accumulate release over release.
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ .Values.migration.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.migration.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "ledger-core.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: migrate
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ include "ledger-core.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: migrate
+          image: {{ include "ledger-core.image" (dict "root" $ "svcName" "migrate") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "ledger-core.fullname" . }}-config
+            - secretRef:
+                name: {{ include "ledger-core.fullname" . }}-secret
+          env:
+            - name: LEDGER_SERVICE
+              value: migrate
+{{- end }}

@@ -1,0 +1,30 @@
+{{- range $svcName, $svc := .Values.services }}
+{{- if $svc.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ledger-core.fullname" $ }}-{{ $svcName }}
+  labels:
+    {{- include "ledger-core.serviceSelectorLabels" (dict "root" $ "svcName" $svcName) | nindent 4 }}
+spec:
+  # ClusterIP only. Nothing here is meant to be reached from outside the
+  # cluster directly -- an Ingress in front of the api Service is a real
+  # cluster's own choice (host, TLS, WAF) and deliberately not something
+  # this chart decides for it.
+  type: ClusterIP
+  selector:
+    {{- include "ledger-core.serviceSelectorLabels" (dict "root" $ "svcName" $svcName) | nindent 4 }}
+  ports:
+    {{- if $svc.exposeMainPort }}
+    - name: http
+      port: {{ $svc.port }}
+      targetPort: http
+      protocol: TCP
+    {{- end }}
+    - name: metrics
+      port: {{ $svc.metricsPort }}
+      targetPort: metrics
+      protocol: TCP
+---
+{{- end }}
+{{- end }}

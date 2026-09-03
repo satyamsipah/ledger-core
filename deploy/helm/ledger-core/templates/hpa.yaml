@@ -1,0 +1,34 @@
+{{- range $svcName, $svc := .Values.services }}
+{{- if and $svc.enabled $svc.hpa.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "ledger-core.fullname" $ }}-{{ $svcName }}
+  labels:
+    {{- include "ledger-core.serviceSelectorLabels" (dict "root" $ "svcName" $svcName) | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "ledger-core.fullname" $ }}-{{ $svcName }}
+  minReplicas: {{ $svc.hpa.minReplicas }}
+  maxReplicas: {{ $svc.hpa.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ $svc.hpa.targetCPUUtilizationPercentage }}
+  behavior:
+    # Scale up promptly -- a payments API under real load should not wait
+    # to add capacity -- but scale down cautiously: a five-minute
+    # stabilization window is what keeps a brief dip from flapping
+    # replicas back down and then immediately back up again.
+    scaleDown:
+      stabilizationWindowSeconds: 300
+    scaleUp:
+      stabilizationWindowSeconds: 0
+---
+{{- end }}
+{{- end }}

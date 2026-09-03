@@ -1,0 +1,20 @@
+apiVersion: v2
+name: ledger-core
+description: >-
+  Ledger-Core's stateless application services (api, outbox-publisher,
+  projector, saga-orchestrator, reconciler) on Kubernetes. Does not deploy
+  Postgres, Kafka, Prometheus or Grafana -- those are either managed
+  services or a separate operator/chart in a real cluster; see
+  deploy/helm/ledger-core/README.md.
+type: application
+version: 0.1.0
+# The chart's own version, bumped independently of appVersion -- a template
+# fix (a probe path, a resource default) is a chart change with no new
+# image anywhere, and conflating the two would make `helm history` lie
+# about which one actually happened.
+appVersion: "0.4.0"
+home: https://github.com/satyamsipah/ledger-core
+sources:
+  - https://github.com/satyamsipah/ledger-core
+maintainers:
+  - name: Satyam Maddheshiya

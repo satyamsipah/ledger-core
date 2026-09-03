@@ -33,6 +33,7 @@ import (
 	"github.com/satyamsipah/ledger-core/internal/config"
 	"github.com/satyamsipah/ledger-core/internal/db"
 	ledgerhttp "github.com/satyamsipah/ledger-core/internal/http"
+	"github.com/satyamsipah/ledger-core/internal/kafka"
 	"github.com/satyamsipah/ledger-core/internal/observability"
 	"github.com/satyamsipah/ledger-core/internal/projector"
 )
@@ -169,7 +170,7 @@ func run() error {
 		Service:  serviceName,
 		Logger:   logger,
 		Metrics:  metrics,
-		Checkers: []ledgerhttp.Checker{pool},
+		Checkers: []ledgerhttp.Checker{pool, kafka.NewChecker(consumer.Client())},
 	}))
 
 	adminCfg := cfg.HTTP

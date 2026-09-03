@@ -1,0 +1,107 @@
+{{- range $svcName, $svc := .Values.services }}
+{{- if $svc.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ledger-core.fullname" $ }}-{{ $svcName }}
+  labels:
+    {{- include "ledger-core.serviceSelectorLabels" (dict "root" $ "svcName" $svcName) | nindent 4 }}
+spec:
+  # No replicas field when HPA owns this service: Helm would otherwise
+  # reset it to $svc.replicas on every `helm upgrade`, fighting the
+  # autoscaler's own decision and undoing whatever load actually put it
+  # at at that moment.
+  {{- if not $svc.hpa.enabled }}
+  replicas: {{ $svc.replicas }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "ledger-core.serviceSelectorLabels" (dict "root" $ "svcName" $svcName) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "ledger-core.serviceSelectorLabels" (dict "root" $ "svcName" $svcName) | nindent 8 }}
+      annotations:
+        # Forces a rollout when only the ConfigMap/Secret content changes
+        # and the image tag does not -- otherwise `helm upgrade` after a
+        # config-only values change reports success while every existing
+        # pod keeps running with the environment it started with.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") $ | sha256sum }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") $ | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "ledger-core.serviceAccountName" $ }}
+      securityContext:
+        {{- toYaml $.Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ $svcName }}
+          image: {{ include "ledger-core.image" (dict "root" $ "svcName" $svcName) }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml $.Values.containerSecurityContext | nindent 12 }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "ledger-core.fullname" $ }}-config
+            - secretRef:
+                name: {{ include "ledger-core.fullname" $ }}-secret
+          env:
+            - name: LEDGER_SERVICE
+              value: {{ $svcName | quote }}
+            {{- if $svc.exposeMainPort }}
+            - name: LEDGER_HTTP_ADDR
+              value: {{ printf ":%d" ($svc.port | int) | quote }}
+            {{- end }}
+            - name: LEDGER_METRICS_ADDR
+              value: {{ printf ":%d" ($svc.metricsPort | int) | quote }}
+            {{- range $key, $value := $svc.extraEnv }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+          ports:
+            {{- if $svc.exposeMainPort }}
+            - name: http
+              containerPort: {{ $svc.port }}
+              protocol: TCP
+            {{- end }}
+            - name: metrics
+              containerPort: {{ $svc.metricsPort }}
+              protocol: TCP
+          # /readyz -- not /healthz -- checks the dependencies this
+          # service actually holds a connection to: Postgres always
+          # (internal/db.Pool), and Kafka too for outbox-publisher and
+          # projector specifically, the two services that hold a live
+          # *kgo.Client (internal/kafka.Checker). api, saga-orchestrator
+          # and reconciler check Postgres only, honestly, because they
+          # structurally do not hold a Kafka client to check -- see
+          # docs/ARCHITECTURE.md for which service talks to what.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: {{ $svc.healthPort }}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # /healthz checks nothing but "is this process still answering
+          # HTTP at all" -- deliberately: a liveness probe that restarts
+          # a pod because a dependency is unreachable turns one slow
+          # dependency into a restart storm across every replica. See
+          # api/openapi.yaml's own description of /healthz.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ $svc.healthPort }}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            {{- toYaml $svc.resources | nindent 12 }}
+      # Kubernetes' own default (30s) is what every worker here is
+      # written to tolerate: context.Context threaded everywhere means an
+      # in-flight request/consume loop observes cancellation and can
+      # finish its current unit of work rather than being killed mid
+      # database transaction.
+      terminationGracePeriodSeconds: 30
+---
+{{- end }}
+{{- end }}

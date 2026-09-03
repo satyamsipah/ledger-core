@@ -1,0 +1,1066 @@
+# GENERATED FILE -- DO NOT HAND-EDIT.
+#
+# This is `helm template`'s own output, checked in as a static,
+# kubectl-apply-able reference for anyone without Helm installed, or who
+# wants to read what the chart actually produces without running it. The
+# Helm chart at deploy/helm/ledger-core/ is the source of truth; this file
+# is downstream of it, never the other way around -- editing this file
+# directly would only be undone the next time it is regenerated, and would
+# risk this file quietly disagreeing with the chart it claims to represent
+# in the meantime.
+#
+# Regenerate after any change to deploy/helm/ledger-core/ with:
+#
+#   helm template ledger-core deploy/helm/ledger-core \
+#     --set image.tag="REPLACE_WITH_RELEASE_TAG" \
+#     --set postgres.dsn="postgres://REPLACE_ME:REPLACE_ME@REPLACE_ME:5432/ledger?sslmode=require" \
+#     --set kafka.brokers="REPLACE_WITH_KAFKA_BROKERS" \
+#     --set gateway.url="https://REPLACE_WITH_REAL_GATEWAY" \
+#     > deploy/k8s/ledger-core.yaml
+#
+# The REPLACE_* values below are placeholders, not real configuration --
+# this file will deploy nothing until every one of them is replaced with
+# real values, the same way the Helm chart's own `required` template
+# functions refuse to render at all without them. See
+# deploy/helm/ledger-core/README.md for what each one is and where it
+# comes from.
+#
+# What this does NOT include: Postgres, Kafka, Prometheus or Grafana --
+# see deploy/helm/ledger-core/README.md for why this chart deploys only
+# the five stateless application services.
+#
+# Verified against the real Kubernetes API schema with kubeconform
+# (`kubeconform -strict -summary`) before being committed: 22/22 resources
+# valid. Verifying this file's validity again after regenerating it is one
+# command and costs nothing.
+
+---
+# Source: ledger-core/templates/pdb.yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ledger-core-api
+  labels:
+    app.kubernetes.io/name: ledger-core
+    app.kubernetes.io/instance: ledger-core
+    app.kubernetes.io/component: api
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ledger-core
+      app.kubernetes.io/instance: ledger-core
+      app.kubernetes.io/component: api
+
+---
+# Source: ledger-core/templates/pdb.yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ledger-core-outbox-publisher
+  labels:
+    app.kubernetes.io/name: ledger-core
+    app.kubernetes.io/instance: ledger-core
+    app.kubernetes.io/component: outbox-publisher
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ledger-core
+      app.kubernetes.io/instance: ledger-core
+      app.kubernetes.io/component: outbox-publisher
+
+---
+# Source: ledger-core/templates/pdb.yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ledger-core-projector
+  labels:
+    app.kubernetes.io/name: ledger-core
+    app.kubernetes.io/instance: ledger-core
+    app.kubernetes.io/component: projector
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ledger-core
+      app.kubernetes.io/instance: ledger-core
+      app.kubernetes.io/component: projector
+
+---
+# Source: ledger-core/templates/pdb.yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ledger-core-reconciler
+  labels:
+    app.kubernetes.io/name: ledger-core
+    app.kubernetes.io/instance: ledger-core
+    app.kubernetes.io/component: reconciler
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ledger-core
+      app.kubernetes.io/instance: ledger-core
+      app.kubernetes.io/component: reconciler
+
+---
+# Source: ledger-core/templates/pdb.yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ledger-core-saga-orchestrator
+  labels:
+    app.kubernetes.io/name: ledger-core
+    app.kubernetes.io/instance: ledger-core
+    app.kubernetes.io/component: saga-orchestrator
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ledger-core
+      app.kubernetes.io/instance: ledger-core
+      app.kubernetes.io/component: saga-orchestrator
+
+---
+# Source: ledger-core/templates/serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ledger-core
+  labels:
+    helm.sh/chart: ledger-core-0.1.0
+    app.kubernetes.io/name: ledger-core
+    app.kubernetes.io/instance: ledger-core
+    app.kubernetes.io/version: "0.4.0"
+    app.kubernetes.io/managed-by: Helm
+
+---
+# Source: ledger-core/templates/secret.yaml
+# Templated from Values so `helm install -f secrets.values.yaml` (a file
+# kept out of version control) or `--set postgres.dsn=...` from a CI
+# secret store both work -- this template itself contains no secret
+# material, only the keys. `required` on each makes a missing value a
+# failed `helm install`/`upgrade`, never a Secret silently created with an
+# empty string a Deployment would then start against.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ledger-core-secret
+  labels:
+    helm.sh/chart: ledger-core-0.1.0
+    app.kubernetes.io/name: ledger-core
+    app.kubernetes.io/instance: ledger-core
+    app.kubernetes.io/version: "0.4.0"
+    app.kubernetes.io/managed-by: Helm
+type: Opaque
+stringData:
+  LEDGER_POSTGRES_DSN: "postgres://REPLACE_ME:REPLACE_ME@REPLACE_ME:5432/ledger?sslmode=require"
+  # A gateway URL can carry embedded credentials in its query string
+  # depending on the provider, so this lives in the Secret rather than the
+  # ConfigMap even though a bare hostname would not need to.
+  LEDGER_GATEWAY_URL: "https://REPLACE_WITH_REAL_GATEWAY"
+
+---
+# Source: ledger-core/templates/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ledger-core-config
+  labels:
+    helm.sh/chart: ledger-core-0.1.0
+    app.kubernetes.io/name: ledger-core
+    app.kubernetes.io/instance: ledger-core
+    app.kubernetes.io/version: "0.4.0"
+    app.kubernetes.io/managed-by: Helm
+data:
+  LEDGER_ENV: "production"
+  LEDGER_LOG_LEVEL: "info"
+  LEDGER_KAFKA_BROKERS: "REPLACE_WITH_KAFKA_BROKERS"
+  LEDGER_POSTGRES_MAX_CONNS: "20"
+  LEDGER_POSTGRES_MIN_CONNS: "2"
+  LEDGER_RECONCILER_PSP_CSV_PATH: ""
+  # Every process here already refuses to enable it without also setting
+  # this explicitly true, but stating the default here -- rather than
+  # simply omitting the key -- is what makes a chart diff show exactly
+  # what a values override to "true" is turning ON, the same reasoning
+  # deploy/docker-compose.yml's own comment gives for restating it.
+  LEDGER_FAULT_INJECTION_ENABLED: "false"
+
+---
+# Source: ledger-core/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: ledger-core-api
+  labels:
+    app.kubernetes.io/name: ledger-core
+    app.kubernetes.io/instance: ledger-core
+    app.kubernetes.io/component: api
+spec:
+  # ClusterIP only. Nothing here is meant to be reached from outside the
+  # cluster directly -- an Ingress in front of the api Service is a real
+  # cluster's own choice (host, TLS, WAF) and deliberately not something
+  # this chart decides for it.
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ledger-core
+    app.kubernetes.io/instance: ledger-core
+    app.kubernetes.io/component: api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+      protocol: TCP
+
+---
+# Source: ledger-core/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: ledger-core-outbox-publisher
+  labels:
+    app.kubernetes.io/name: ledger-core
+    app.kubernetes.io/instance: ledger-core
+    app.kubernetes.io/component: outbox-publisher
+spec:
+  # ClusterIP only. Nothing here is meant to be reached from outside the
+  # cluster directly -- an Ingress in front of the api Service is a real
+  # cluster's own choice (host, TLS, WAF) and deliberately not something
+  # this chart decides for it.
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ledger-core
+    app.kubernetes.io/instance: ledger-core
+    app.kubernetes.io/component: outbox-publisher
+  ports:
+    - name: metrics
+      port: 9091
+      targetPort: metrics
+      protocol: TCP
+
+---
+# Source: ledger-core/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: ledger-core-projector
+  labels:
+    app.kubernetes.io/name: ledger-core
+    app.kubernetes.io/instance: ledger-core
+    app.kubernetes.io/component: projector
+spec:
+  # ClusterIP only. Nothing here is meant to be reached from outside the
+  # cluster directly -- an Ingress in front of the api Service is a real
+  # cluster's own choice (host, TLS, WAF) and deliberately not something
+  # this chart decides for it.
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ledger-core
+    app.kubernetes.io/instance: ledger-core
+    app.kubernetes.io/component: projector
+  ports:
+    - name: metrics
+      port: 9093
+      targetPort: metrics
+      protocol: TCP
+
+---
+# Source: ledger-core/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: ledger-core-reconciler
+  labels:
+    app.kubernetes.io/name: ledger-core
+    app.kubernetes.io/instance: ledger-core
+    app.kubernetes.io/component: reconciler
+spec:
+  # ClusterIP only. Nothing here is meant to be reached from outside the
+  # cluster directly -- an Ingress in front of the api Service is a real
+  # cluster's own choice (host, TLS, WAF) and deliberately not something
+  # this chart decides for it.
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ledger-core
+    app.kubernetes.io/instance: ledger-core
+    app.kubernetes.io/component: reconciler
+  ports:
+    - name: metrics
+      port: 9095
+      targetPort: metrics
+      protocol: TCP
+
+---
+# Source: ledger-core/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: ledger-core-saga-orchestrator
+  labels:
+    app.kubernetes.io/name: ledger-core
+    app.kubernetes.io/instance: ledger-core
+    app.kubernetes.io/component: saga-orchestrator
+spec:
+  # ClusterIP only. Nothing here is meant to be reached from outside the
+  # cluster directly -- an Ingress in front of the api Service is a real
+  # cluster's own choice (host, TLS, WAF) and deliberately not something
+  # this chart decides for it.
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ledger-core
+    app.kubernetes.io/instance: ledger-core
+    app.kubernetes.io/component: saga-orchestrator
+  ports:
+    - name: metrics
+      port: 9094
+      targetPort: metrics
+      protocol: TCP
+
+---
+# Source: ledger-core/templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ledger-core-api
+  labels:
+    app.kubernetes.io/name: ledger-core
+    app.kubernetes.io/instance: ledger-core
+    app.kubernetes.io/component: api
+spec:
+  # No replicas field when HPA owns this service: Helm would otherwise
+  # reset it to $svc.replicas on every `helm upgrade`, fighting the
+  # autoscaler's own decision and undoing whatever load actually put it
+  # at at that moment.
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ledger-core
+      app.kubernetes.io/instance: ledger-core
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ledger-core
+        app.kubernetes.io/instance: ledger-core
+        app.kubernetes.io/component: api
+      annotations:
+        # Forces a rollout when only the ConfigMap/Secret content changes
+        # and the image tag does not -- otherwise `helm upgrade` after a
+        # config-only values change reports success while every existing
+        # pod keeps running with the environment it started with.
+        checksum/config: 695305fc56701863e3334dc069bf4e0584c45e375fb1ddab57c0aa1da9920b36
+        checksum/secret: 36f29e3af7cb8134a1826608b0814b279548b453185ce4dd221ac15ef0ee0e2a
+    spec:
+      serviceAccountName: ledger-core
+      securityContext:
+        fsGroup: 65532
+        runAsGroup: 65532
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: api
+          image: ghcr.io/satyamsipah/ledger-core-api:REPLACE_WITH_RELEASE_TAG
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          envFrom:
+            - configMapRef:
+                name: ledger-core-config
+            - secretRef:
+                name: ledger-core-secret
+          env:
+            - name: LEDGER_SERVICE
+              value: "api"
+            - name: LEDGER_HTTP_ADDR
+              value: ":8080"
+            - name: LEDGER_METRICS_ADDR
+              value: ":9090"
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          # /readyz -- not /healthz -- checks the dependencies this
+          # service actually holds a connection to: Postgres always
+          # (internal/db.Pool), and Kafka too for outbox-publisher and
+          # projector specifically, the two services that hold a live
+          # *kgo.Client (internal/kafka.Checker). api, saga-orchestrator
+          # and reconciler check Postgres only, honestly, because they
+          # structurally do not hold a Kafka client to check -- see
+          # docs/ARCHITECTURE.md for which service talks to what.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # /healthz checks nothing but "is this process still answering
+          # HTTP at all" -- deliberately: a liveness probe that restarts
+          # a pod because a dependency is unreachable turns one slow
+          # dependency into a restart storm across every replica. See
+          # api/openapi.yaml's own description of /healthz.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            limits:
+              cpu: 500m
+              memory: 256Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+      # Kubernetes' own default (30s) is what every worker here is
+      # written to tolerate: context.Context threaded everywhere means an
+      # in-flight request/consume loop observes cancellation and can
+      # finish its current unit of work rather than being killed mid
+      # database transaction.
+      terminationGracePeriodSeconds: 30
+
+---
+# Source: ledger-core/templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ledger-core-outbox-publisher
+  labels:
+    app.kubernetes.io/name: ledger-core
+    app.kubernetes.io/instance: ledger-core
+    app.kubernetes.io/component: outbox-publisher
+spec:
+  # No replicas field when HPA owns this service: Helm would otherwise
+  # reset it to $svc.replicas on every `helm upgrade`, fighting the
+  # autoscaler's own decision and undoing whatever load actually put it
+  # at at that moment.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ledger-core
+      app.kubernetes.io/instance: ledger-core
+      app.kubernetes.io/component: outbox-publisher
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ledger-core
+        app.kubernetes.io/instance: ledger-core
+        app.kubernetes.io/component: outbox-publisher
+      annotations:
+        # Forces a rollout when only the ConfigMap/Secret content changes
+        # and the image tag does not -- otherwise `helm upgrade` after a
+        # config-only values change reports success while every existing
+        # pod keeps running with the environment it started with.
+        checksum/config: 695305fc56701863e3334dc069bf4e0584c45e375fb1ddab57c0aa1da9920b36
+        checksum/secret: 36f29e3af7cb8134a1826608b0814b279548b453185ce4dd221ac15ef0ee0e2a
+    spec:
+      serviceAccountName: ledger-core
+      securityContext:
+        fsGroup: 65532
+        runAsGroup: 65532
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: outbox-publisher
+          image: ghcr.io/satyamsipah/ledger-core-outbox-publisher:REPLACE_WITH_RELEASE_TAG
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          envFrom:
+            - configMapRef:
+                name: ledger-core-config
+            - secretRef:
+                name: ledger-core-secret
+          env:
+            - name: LEDGER_SERVICE
+              value: "outbox-publisher"
+            - name: LEDGER_METRICS_ADDR
+              value: ":9091"
+            - name: LEDGER_OUTBOX_PUBLISHER
+              value: "polling"
+          ports:
+            - name: metrics
+              containerPort: 9091
+              protocol: TCP
+          # /readyz -- not /healthz -- checks the dependencies this
+          # service actually holds a connection to: Postgres always
+          # (internal/db.Pool), and Kafka too for outbox-publisher and
+          # projector specifically, the two services that hold a live
+          # *kgo.Client (internal/kafka.Checker). api, saga-orchestrator
+          # and reconciler check Postgres only, honestly, because they
+          # structurally do not hold a Kafka client to check -- see
+          # docs/ARCHITECTURE.md for which service talks to what.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 9091
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # /healthz checks nothing but "is this process still answering
+          # HTTP at all" -- deliberately: a liveness probe that restarts
+          # a pod because a dependency is unreachable turns one slow
+          # dependency into a restart storm across every replica. See
+          # api/openapi.yaml's own description of /healthz.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9091
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            limits:
+              cpu: 250m
+              memory: 128Mi
+            requests:
+              cpu: 50m
+              memory: 64Mi
+      # Kubernetes' own default (30s) is what every worker here is
+      # written to tolerate: context.Context threaded everywhere means an
+      # in-flight request/consume loop observes cancellation and can
+      # finish its current unit of work rather than being killed mid
+      # database transaction.
+      terminationGracePeriodSeconds: 30
+
+---
+# Source: ledger-core/templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ledger-core-projector
+  labels:
+    app.kubernetes.io/name: ledger-core
+    app.kubernetes.io/instance: ledger-core
+    app.kubernetes.io/component: projector
+spec:
+  # No replicas field when HPA owns this service: Helm would otherwise
+  # reset it to $svc.replicas on every `helm upgrade`, fighting the
+  # autoscaler's own decision and undoing whatever load actually put it
+  # at at that moment.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ledger-core
+      app.kubernetes.io/instance: ledger-core
+      app.kubernetes.io/component: projector
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ledger-core
+        app.kubernetes.io/instance: ledger-core
+        app.kubernetes.io/component: projector
+      annotations:
+        # Forces a rollout when only the ConfigMap/Secret content changes
+        # and the image tag does not -- otherwise `helm upgrade` after a
+        # config-only values change reports success while every existing
+        # pod keeps running with the environment it started with.
+        checksum/config: 695305fc56701863e3334dc069bf4e0584c45e375fb1ddab57c0aa1da9920b36
+        checksum/secret: 36f29e3af7cb8134a1826608b0814b279548b453185ce4dd221ac15ef0ee0e2a
+    spec:
+      serviceAccountName: ledger-core
+      securityContext:
+        fsGroup: 65532
+        runAsGroup: 65532
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: projector
+          image: ghcr.io/satyamsipah/ledger-core-projector:REPLACE_WITH_RELEASE_TAG
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          envFrom:
+            - configMapRef:
+                name: ledger-core-config
+            - secretRef:
+                name: ledger-core-secret
+          env:
+            - name: LEDGER_SERVICE
+              value: "projector"
+            - name: LEDGER_METRICS_ADDR
+              value: ":9093"
+          ports:
+            - name: metrics
+              containerPort: 9093
+              protocol: TCP
+          # /readyz -- not /healthz -- checks the dependencies this
+          # service actually holds a connection to: Postgres always
+          # (internal/db.Pool), and Kafka too for outbox-publisher and
+          # projector specifically, the two services that hold a live
+          # *kgo.Client (internal/kafka.Checker). api, saga-orchestrator
+          # and reconciler check Postgres only, honestly, because they
+          # structurally do not hold a Kafka client to check -- see
+          # docs/ARCHITECTURE.md for which service talks to what.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 9093
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # /healthz checks nothing but "is this process still answering
+          # HTTP at all" -- deliberately: a liveness probe that restarts
+          # a pod because a dependency is unreachable turns one slow
+          # dependency into a restart storm across every replica. See
+          # api/openapi.yaml's own description of /healthz.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9093
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            limits:
+              cpu: 250m
+              memory: 128Mi
+            requests:
+              cpu: 50m
+              memory: 64Mi
+      # Kubernetes' own default (30s) is what every worker here is
+      # written to tolerate: context.Context threaded everywhere means an
+      # in-flight request/consume loop observes cancellation and can
+      # finish its current unit of work rather than being killed mid
+      # database transaction.
+      terminationGracePeriodSeconds: 30
+
+---
+# Source: ledger-core/templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ledger-core-reconciler
+  labels:
+    app.kubernetes.io/name: ledger-core
+    app.kubernetes.io/instance: ledger-core
+    app.kubernetes.io/component: reconciler
+spec:
+  # No replicas field when HPA owns this service: Helm would otherwise
+  # reset it to $svc.replicas on every `helm upgrade`, fighting the
+  # autoscaler's own decision and undoing whatever load actually put it
+  # at at that moment.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ledger-core
+      app.kubernetes.io/instance: ledger-core
+      app.kubernetes.io/component: reconciler
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ledger-core
+        app.kubernetes.io/instance: ledger-core
+        app.kubernetes.io/component: reconciler
+      annotations:
+        # Forces a rollout when only the ConfigMap/Secret content changes
+        # and the image tag does not -- otherwise `helm upgrade` after a
+        # config-only values change reports success while every existing
+        # pod keeps running with the environment it started with.
+        checksum/config: 695305fc56701863e3334dc069bf4e0584c45e375fb1ddab57c0aa1da9920b36
+        checksum/secret: 36f29e3af7cb8134a1826608b0814b279548b453185ce4dd221ac15ef0ee0e2a
+    spec:
+      serviceAccountName: ledger-core
+      securityContext:
+        fsGroup: 65532
+        runAsGroup: 65532
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: reconciler
+          image: ghcr.io/satyamsipah/ledger-core-reconciler:REPLACE_WITH_RELEASE_TAG
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          envFrom:
+            - configMapRef:
+                name: ledger-core-config
+            - secretRef:
+                name: ledger-core-secret
+          env:
+            - name: LEDGER_SERVICE
+              value: "reconciler"
+            - name: LEDGER_METRICS_ADDR
+              value: ":9095"
+          ports:
+            - name: metrics
+              containerPort: 9095
+              protocol: TCP
+          # /readyz -- not /healthz -- checks the dependencies this
+          # service actually holds a connection to: Postgres always
+          # (internal/db.Pool), and Kafka too for outbox-publisher and
+          # projector specifically, the two services that hold a live
+          # *kgo.Client (internal/kafka.Checker). api, saga-orchestrator
+          # and reconciler check Postgres only, honestly, because they
+          # structurally do not hold a Kafka client to check -- see
+          # docs/ARCHITECTURE.md for which service talks to what.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 9095
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # /healthz checks nothing but "is this process still answering
+          # HTTP at all" -- deliberately: a liveness probe that restarts
+          # a pod because a dependency is unreachable turns one slow
+          # dependency into a restart storm across every replica. See
+          # api/openapi.yaml's own description of /healthz.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9095
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            limits:
+              cpu: 250m
+              memory: 128Mi
+            requests:
+              cpu: 50m
+              memory: 64Mi
+      # Kubernetes' own default (30s) is what every worker here is
+      # written to tolerate: context.Context threaded everywhere means an
+      # in-flight request/consume loop observes cancellation and can
+      # finish its current unit of work rather than being killed mid
+      # database transaction.
+      terminationGracePeriodSeconds: 30
+
+---
+# Source: ledger-core/templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ledger-core-saga-orchestrator
+  labels:
+    app.kubernetes.io/name: ledger-core
+    app.kubernetes.io/instance: ledger-core
+    app.kubernetes.io/component: saga-orchestrator
+spec:
+  # No replicas field when HPA owns this service: Helm would otherwise
+  # reset it to $svc.replicas on every `helm upgrade`, fighting the
+  # autoscaler's own decision and undoing whatever load actually put it
+  # at at that moment.
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ledger-core
+      app.kubernetes.io/instance: ledger-core
+      app.kubernetes.io/component: saga-orchestrator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ledger-core
+        app.kubernetes.io/instance: ledger-core
+        app.kubernetes.io/component: saga-orchestrator
+      annotations:
+        # Forces a rollout when only the ConfigMap/Secret content changes
+        # and the image tag does not -- otherwise `helm upgrade` after a
+        # config-only values change reports success while every existing
+        # pod keeps running with the environment it started with.
+        checksum/config: 695305fc56701863e3334dc069bf4e0584c45e375fb1ddab57c0aa1da9920b36
+        checksum/secret: 36f29e3af7cb8134a1826608b0814b279548b453185ce4dd221ac15ef0ee0e2a
+    spec:
+      serviceAccountName: ledger-core
+      securityContext:
+        fsGroup: 65532
+        runAsGroup: 65532
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: saga-orchestrator
+          image: ghcr.io/satyamsipah/ledger-core-saga-orchestrator:REPLACE_WITH_RELEASE_TAG
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          envFrom:
+            - configMapRef:
+                name: ledger-core-config
+            - secretRef:
+                name: ledger-core-secret
+          env:
+            - name: LEDGER_SERVICE
+              value: "saga-orchestrator"
+            - name: LEDGER_METRICS_ADDR
+              value: ":9094"
+          ports:
+            - name: metrics
+              containerPort: 9094
+              protocol: TCP
+          # /readyz -- not /healthz -- checks the dependencies this
+          # service actually holds a connection to: Postgres always
+          # (internal/db.Pool), and Kafka too for outbox-publisher and
+          # projector specifically, the two services that hold a live
+          # *kgo.Client (internal/kafka.Checker). api, saga-orchestrator
+          # and reconciler check Postgres only, honestly, because they
+          # structurally do not hold a Kafka client to check -- see
+          # docs/ARCHITECTURE.md for which service talks to what.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 9094
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # /healthz checks nothing but "is this process still answering
+          # HTTP at all" -- deliberately: a liveness probe that restarts
+          # a pod because a dependency is unreachable turns one slow
+          # dependency into a restart storm across every replica. See
+          # api/openapi.yaml's own description of /healthz.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9094
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            limits:
+              cpu: 500m
+              memory: 256Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+      # Kubernetes' own default (30s) is what every worker here is
+      # written to tolerate: context.Context threaded everywhere means an
+      # in-flight request/consume loop observes cancellation and can
+      # finish its current unit of work rather than being killed mid
+      # database transaction.
+      terminationGracePeriodSeconds: 30
+
+---
+# Source: ledger-core/templates/hpa.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ledger-core-api
+  labels:
+    app.kubernetes.io/name: ledger-core
+    app.kubernetes.io/instance: ledger-core
+    app.kubernetes.io/component: api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ledger-core-api
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    # Scale up promptly -- a payments API under real load should not wait
+    # to add capacity -- but scale down cautiously: a five-minute
+    # stabilization window is what keeps a brief dip from flapping
+    # replicas back down and then immediately back up again.
+    scaleDown:
+      stabilizationWindowSeconds: 300
+    scaleUp:
+      stabilizationWindowSeconds: 0
+
+---
+# Source: ledger-core/templates/hpa.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ledger-core-saga-orchestrator
+  labels:
+    app.kubernetes.io/name: ledger-core
+    app.kubernetes.io/instance: ledger-core
+    app.kubernetes.io/component: saga-orchestrator
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ledger-core-saga-orchestrator
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    # Scale up promptly -- a payments API under real load should not wait
+    # to add capacity -- but scale down cautiously: a five-minute
+    # stabilization window is what keeps a brief dip from flapping
+    # replicas back down and then immediately back up again.
+    scaleDown:
+      stabilizationWindowSeconds: 300
+    scaleUp:
+      stabilizationWindowSeconds: 0
+---
+# Source: ledger-core/templates/kafka-init-job.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ledger-core-kafka-init
+  labels:
+    helm.sh/chart: ledger-core-0.1.0
+    app.kubernetes.io/name: ledger-core
+    app.kubernetes.io/instance: ledger-core
+    app.kubernetes.io/version: "0.4.0"
+    app.kubernetes.io/managed-by: Helm
+  annotations:
+    # weight "1": after migration's "0". Provisioning the topic layout
+    # does not depend on the schema, but running them concurrently buys
+    # nothing and two hook Jobs racing to be "the" pre-install step is a
+    # confusing failure to debug the one time one of them fails.
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "1"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 120
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ledger-core
+        app.kubernetes.io/instance: ledger-core
+        app.kubernetes.io/component: kafka-init
+    spec:
+      restartPolicy: Never
+      serviceAccountName: ledger-core
+      securityContext:
+        fsGroup: 65532
+        runAsGroup: 65532
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: kafka-init
+          image: ghcr.io/satyamsipah/ledger-core-kafka-init:REPLACE_WITH_RELEASE_TAG
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          envFrom:
+            - configMapRef:
+                name: ledger-core-config
+            - secretRef:
+                name: ledger-core-secret
+          env:
+            - name: LEDGER_SERVICE
+              value: kafka-init
+
+---
+# Source: ledger-core/templates/migration-job.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ledger-core-migrate
+  labels:
+    helm.sh/chart: ledger-core-0.1.0
+    app.kubernetes.io/name: ledger-core
+    app.kubernetes.io/instance: ledger-core
+    app.kubernetes.io/version: "0.4.0"
+    app.kubernetes.io/managed-by: Helm
+  annotations:
+    # weight "0": runs before kafka-init's "1" and before every Deployment
+    # (hooks run before the main install/upgrade proceeds at all). A Job
+    # name is not unique across "helm upgrade" runs by default, so
+    # hook-delete-policy removes the previous run's Job before creating
+    # this one rather than erroring on a name collision, and also cleans
+    # up after a successful run rather than leaving completed Jobs to
+    # accumulate release over release.
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ledger-core
+        app.kubernetes.io/instance: ledger-core
+        app.kubernetes.io/component: migrate
+    spec:
+      restartPolicy: Never
+      serviceAccountName: ledger-core
+      securityContext:
+        fsGroup: 65532
+        runAsGroup: 65532
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          image: ghcr.io/satyamsipah/ledger-core-migrate:REPLACE_WITH_RELEASE_TAG
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          envFrom:
+            - configMapRef:
+                name: ledger-core-config
+            - secretRef:
+                name: ledger-core-secret
+          env:
+            - name: LEDGER_SERVICE
+              value: migrate
+

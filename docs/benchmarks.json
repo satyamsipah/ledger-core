@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-03T07:17:35.149096+05:30",
+  "generated_at": "2026-09-03T07:57:38.440048+05:30",
   "environment": {
     "caveat": "Single-node local/dev environment (Docker Compose on one developer machine), not a production cluster. Absolute numbers describe this machine; do not quote them as production capacity.",
     "os": "darwin",
@@ -9,36 +9,36 @@
     "postgres_shared_buffers": "128MB",
     "postgres_max_connections": "100",
     "postgres_wal_level": "logical",
-    "pool_max_conns": "20 (internal/config default; not overridden)",
-    "pool_min_conns": "2 (internal/config default; not overridden)"
+    "pool_max_conns": "20",
+    "pool_min_conns": "2"
   },
   "scenarios": [
     {
       "name": "baseline_simple_transfer",
       "description": "Two fixed accounts, moderate steady-state rate. Every other scenario is read against this one.",
-      "started_at": "2026-09-03T07:08:32.949194+05:30",
-      "duration_seconds": 86.124719416,
+      "started_at": "2026-09-03T07:48:38.173861+05:30",
+      "duration_seconds": 85.957953333,
       "total_requests": 7249,
-      "throughput_rps": 85.28193957459877,
-      "p50_ms": 3.198,
-      "p95_ms": 8.549999999999992,
-      "p99_ms": 22.557159999999996,
+      "throughput_rps": 85.2803894856209,
+      "p50_ms": 3.382,
+      "p95_ms": 12.9874,
+      "p99_ms": 38.74868,
       "error_rate_percent": 0,
       "thresholds_passed": true,
       "serialization_retries": 0,
-      "outbox_lag_seconds_at_end": 41.093587,
+      "outbox_lag_seconds_at_end": 41.327785,
       "consumer_lag_at_end": 0,
       "api_resources": {
-        "CPUAvgPercent": 12.307857142857147,
-        "CPUMaxPercent": 23.16,
-        "MemAvgMB": 30.08261904761906,
-        "MemMaxMB": 32.66
+        "CPUAvgPercent": 12.891666666666662,
+        "CPUMaxPercent": 25.35,
+        "MemAvgMB": 30.536428571428576,
+        "MemMaxMB": 33.09
       },
       "postgres_resources": {
-        "CPUAvgPercent": 23.352142857142855,
-        "CPUMaxPercent": 61.43,
-        "MemAvgMB": 140.90380952380954,
-        "MemMaxMB": 170.6
+        "CPUAvgPercent": 27.92904761904762,
+        "CPUMaxPercent": 68.97,
+        "MemAvgMB": 140.59142857142857,
+        "MemMaxMB": 170.7
       },
       "correctness": {
         "global_invariant": {
@@ -65,29 +65,29 @@
     {
       "name": "hot_account",
       "description": "Same rate and shape as baseline_simple_transfer; 90% of traffic credits one account instead of spreading out, isolating row-lock contention's cost (D11).",
-      "started_at": "2026-09-03T07:10:11.186042+05:30",
-      "duration_seconds": 85.885204,
-      "total_requests": 7235,
-      "throughput_rps": 85.10105535659565,
-      "p50_ms": 3.385,
-      "p95_ms": 12.822699999999998,
-      "p99_ms": 319.9888599999995,
+      "started_at": "2026-09-03T07:50:16.228938+05:30",
+      "duration_seconds": 86.203642708,
+      "total_requests": 7249,
+      "throughput_rps": 85.28111185017225,
+      "p50_ms": 3.47,
+      "p95_ms": 18.67879999999999,
+      "p99_ms": 167.39287999999988,
       "error_rate_percent": 0,
       "thresholds_passed": true,
       "serialization_retries": 0,
-      "outbox_lag_seconds_at_end": 20.947334,
+      "outbox_lag_seconds_at_end": 19.966888,
       "consumer_lag_at_end": 0,
       "api_resources": {
-        "CPUAvgPercent": 14.375714285714283,
-        "CPUMaxPercent": 61.48,
-        "MemAvgMB": 33.73380952380952,
-        "MemMaxMB": 35.54
+        "CPUAvgPercent": 14.129285714285716,
+        "CPUMaxPercent": 30.4,
+        "MemAvgMB": 34.18595238095237,
+        "MemMaxMB": 36.52
       },
       "postgres_resources": {
-        "CPUAvgPercent": 28.84619047619048,
-        "CPUMaxPercent": 208.13,
-        "MemAvgMB": 211.96428571428572,
-        "MemMaxMB": 241.5
+        "CPUAvgPercent": 31.215476190476195,
+        "CPUMaxPercent": 110,
+        "MemAvgMB": 215.70238095238096,
+        "MemMaxMB": 242.9
       },
       "correctness": {
         "global_invariant": {
@@ -114,29 +114,29 @@
     {
       "name": "idempotent_retry_storm",
       "description": "30% of requests replay an exact earlier (key, body) pair from the same VU, exercising the idempotency read path (D20) instead of PostTransaction.",
-      "started_at": "2026-09-03T07:11:49.191627+05:30",
-      "duration_seconds": 85.878254041,
+      "started_at": "2026-09-03T07:51:54.583661+05:30",
+      "duration_seconds": 85.706162334,
       "total_requests": 7249,
-      "throughput_rps": 85.28016073939747,
-      "p50_ms": 3.348,
-      "p95_ms": 11.013199999999992,
-      "p99_ms": 94.98159999999997,
+      "throughput_rps": 85.28149009315905,
+      "p50_ms": 3.346,
+      "p95_ms": 10.866199999999992,
+      "p99_ms": 46.4214,
       "error_rate_percent": 0,
       "thresholds_passed": true,
       "serialization_retries": 0,
-      "outbox_lag_seconds_at_end": 1.141286,
+      "outbox_lag_seconds_at_end": 1.279635,
       "consumer_lag_at_end": 0,
       "api_resources": {
-        "CPUAvgPercent": 14.581904761904761,
-        "CPUMaxPercent": 70.28,
-        "MemAvgMB": 34.922142857142845,
-        "MemMaxMB": 36.6
+        "CPUAvgPercent": 11.968095238095234,
+        "CPUMaxPercent": 24.22,
+        "MemAvgMB": 27.906666666666666,
+        "MemMaxMB": 37.83
       },
       "postgres_resources": {
-        "CPUAvgPercent": 24.994285714285713,
-        "CPUMaxPercent": 163.64,
-        "MemAvgMB": 257.06428571428575,
-        "MemMaxMB": 273.9
+        "CPUAvgPercent": 23.659761904761904,
+        "CPUMaxPercent": 69.65,
+        "MemAvgMB": 259.3619047619048,
+        "MemMaxMB": 297.6
       },
       "correctness": {
         "global_invariant": {
@@ -163,29 +163,29 @@
     {
       "name": "saga_heavy",
       "description": "Full RESERVE/GATEWAY/SETTLE marketplace payouts against a gateway failing 5% of calls ambiguously; each iteration polls the saga to a settled state rather than trusting the 202.",
-      "started_at": "2026-09-03T07:13:27.210133+05:30",
-      "duration_seconds": 106.746772458,
-      "total_requests": 8092,
-      "throughput_rps": 76.4680268865816,
-      "p50_ms": 2.029,
-      "p95_ms": 7.265,
-      "p99_ms": 16.76063999999999,
+      "started_at": "2026-09-03T07:53:32.399652+05:30",
+      "duration_seconds": 105.249392667,
+      "total_requests": 8035,
+      "throughput_rps": 76.8044111483223,
+      "p50_ms": 1.829,
+      "p95_ms": 6.136299999999999,
+      "p99_ms": 12.570279999999984,
       "error_rate_percent": 0,
       "thresholds_passed": true,
       "serialization_retries": 0,
-      "outbox_lag_seconds_at_end": 2.222472,
+      "outbox_lag_seconds_at_end": 0.988586,
       "consumer_lag_at_end": 0,
       "api_resources": {
-        "CPUAvgPercent": 8.407884615384614,
-        "CPUMaxPercent": 35.82,
-        "MemAvgMB": 37.713653846153846,
-        "MemMaxMB": 40.09
+        "CPUAvgPercent": 7.022156862745098,
+        "CPUMaxPercent": 24.64,
+        "MemAvgMB": 22.929803921568624,
+        "MemMaxMB": 24.21
       },
       "postgres_resources": {
-        "CPUAvgPercent": 18.580576923076922,
-        "CPUMaxPercent": 47.52,
-        "MemAvgMB": 317.7692307692307,
-        "MemMaxMB": 336.9
+        "CPUAvgPercent": 17.91666666666667,
+        "CPUMaxPercent": 59.64,
+        "MemAvgMB": 315.4568627450981,
+        "MemMaxMB": 333.1
       },
       "correctness": {
         "global_invariant": {
@@ -212,29 +212,29 @@
     {
       "name": "mixed_realistic",
       "description": "A weighted concurrent blend of the other four scenarios (60% transfers, 20% hot-account, 15% idempotent retries, 5% payouts) via k6's own multi-scenario executor.",
-      "started_at": "2026-09-03T07:15:26.094582+05:30",
-      "duration_seconds": 116.507914125,
-      "total_requests": 10998,
-      "throughput_rps": 95.59940417875617,
-      "p50_ms": 3.524,
-      "p95_ms": 17.033199999999987,
-      "p99_ms": 194.7106399999999,
+      "started_at": "2026-09-03T07:55:29.836544+05:30",
+      "duration_seconds": 116.0562385,
+      "total_requests": 10507,
+      "throughput_rps": 91.33024187954457,
+      "p50_ms": 3.84,
+      "p95_ms": 29.521799999999928,
+      "p99_ms": 168.72624,
       "error_rate_percent": 0,
       "thresholds_passed": true,
       "serialization_retries": 0,
-      "outbox_lag_seconds_at_end": 20.157322,
+      "outbox_lag_seconds_at_end": 12.882201,
       "consumer_lag_at_end": 0,
       "api_resources": {
-        "CPUAvgPercent": 13.643859649122806,
-        "CPUMaxPercent": 73.76,
-        "MemAvgMB": 30.879649122807017,
-        "MemMaxMB": 40.95
+        "CPUAvgPercent": 13.646249999999998,
+        "CPUMaxPercent": 52.42,
+        "MemAvgMB": 25.283928571428564,
+        "MemMaxMB": 26.69
       },
       "postgres_resources": {
-        "CPUAvgPercent": 29.508070175438593,
-        "CPUMaxPercent": 180.52,
-        "MemAvgMB": 350.6771929824561,
-        "MemMaxMB": 355.2
+        "CPUAvgPercent": 31.218214285714282,
+        "CPUMaxPercent": 100.69,
+        "MemAvgMB": 352.26249999999976,
+        "MemMaxMB": 374.6
       },
       "correctness": {
         "global_invariant": {

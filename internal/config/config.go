@@ -164,6 +164,24 @@ type Postgres struct {
 	MaxConnIdleTime time.Duration
 	ConnectTimeout  time.Duration
 	QueryTimeout    time.Duration
+
+	// ReplicaDSN, when non-empty, points cmd/api's statement/temporal reads
+	// (internal/ledger/pgledger.WithReadReplica) at a streaming hot standby
+	// instead of this primary. Empty means "no replica" -- every read stays on
+	// the primary, exactly Phase 7's own behaviour before this option existed
+	// -- so a deployment that never sets this (every test, and any
+	// environment with no standby) is unaffected by its existence.
+	ReplicaDSN string
+
+	// QueryExecMode selects pgx's own statement-execution strategy: "cache_statement"
+	// (pgx's own default -- server-side prepared statements, cached per
+	// connection, one round trip per query after the first) or
+	// "simple_protocol" (no server-side preparation, client-side parameter
+	// interpolation). Exists to make Phase 7's optimisation-cycle comparison
+	// (docs/BENCHMARKS.md) a config change rather than a code change; the
+	// honest finding was that the default was already the answer -- see
+	// docs/DECISIONS.md's Phase 7 entry for the measured before/after.
+	QueryExecMode string
 }
 
 // Kafka configures broker connectivity. Locally these point at Redpanda, which
@@ -291,6 +309,8 @@ func Load(service string) (Config, error) {
 			MaxConnIdleTime: envDuration("POSTGRES_MAX_CONN_IDLE_TIME", 30*time.Minute, fail),
 			ConnectTimeout:  envDuration("POSTGRES_CONNECT_TIMEOUT", 5*time.Second, fail),
 			QueryTimeout:    envDuration("POSTGRES_QUERY_TIMEOUT", 3*time.Second, fail),
+			ReplicaDSN:      env("POSTGRES_REPLICA_DSN", ""),
+			QueryExecMode:   env("POSTGRES_QUERY_EXEC_MODE", "cache_statement"),
 		},
 		Ledger: Ledger{
 			AdvisoryLocks:    envBool("LEDGER_ADVISORY_LOCKS", false, fail),
@@ -357,6 +377,10 @@ func Load(service string) (Config, error) {
 	if cfg.Postgres.MinConns > cfg.Postgres.MaxConns {
 		fail("%sPOSTGRES_MIN_CONNS (%d) exceeds %sPOSTGRES_MAX_CONNS (%d)",
 			envPrefix, cfg.Postgres.MinConns, envPrefix, cfg.Postgres.MaxConns)
+	}
+	if cfg.Postgres.QueryExecMode != "cache_statement" && cfg.Postgres.QueryExecMode != "simple_protocol" {
+		fail(`%sPOSTGRES_QUERY_EXEC_MODE must be "cache_statement" or "simple_protocol", got %q`,
+			envPrefix, cfg.Postgres.QueryExecMode)
 	}
 	if cfg.Observability.TraceSampleRatio < 0 || cfg.Observability.TraceSampleRatio > 1 {
 		fail("%sTRACE_SAMPLE_RATIO must be between 0 and 1, got %v",

@@ -71,6 +71,31 @@ func run() error {
 
 	metrics := observability.NewMetrics(serviceName)
 
+	// readReplicaOpts is empty unless LEDGER_POSTGRES_REPLICA_DSN is set --
+	// see config.Postgres.ReplicaDSN's own doc comment for why an unset
+	// replica must leave every read on the primary rather than default to
+	// something that silently changes behaviour.
+	var readReplicaOpts []pgledger.Option
+	checkers := []ledgerhttp.Checker{pool}
+	if cfg.Postgres.ReplicaDSN != "" {
+		replicaCfg := cfg.Postgres
+		replicaCfg.DSN = cfg.Postgres.ReplicaDSN
+		replicaPool, err := db.NewPool(ctx, replicaCfg, logger)
+		if err != nil {
+			return fmt.Errorf("init postgres read replica: %w", err)
+		}
+		defer replicaPool.Close()
+
+		readReplicaOpts = append(readReplicaOpts, pgledger.WithReadReplica(replicaPool.Pool))
+		// Named distinctly from the primary's own db.Pool.Name() ("postgres"):
+		// /readyz keys its checks by name, and two checkers reporting the
+		// identical name would silently collide -- one overwriting the other
+		// in the response -- hiding exactly the "is the replica actually
+		// reachable" signal this checker exists to add.
+		checkers = append(checkers, namedChecker{name: "postgres-replica", Checker: replicaPool})
+		logger.Info("read replica configured for statement/balance-as-of queries")
+	}
+
 	// The retrier re-runs only 40001 and 40P01, the two aborts PostgreSQL
 	// guarantees rolled back nothing. Advisory locking is a process-wide switch
 	// rather than a per-request one, because a second lock space entered by only
@@ -79,8 +104,10 @@ func run() error {
 		cfg.Ledger.MaxTxAttempts, cfg.Ledger.RetryBaseBackoff, cfg.Ledger.RetryMaxBackoff)
 
 	repository := pgledger.New(pool.Pool, cfg.Postgres.QueryTimeout,
-		pgledger.WithRetrier(retrier),
-		pgledger.WithAdvisoryLocks(cfg.Ledger.AdvisoryLocks))
+		append([]pgledger.Option{
+			pgledger.WithRetrier(retrier),
+			pgledger.WithAdvisoryLocks(cfg.Ledger.AdvisoryLocks),
+		}, readReplicaOpts...)...)
 
 	ledgerService := ledger.NewService(repository, metrics)
 
@@ -124,7 +151,7 @@ func run() error {
 		Service:          serviceName,
 		Logger:           logger,
 		Metrics:          metrics,
-		Checkers:         []ledgerhttp.Checker{pool},
+		Checkers:         checkers,
 		Ledger:           ledgerService,
 		Idempotency:      idempotencyManager,
 		Payout:           payoutStarter,
@@ -167,3 +194,14 @@ func run() error {
 	logger.Info("stopped cleanly")
 	return nil
 }
+
+// namedChecker overrides a Checker's own Name(), so the primary pool and the
+// read replica pool -- both *db.Pool, both named "postgres" by that type's
+// own Name() method -- can coexist as two distinct entries in /readyz's
+// response instead of one silently overwriting the other.
+type namedChecker struct {
+	name string
+	ledgerhttp.Checker
+}
+
+func (n namedChecker) Name() string { return n.name }

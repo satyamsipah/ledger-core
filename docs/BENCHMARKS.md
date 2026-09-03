@@ -1,6 +1,6 @@
 # Load test benchmarks
 
-Generated 2026-09-03T07:17:35+05:30 by `make loadtest` (cmd/loadtest-harness). Reproduce with:
+Generated 2026-09-03T07:57:38+05:30 by `make loadtest` (cmd/loadtest-harness). Reproduce with:
 
 ```
 make loadtest
@@ -20,31 +20,31 @@ make loadtest
 | `shared_buffers` | 128MB |
 | `max_connections` | 100 |
 | `wal_level` | logical |
-| `LEDGER_POSTGRES_MAX_CONNS` (api) | 20 (internal/config default; not overridden) |
-| `LEDGER_POSTGRES_MIN_CONNS` (api) | 2 (internal/config default; not overridden) |
+| `LEDGER_POSTGRES_MAX_CONNS` (api) | 20 |
+| `LEDGER_POSTGRES_MIN_CONNS` (api) | 2 |
 
 ## Summary
 
 | Scenario | Requests | Throughput (req/s) | p50 (ms) | p95 (ms) | p99 (ms) | Error rate | Thresholds | Correctness |
 |---|---|---|---|---|---|---|---|---|
-| baseline_simple_transfer | 7249 | 85.3 | 3.20 | 8.55 | 22.56 | 0.000% | PASS | PASS |
-| hot_account | 7235 | 85.1 | 3.38 | 12.82 | 319.99 | 0.000% | PASS | PASS |
-| idempotent_retry_storm | 7249 | 85.3 | 3.35 | 11.01 | 94.98 | 0.000% | PASS | PASS |
-| saga_heavy | 8092 | 76.5 | 2.03 | 7.26 | 16.76 | 0.000% | PASS | PASS |
-| mixed_realistic | 10998 | 95.6 | 3.52 | 17.03 | 194.71 | 0.000% | PASS | PASS |
+| baseline_simple_transfer | 7249 | 85.3 | 3.38 | 12.99 | 38.75 | 0.000% | PASS | PASS |
+| hot_account | 7249 | 85.3 | 3.47 | 18.68 | 167.39 | 0.000% | PASS | PASS |
+| idempotent_retry_storm | 7249 | 85.3 | 3.35 | 10.87 | 46.42 | 0.000% | PASS | PASS |
+| saga_heavy | 8035 | 76.8 | 1.83 | 6.14 | 12.57 | 0.000% | PASS | PASS |
+| mixed_realistic | 10507 | 91.3 | 3.84 | 29.52 | 168.73 | 0.000% | PASS | PASS |
 
 ## baseline_simple_transfer
 
 Two fixed accounts, moderate steady-state rate. Every other scenario is read against this one.
 
-- Duration: 86.1s, 7249 requests, 85.3 req/s
-- Latency: p50=3.20ms p95=8.55ms p99=22.56ms
+- Duration: 86.0s, 7249 requests, 85.3 req/s
+- Latency: p50=3.38ms p95=12.99ms p99=38.75ms
 - Error rate: 0.000%
 - Serialization retries (`ledger_db_tx_retries_total` increase over the run): 0
-- Outbox lag at end of run: 41.09s (Debezium arm: replication-slot confirmation lag, bounded below by Kafka Connect's `offset.flush.interval.ms` -- not a queue depth; see cmd/loadtest-harness/prometheus.go's doc comment)
+- Outbox lag at end of run: 41.33s (Debezium arm: replication-slot confirmation lag, bounded below by Kafka Connect's `offset.flush.interval.ms` -- not a queue depth; see cmd/loadtest-harness/prometheus.go's doc comment)
 - Consumer lag at end of run: 0
-- `api` container: CPU avg 12.3% / max 23.2%, memory avg 30.1MB / max 32.7MB
-- `postgres` container: CPU avg 23.4% / max 61.4%, memory avg 140.9MB / max 170.6MB
+- `api` container: CPU avg 12.9% / max 25.4%, memory avg 30.5MB / max 33.1MB
+- `postgres` container: CPU avg 27.9% / max 69.0%, memory avg 140.6MB / max 170.7MB
 - Thresholds: PASS
 - Correctness-under-load proof (global invariant, projection drift, orphans, async-pipeline rebuild, all against this run's own data): PASS
 
@@ -52,14 +52,14 @@ Two fixed accounts, moderate steady-state rate. Every other scenario is read aga
 
 Same rate and shape as baseline_simple_transfer; 90% of traffic credits one account instead of spreading out, isolating row-lock contention's cost (D11).
 
-- Duration: 85.9s, 7235 requests, 85.1 req/s
-- Latency: p50=3.38ms p95=12.82ms p99=319.99ms
+- Duration: 86.2s, 7249 requests, 85.3 req/s
+- Latency: p50=3.47ms p95=18.68ms p99=167.39ms
 - Error rate: 0.000%
 - Serialization retries (`ledger_db_tx_retries_total` increase over the run): 0
-- Outbox lag at end of run: 20.95s (Debezium arm: replication-slot confirmation lag, bounded below by Kafka Connect's `offset.flush.interval.ms` -- not a queue depth; see cmd/loadtest-harness/prometheus.go's doc comment)
+- Outbox lag at end of run: 19.97s (Debezium arm: replication-slot confirmation lag, bounded below by Kafka Connect's `offset.flush.interval.ms` -- not a queue depth; see cmd/loadtest-harness/prometheus.go's doc comment)
 - Consumer lag at end of run: 0
-- `api` container: CPU avg 14.4% / max 61.5%, memory avg 33.7MB / max 35.5MB
-- `postgres` container: CPU avg 28.8% / max 208.1%, memory avg 212.0MB / max 241.5MB
+- `api` container: CPU avg 14.1% / max 30.4%, memory avg 34.2MB / max 36.5MB
+- `postgres` container: CPU avg 31.2% / max 110.0%, memory avg 215.7MB / max 242.9MB
 - Thresholds: PASS
 - Correctness-under-load proof (global invariant, projection drift, orphans, async-pipeline rebuild, all against this run's own data): PASS
 
@@ -67,14 +67,14 @@ Same rate and shape as baseline_simple_transfer; 90% of traffic credits one acco
 
 30% of requests replay an exact earlier (key, body) pair from the same VU, exercising the idempotency read path (D20) instead of PostTransaction.
 
-- Duration: 85.9s, 7249 requests, 85.3 req/s
-- Latency: p50=3.35ms p95=11.01ms p99=94.98ms
+- Duration: 85.7s, 7249 requests, 85.3 req/s
+- Latency: p50=3.35ms p95=10.87ms p99=46.42ms
 - Error rate: 0.000%
 - Serialization retries (`ledger_db_tx_retries_total` increase over the run): 0
-- Outbox lag at end of run: 1.14s (Debezium arm: replication-slot confirmation lag, bounded below by Kafka Connect's `offset.flush.interval.ms` -- not a queue depth; see cmd/loadtest-harness/prometheus.go's doc comment)
+- Outbox lag at end of run: 1.28s (Debezium arm: replication-slot confirmation lag, bounded below by Kafka Connect's `offset.flush.interval.ms` -- not a queue depth; see cmd/loadtest-harness/prometheus.go's doc comment)
 - Consumer lag at end of run: 0
-- `api` container: CPU avg 14.6% / max 70.3%, memory avg 34.9MB / max 36.6MB
-- `postgres` container: CPU avg 25.0% / max 163.6%, memory avg 257.1MB / max 273.9MB
+- `api` container: CPU avg 12.0% / max 24.2%, memory avg 27.9MB / max 37.8MB
+- `postgres` container: CPU avg 23.7% / max 69.7%, memory avg 259.4MB / max 297.6MB
 - Thresholds: PASS
 - Correctness-under-load proof (global invariant, projection drift, orphans, async-pipeline rebuild, all against this run's own data): PASS
 
@@ -82,14 +82,14 @@ Same rate and shape as baseline_simple_transfer; 90% of traffic credits one acco
 
 Full RESERVE/GATEWAY/SETTLE marketplace payouts against a gateway failing 5% of calls ambiguously; each iteration polls the saga to a settled state rather than trusting the 202.
 
-- Duration: 106.7s, 8092 requests, 76.5 req/s
-- Latency: p50=2.03ms p95=7.26ms p99=16.76ms
+- Duration: 105.2s, 8035 requests, 76.8 req/s
+- Latency: p50=1.83ms p95=6.14ms p99=12.57ms
 - Error rate: 0.000%
 - Serialization retries (`ledger_db_tx_retries_total` increase over the run): 0
-- Outbox lag at end of run: 2.22s (Debezium arm: replication-slot confirmation lag, bounded below by Kafka Connect's `offset.flush.interval.ms` -- not a queue depth; see cmd/loadtest-harness/prometheus.go's doc comment)
+- Outbox lag at end of run: 0.99s (Debezium arm: replication-slot confirmation lag, bounded below by Kafka Connect's `offset.flush.interval.ms` -- not a queue depth; see cmd/loadtest-harness/prometheus.go's doc comment)
 - Consumer lag at end of run: 0
-- `api` container: CPU avg 8.4% / max 35.8%, memory avg 37.7MB / max 40.1MB
-- `postgres` container: CPU avg 18.6% / max 47.5%, memory avg 317.8MB / max 336.9MB
+- `api` container: CPU avg 7.0% / max 24.6%, memory avg 22.9MB / max 24.2MB
+- `postgres` container: CPU avg 17.9% / max 59.6%, memory avg 315.5MB / max 333.1MB
 - Thresholds: PASS
 - Correctness-under-load proof (global invariant, projection drift, orphans, async-pipeline rebuild, all against this run's own data): PASS
 
@@ -97,14 +97,14 @@ Full RESERVE/GATEWAY/SETTLE marketplace payouts against a gateway failing 5% of 
 
 A weighted concurrent blend of the other four scenarios (60% transfers, 20% hot-account, 15% idempotent retries, 5% payouts) via k6's own multi-scenario executor.
 
-- Duration: 116.5s, 10998 requests, 95.6 req/s
-- Latency: p50=3.52ms p95=17.03ms p99=194.71ms
+- Duration: 116.1s, 10507 requests, 91.3 req/s
+- Latency: p50=3.84ms p95=29.52ms p99=168.73ms
 - Error rate: 0.000%
 - Serialization retries (`ledger_db_tx_retries_total` increase over the run): 0
-- Outbox lag at end of run: 20.16s (Debezium arm: replication-slot confirmation lag, bounded below by Kafka Connect's `offset.flush.interval.ms` -- not a queue depth; see cmd/loadtest-harness/prometheus.go's doc comment)
+- Outbox lag at end of run: 12.88s (Debezium arm: replication-slot confirmation lag, bounded below by Kafka Connect's `offset.flush.interval.ms` -- not a queue depth; see cmd/loadtest-harness/prometheus.go's doc comment)
 - Consumer lag at end of run: 0
-- `api` container: CPU avg 13.6% / max 73.8%, memory avg 30.9MB / max 41.0MB
-- `postgres` container: CPU avg 29.5% / max 180.5%, memory avg 350.7MB / max 355.2MB
+- `api` container: CPU avg 13.6% / max 52.4%, memory avg 25.3MB / max 26.7MB
+- `postgres` container: CPU avg 31.2% / max 100.7%, memory avg 352.3MB / max 374.6MB
 - Thresholds: PASS
 - Correctness-under-load proof (global invariant, projection drift, orphans, async-pipeline rebuild, all against this run's own data): PASS
 

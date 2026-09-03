@@ -2374,3 +2374,273 @@ reasoning about it from the code:**
 statement caching, batch inserts, the sharding comparison, index
 effectiveness, read-replica routing), and the README numbers table are not
 built by this entry.
+
+### D53. The optimisation cycle: five measurements, and what each one actually found
+
+**Decided.** Five of the six optimisation steps the phase names, each
+measured against this same machine rather than guessed, with the sixth
+(read-replica routing) recorded separately in D54 because it is a real
+subsystem addition rather than a measurement. Per CLAUDE.md's own rule for
+this cycle -- revert a regression, document why, move on -- three of these
+five findings are NOT "the obvious answer was right"; they are surprises
+worth recording exactly because they were not predicted.
+
+**Prepared statement caching: already the default, and the alternative does
+not merely lose, it breaks.** pgx v5's own source (`conn.go`) states
+`QueryExecModeCacheStatement` is already its default, unconditionally, and
+`internal/db/db.go` never overrode it -- so this codebase has been getting
+server-side prepared statements for free since Phase 1. `config.Postgres`
+gained `QueryExecMode` (`LEDGER_POSTGRES_QUERY_EXEC_MODE`, default
+`cache_statement`) purely to make the alternative reachable for measurement.
+Setting it to `simple_protocol` and rebuilding `api` did not produce a
+slower number -- it produced `unable to encode []uuid.UUID{...} into text
+format for unknown type (OID 0): cannot find encode plan` on every single
+write, reproduced directly against a standalone pgx connection to confirm
+the exact cause: `QueryExecModeSimpleProtocol` has no server round trip to
+learn a parameter's PostgreSQL type from, so it cannot encode the
+`unnest($1::uuid[], ...)` array parameters `pgledger`'s own journal-entry
+insert depends on (see this entry's own next finding). This is not "the
+default is faster" -- it is "the alternative cannot run this codebase's
+write path at all," which is a stronger reason to keep the default than any
+benchmark number would have been.
+
+**Batch inserts: already shipped (`unnest`, not a loop) -- the "before"
+this phase asked to measure never ran in production, so it was measured
+directly instead of reintroduced as real code just to revert it.**
+`test/batch_insert_bench_test.go`'s `BenchmarkJournalEntryInsert` runs both
+shapes -- the real `unnest($1::uuid[], ...)` statement and a naive per-row
+`INSERT` loop -- each inside `BEGIN`/`ROLLBACK` so the deferred balance
+trigger (which only fires at COMMIT) never has to be satisfied and the
+benchmark leaves no trace in the database it runs against:
+
+| Entries per transaction | `unnest` batch | naive loop | Speedup |
+|---|---|---|---|
+| 2  |  306.5 µs/op |  404.1 µs/op | 1.32x |
+| 10 |  499.7 µs/op | 2167.2 µs/op | 4.34x |
+| 50 | 1720.2 µs/op | 10257.7 µs/op | 5.96x |
+
+The speedup grows with entry count because the naive loop pays one Postgres
+round trip per row while the batch pays one round trip total -- exactly the
+mechanism the batch insert was built to avoid, now with a number attached.
+
+**Index effectiveness: a genuine surprise, and the honest finding is
+scale-dependent, not "index good."** `journal_entries_account_id_created_at_idx`
+backs the account-statement query (D-index-decisions table, migration
+000004). Measured with `EXPLAIN (ANALYZE, BUFFERS)` against the live,
+loaded dev database (57,575 journal entries after the full `make loadtest`
+run), comparing the index present against `BEGIN; DROP INDEX ...; EXPLAIN
+...; ROLLBACK;` -- the same technique the batch-insert benchmark uses, for
+the same reason: real data, nothing altered. Plans saved under
+`docs/explain/`.
+
+- **Full account history** (`From` = account inception, ~26,162 of 57,575
+  rows match): **41.7ms without the index, 126.4ms with it** -- the index
+  makes this query THREE TIMES SLOWER. `Buffers` explains why:
+  the WITH-index plan is a Bitmap Heap Scan that visits heap pages in the
+  order the bitmap collects them, not physical order, costing 512 real disk
+  reads against `shared_buffers=128MB`; the WITHOUT-index plan is a
+  sequential scan that reads the same pages in physical order and stays
+  entirely cache-resident (0 disk reads, verified in `Buffers:`).
+- **Recent window** (`From` = 2 minutes before the newest entry, 6,561
+  rows match -- the query's actual intended use, a client paginating recent
+  activity): **29.6ms with the index, 33.1ms without** -- the index wins,
+  but by ~10%, not dramatically, because at this table's current size both
+  plans are already cache-resident and neither pays for a disk read.
+- **The honest conclusion, stated so it cannot be quoted out of context:**
+  this index is not wrong and is not being dropped. At THIS data volume (a
+  single append-only table small enough that `shared_buffers` holds nearly
+  all of it), PostgreSQL's own cost-based planner and the buffer cache
+  mostly erase the gap an index is supposed to provide, and a bitmap-scan's
+  scattered heap access can, in one specific access pattern, cost more than
+  reading the whole table in physical order. The index's real advantage
+  is at PRODUCTION scale -- millions of rows spanning many gigabytes, where
+  neither plan is cache-resident and a sequential scan means reading the
+  entire table off disk regardless of how selective the query is. Measuring
+  "index effectiveness" honestly means reporting that the effect is
+  real but small on today's data and would be reported backwards if this
+  measurement were mistaken for the production answer.
+
+**Connection pool tuning: two findings, not one, and the first sweep had to
+be thrown out.** The first sweep (MaxConns ∈ {5, 10, 20, 40, 80}) ran
+concurrently with other benchmarks on this same machine (the sharding
+rerun, the batch-insert benchmark) and produced an incoherent curve --
+MaxConns=20 measuring WORSE than MaxConns=10 -- that was host contention,
+not a property of the pool, and was discarded rather than reported as a
+result. Two real findings survived a clean rerun with nothing else
+competing for the host:
+
+1. **MaxConns=80 is not merely suboptimal, it is broken**, reproducibly:
+   96.35% of requests failed with 500s, traced to Postgres itself refusing
+   connections -- `FATAL: sorry, too many clients already`, reproduced by
+   hand against `psql` during the same load. `max_connections=100` (the
+   docker-compose default) is a budget SHARED across every service that
+   opens a pool against this one Postgres instance: `outbox-publisher`,
+   `projector`, `saga-orchestrator` and `reconciler` each default to 20
+   (`internal/config`'s own default), so 4×20=80 is already committed
+   before `api`'s own pool opens a single connection. Setting `api` alone
+   to 80 pushes the honest total toward 160 against a ceiling of 100. This
+   is the actual optimum-finding result the phase asked for: the ceiling
+   here is a structural, shared budget, not row-lock contention, and no
+   amount of tuning `api`'s own `LEDGER_POSTGRES_MAX_CONNS` in isolation
+   escapes it.
+2. **Within the range that stays safely under that shared budget
+   (MaxConns ∈ {5, 10, 15, 20, 25, 30}), throughput is flat**: 396-458 req/s
+   across the whole range, a ~15% band consistent with this machine's own
+   established run-to-run noise (docs/BENCHMARKS.md's own variance
+   caveat) rather than a real trend. The reason is `baseline_simple_transfer`'s
+   own design: it deliberately hits only TWO fixed accounts (this entry's
+   own scenario doc comment), so at 100 concurrent VUs the bottleneck is
+   D11's row-lock queueing on those two `account_balances` rows, which a
+   bigger connection pool cannot relieve -- there is always a writer ready
+   to grab a connection the instant the lock frees, whether the pool holds
+   5 spares or 30. A pool-sizing effect would show up on a workload spread
+   across many distinct accounts instead, which is not what this scenario
+   is for.
+
+**Decided: `LEDGER_POSTGRES_MAX_CONNS` stays at its default (20).** It sits
+comfortably inside the safe, near-flat range the clean sweep found, well
+clear of the shared-budget ceiling the confirmed-broken 80 demonstrated, and
+no value in the measured range showed a throughput advantage worth trading
+that safety margin for.
+
+**The sharding comparison: rerun the existing benchmark, not reimplemented
+at the HTTP layer.** D25 already built and shipped
+`TestSharding_ThroughputSingleVersusSixteen`
+(`test/sharding_test.go`) -- the authoritative, already-correct comparison,
+run against the identical machine every other Phase 7 number in this
+document comes from. Building a second, k6-level version (which would need
+an HTTP-reachable way to create shards for a seeded account, and there is
+none -- D25 states plainly that shard creation is a rare, direct-SQL admin
+operation) would have been a less rigorous reimplementation of a comparison
+that already exists and is already tested, not a genuinely new measurement.
+Rerun three times (`go test -run TestSharding_ThroughputSingleVersusSixteen
+-count=3`):
+
+| Run | Single account | 16 shards | Speedup |
+|---|---|---|---|
+| 1 | 186 tx/s | 817 tx/s | 4.40x |
+| 2 | 231 tx/s | 691 tx/s | 2.99x |
+| 3 | 241 tx/s | 482 tx/s | 2.00x |
+
+Consistent with D25's own range (4.4x-4.8x) and its own caveat that
+absolute figures and even the exact ratio describe this laptop and its
+concurrent load at measurement time, not a portable constant -- the range
+here is wider than D25's three original runs, and that is itself consistent
+with this being a shared, busier machine than whatever D25 was measured
+against, not a regression in sharding's own benefit.
+
+### D54. A real streaming replica, and a pg_hba discovery it took a rejected `pg_basebackup` to find
+
+**Decided.** `postgres-replica` (`deploy/docker-compose.yml`) is genuine
+PostgreSQL 16 streaming (physical) replication -- a real hot standby that
+bootstraps itself from the primary via `pg_basebackup`, not a second pool
+pointed at the same database. Per the trade-off approved before this phase
+began: the alternative (a fake replica) would have made replica lag a
+number that could never be anything but zero, which is not a caveat, it is
+a fabricated result.
+
+**The bootstrap: `pg_basebackup -R -S ledger_replica_slot -C`, run from the
+replica's own entrypoint on first start only.** `-R` writes
+`standby.signal` and `primary_conninfo` for PostgreSQL 16's own recovery
+configuration in one flag, rather than hand-writing it. `-S ... -C` creates
+and uses a dedicated, named replication slot -- the same mechanism the
+Debezium outbox connector already holds on this same primary
+(`max_replication_slots=10` already had headroom for a second, migration
+000008) -- so the primary retains exactly the WAL this replica has not yet
+consumed rather than streaming without a slot and risking a standby that
+silently falls behind what the primary has already recycled. The
+entrypoint checks `PGDATA/PG_VERSION` before running `pg_basebackup` at
+all: present means an earlier start already cloned the primary, so a
+restart against the existing volume skips straight to `docker-entrypoint.sh
+postgres` -- re-running `pg_basebackup` against a non-empty data directory
+fails outright, and the same check is what makes this safe to leave in a
+`docker compose up` a developer runs repeatedly, not just once.
+
+**The discovery: the primary's own generated `pg_hba.conf` does not allow
+replication connections from anywhere but localhost, and it takes reading
+the actual generated file to know that -- the catch-all line does not
+cover it.** The official image's default `pg_hba.conf`, read directly off
+the running primary rather than assumed from documentation, is:
+
+```
+local   all             all                                     trust
+host    all             all             127.0.0.1/32            trust
+host    all             all             ::1/128                 trust
+local   replication     all                                     trust
+host    replication     all             127.0.0.1/32            trust
+host    replication     all             ::1/128                 trust
+host all all all scram-sha-256
+```
+
+The final catch-all line matches every DATABASE except one:
+`replication` is a separate pseudo-database in `pg_hba`'s own matching
+rules, and a bare `all` in the DATABASE column does not include it. Every
+explicit `replication` line above is scoped to `127.0.0.1`/`::1` --
+loopback only. `postgres-replica` connects from a different container, so
+the first `pg_basebackup` attempt was rejected outright before any of this
+entry's other work could be verified. `deploy/postgres-initdb/10-allow-replication.sh`
+-- mounted read-only into the primary's own
+`/docker-entrypoint-initdb.d`, so it runs automatically and only once, on
+the first initialization of an empty volume, the same mechanism the
+official image already uses for its own init scripts -- appends one line,
+`host replication all all scram-sha-256`, closing exactly this gap and no
+more: still password-authenticated, still scoped to the `replication`
+pseudo-database specifically, never broadened to a `trust` method or to
+ordinary data access.
+
+**`WithReadReplica`, and what it deliberately does not touch.**
+`internal/ledger/pgledger.Repository` gained a `readPool` field, defaulted
+to the primary pool in `New` when the option is never applied -- so every
+existing caller, every test, and any deployment with no
+`LEDGER_POSTGRES_REPLICA_DSN` configured reads its own writes with zero
+added staleness, exactly as before this entry. Only `GetBalanceAsOf` and
+`GetStatement` route to it. Every other read -- the `account_balances` row
+a posting transaction locks under `FOR UPDATE` (D1, D18), the idempotency
+lease check, the saga claim query -- stays on the primary, because those
+reads are load-bearing for a WRITE's own consistency, and a replica is
+asynchronous by construction: deciding whether a debit is permitted from a
+row that might be milliseconds stale would reopen the exact lost-update
+class of bug D11's row lock exists to close. `GetBalanceAsOf` and
+`GetStatement` carry no equivalent risk -- D16 already documents that a
+temporal or paginated read is bounded-stale by nature, so the additional
+staleness a replica adds is a difference in degree, not in kind, which is
+the entire reason this option is safe to offer at all.
+
+**`/readyz` needed a second checker, and a naming collision very nearly
+made it invisible.** `*db.Pool.Name()` unconditionally returns
+`"postgres"`, so registering the replica pool as a second `Checker`
+alongside the primary would have reported both under the identical map key
+in `/readyz`'s JSON -- one silently overwriting the other, hiding
+precisely the "is the replica actually reachable" signal this checker
+exists to add. `cmd/api`'s own `namedChecker` wraps the replica's `*db.Pool`
+purely to override its name to `"postgres-replica"`, rather than changing
+`db.Pool.Name()` itself, which every other service's health check still
+correctly reports as `"postgres"` against its own single pool.
+
+**Verification, in increasing order of how directly it proves the claim.**
+`/readyz` reports `{"postgres": "ok", "postgres-replica": "ok"}` as two
+distinct entries. `pg_stat_replication` on the primary shows a `walreceiver`
+entry, `state=streaming`, `sync_state=async`, with `replay_lag` around
+90ms against an idle system. `pg_is_in_recovery()` on the replica returns
+true, and a direct `INSERT` against it is refused with `cannot execute
+INSERT in a read-only transaction` -- the standby genuinely cannot be
+written to, not merely documented as read-only. A row inserted on the
+primary was visible on the replica by the time the next `psql` command
+ran. Most direct of all: `SELECT query, state FROM pg_stat_activity` run
+ON THE REPLICA, while issuing five concurrent
+`GET /v1/accounts/{id}/statement` requests through the real HTTP API, shows
+five backends holding the EXACT text of `GetStatement`'s own query --
+proof the query executed there, not an inference from timing or
+configuration. (A `docker pause` on the replica, tried first as a more
+dramatic proof, returned successes rather than the expected hang; not
+pursued further once `pg_stat_activity` gave an unambiguous, directly
+observed answer instead of one resting on assumptions about how cgroup
+freezing interacts with already-established connections.)
+
+**What remains open.** No failover: if the replica falls behind or dies,
+`GetBalanceAsOf`/`GetStatement` fail rather than falling back to the
+primary -- a deliberate scope boundary (this phase asks for read-replica
+ROUTING, not a highly-available read path) rather than an oversight, but
+worth stating rather than leaving implicit. Replica lag under real write
+load (this entry measured it idle) is exactly what `docs/BENCHMARKS.md`'s
+`mixed_realistic` numbers with the replica in place are for.

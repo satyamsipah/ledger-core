@@ -40,6 +40,7 @@ services:
       - "5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
+      - ./postgres-initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
       # -U and -d are not optional here: bare pg_isready reports the server up
       # while it is still running its init scripts and refusing connections.
@@ -48,6 +49,62 @@ services:
       timeout: 3s
       retries: 30
       start_period: 5s
+
+  # A real streaming (physical) hot standby, for Phase 7's read-replica
+  # routing (docs/DECISIONS.md): GetBalanceAsOf and GetStatement read from
+  # here, everything else -- including account_balances reads inside a
+  # posting transaction -- stays on postgres. This is genuine
+  # primary/standby WAL replication, not a second pool pointed at the same
+  # database, specifically so replica lag is a real, measurable, honestly
+  # documented thing rather than a number that could never be anything but
+  # zero.
+  postgres-replica:
+    image: postgres:16-alpine
+    container_name: ledger-postgres-replica
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGUSER: ledger
+      PGPASSWORD: ledger
+    # If the data directory is already a base backup (every restart against
+    # the existing volume), skip straight to starting postgres -- re-running
+    # pg_basebackup against a non-empty PGDATA fails outright. Only the
+    # FIRST start, against an empty volume, actually clones the primary.
+    #
+    # -R writes standby.signal and primary_conninfo for us, from a single
+    # pg_basebackup flag, rather than hand-writing PostgreSQL 16's recovery
+    # configuration. -S / -C create and use a dedicated, named replication
+    # slot (ledger_replica_slot) -- the same mechanism the Debezium outbox
+    # connector already uses on this same primary (migration 000008,
+    # max_replication_slots=10 has room for both) -- so the primary retains
+    # exactly the WAL this replica has not yet consumed, rather than
+    # streaming without one and risking a standby that falls behind what
+    # the primary has already recycled.
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -e
+        if [ ! -s "$$PGDATA/PG_VERSION" ]; then
+          echo "postgres-replica: bootstrapping via pg_basebackup from postgres..."
+          until pg_basebackup -h postgres -U ledger -D "$$PGDATA" -Fp -Xs -P -R -S ledger_replica_slot -C; do
+            echo "postgres-replica: primary not ready for pg_basebackup yet, retrying..."
+            sleep 2
+          done
+          chmod 0700 "$$PGDATA"
+        fi
+        exec docker-entrypoint.sh postgres
+    volumes:
+      - postgres-replica-data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ledger -d ledger"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+      start_period: 10s
 
   migrate:
     image: migrate/migrate:v4.17.1
@@ -211,11 +268,18 @@ services:
         condition: service_healthy
       redpanda:
         condition: service_healthy
+      postgres-replica:
+        condition: service_healthy
     environment:
       LEDGER_ENV: local
       LEDGER_HTTP_ADDR: ":8080"
       LEDGER_METRICS_ADDR: ":9090"
       LEDGER_POSTGRES_DSN: postgres://ledger:ledger@postgres:5432/ledger?sslmode=disable
+      # Statement/balance-as-of reads only (internal/ledger/pgledger.WithReadReplica);
+      # the write path and every other read stay on LEDGER_POSTGRES_DSN above.
+      # Empty disables replica routing outright -- see config.Postgres.ReplicaDSN's
+      # own doc comment.
+      LEDGER_POSTGRES_REPLICA_DSN: postgres://ledger:ledger@postgres-replica:5432/ledger?sslmode=disable
       LEDGER_REDIS_ADDR: redis:6379
       LEDGER_KAFKA_BROKERS: redpanda:29092
       LEDGER_LOG_LEVEL: debug
@@ -224,6 +288,15 @@ services:
       # run, and stating the default here says what it is being overridden
       # FROM, not just that it happens to default to false somewhere in Go.
       LEDGER_FAULT_INJECTION_ENABLED: "false"
+      # Shell-overridable for Phase 7's optimisation cycle (docs/DECISIONS.md):
+      # `LEDGER_POSTGRES_MAX_CONNS=N docker compose up -d --force-recreate api`
+      # sweeps the pool size without editing this file. The right-hand side of
+      # each `:-` is internal/config's own default, restated here so this file
+      # documents what a sweep is overriding FROM, per the same convention as
+      # LEDGER_FAULT_INJECTION_ENABLED above.
+      LEDGER_POSTGRES_MAX_CONNS: ${LEDGER_POSTGRES_MAX_CONNS:-20}
+      LEDGER_POSTGRES_MIN_CONNS: ${LEDGER_POSTGRES_MIN_CONNS:-2}
+      LEDGER_POSTGRES_QUERY_EXEC_MODE: ${LEDGER_POSTGRES_QUERY_EXEC_MODE:-cache_statement}
     ports:
       - "8080:8080"
       - "9090:9090"
@@ -472,6 +545,7 @@ services:
 
 volumes:
   postgres-data:
+  postgres-replica-data:
   redpanda-data:
   prometheus-data:
   grafana-data:

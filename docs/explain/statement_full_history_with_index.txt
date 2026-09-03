@@ -1,0 +1,75 @@
+                                                                                                                     QUERY PLAN                                                                                                                     
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ WindowAgg  (cost=2155.58..2156.73 rows=51 width=146) (actual time=125.720..125.804 rows=51 loops=1)
+   Buffers: shared hit=821 read=512
+   CTE acct
+     ->  Index Scan using accounts_id_currency_key on accounts  (cost=0.15..8.17 rows=1 width=64) (actual time=0.174..0.174 rows=1 loops=1)
+           Index Cond: (id = '01920000-0000-7000-8000-000000000001'::uuid)
+           Buffers: shared hit=2
+   CTE physical
+     ->  Append  (cost=0.15..17.65 rows=3 width=16) (actual time=0.539..0.547 rows=1 loops=1)
+           Buffers: shared hit=4
+           ->  Index Only Scan using accounts_id_currency_key on accounts accounts_1  (cost=0.15..8.17 rows=1 width=16) (actual time=0.538..0.538 rows=1 loops=1)
+                 Index Cond: (id = '01920000-0000-7000-8000-000000000001'::uuid)
+                 Heap Fetches: 1
+                 Buffers: shared hit=2
+           ->  Bitmap Heap Scan on accounts accounts_2  (cost=4.13..9.47 rows=2 width=16) (actual time=0.003..0.003 rows=0 loops=1)
+                 Recheck Cond: (parent_account_id = '01920000-0000-7000-8000-000000000001'::uuid)
+                 Buffers: shared hit=2
+                 ->  Bitmap Index Scan on accounts_parent_account_id_idx  (cost=0.00..4.13 rows=2 width=0) (actual time=0.002..0.003 rows=0 loops=1)
+                       Index Cond: (parent_account_id = '01920000-0000-7000-8000-000000000001'::uuid)
+                       Buffers: shared hit=2
+   ->  Sort  (cost=2129.76..2129.89 rows=51 width=114) (actual time=125.493..125.534 rows=51 loops=1)
+         Sort Key: je_1.created_at, je_1.id
+         Sort Method: quicksort  Memory: 30kB
+         Buffers: shared hit=821 read=512
+         ->  Nested Loop Left Join  (cost=2127.64..2128.32 rows=51 width=114) (actual time=125.374..125.396 rows=51 loops=1)
+               Buffers: shared hit=815 read=512
+               ->  Nested Loop  (cost=17.49..17.53 rows=1 width=48) (actual time=0.920..0.924 rows=1 loops=1)
+                     Buffers: shared hit=9
+                     ->  CTE Scan on acct a  (cost=0.00..0.02 rows=1 width=16) (actual time=0.176..0.177 rows=1 loops=1)
+                           Buffers: shared hit=2
+                     ->  Aggregate  (cost=17.49..17.50 rows=1 width=32) (actual time=0.741..0.744 rows=1 loops=1)
+                           Buffers: shared hit=7
+                           ->  Nested Loop Left Join  (cost=0.48..17.47 rows=2 width=46) (actual time=0.724..0.727 rows=1 loops=1)
+                                 Buffers: shared hit=7
+                                 ->  CTE Scan on acct a_1  (cost=0.00..0.02 rows=1 width=32) (actual time=0.000..0.001 rows=1 loops=1)
+                                 ->  Nested Loop  (cost=0.48..17.43 rows=2 width=14) (actual time=0.723..0.724 rows=0 loops=1)
+                                       Buffers: shared hit=7
+                                       ->  HashAggregate  (cost=0.07..0.10 rows=3 width=16) (actual time=0.546..0.546 rows=1 loops=1)
+                                             Group Key: physical.id
+                                             Batches: 1  Memory Usage: 24kB
+                                             Buffers: shared hit=4
+                                             ->  CTE Scan on physical  (cost=0.00..0.06 rows=3 width=16) (actual time=0.539..0.543 rows=1 loops=1)
+                                                   Buffers: shared hit=4
+                                       ->  Index Only Scan using journal_entries_account_id_created_at_idx on journal_entries je  (cost=0.41..5.77 rows=1 width=30) (actual time=0.173..0.173 rows=0 loops=1)
+                                             Index Cond: ((account_id = physical.id) AND (ROW(created_at, id) <= ROW('2020-01-01 00:00:00+00'::timestamp with time zone, '00000000-0000-0000-0000-000000000000'::uuid)))
+                                             Heap Fetches: 0
+                                             Buffers: shared hit=3
+               ->  Limit  (cost=2110.15..2110.28 rows=51 width=66) (actual time=124.450..124.460 rows=51 loops=1)
+                     Buffers: shared hit=806 read=512
+                     ->  Sort  (cost=2110.15..2157.98 rows=19134 width=66) (actual time=124.433..124.439 rows=51 loops=1)
+                           Sort Key: je_1.created_at, je_1.id
+                           Sort Method: top-N heapsort  Memory: 31kB
+                           Buffers: shared hit=806 read=512
+                           ->  Nested Loop  (cost=575.14..1471.80 rows=19134 width=66) (actual time=89.721..119.792 rows=26162 loops=1)
+                                 Buffers: shared hit=806 read=512
+                                 ->  Nested Loop  (cost=0.07..0.15 rows=1 width=48) (actual time=0.002..0.017 rows=1 loops=1)
+                                       ->  CTE Scan on acct a_2  (cost=0.00..0.02 rows=1 width=32) (actual time=0.000..0.006 rows=1 loops=1)
+                                       ->  HashAggregate  (cost=0.07..0.10 rows=3 width=16) (actual time=0.001..0.009 rows=1 loops=1)
+                                             Group Key: physical_1.id
+                                             Batches: 1  Memory Usage: 24kB
+                                             ->  CTE Scan on physical physical_1  (cost=0.00..0.06 rows=3 width=16) (actual time=0.000..0.001 rows=1 loops=1)
+                                 ->  Bitmap Heap Scan on journal_entries je_1  (cost=575.07..1312.20 rows=6378 width=74) (actual time=89.705..114.876 rows=26162 loops=1)
+                                       Recheck Cond: ((account_id = physical_1.id) AND (ROW(created_at, id) > ROW('2020-01-01 00:00:00+00'::timestamp with time zone, '00000000-0000-0000-0000-000000000000'::uuid)) AND (created_at <= now()))
+                                       Heap Blocks: exact=734
+                                       Buffers: shared hit=806 read=512
+                                       ->  Bitmap Index Scan on journal_entries_account_id_created_at_idx  (cost=0.00..573.48 rows=6378 width=0) (actual time=89.610..89.610 rows=26162 loops=1)
+                                             Index Cond: ((account_id = physical_1.id) AND (ROW(created_at, id) > ROW('2020-01-01 00:00:00+00'::timestamp with time zone, '00000000-0000-0000-0000-000000000000'::uuid)) AND (created_at <= now()))
+                                             Buffers: shared hit=72 read=512
+ Planning:
+   Buffers: shared hit=308 read=7
+ Planning Time: 14.472 ms
+ Execution Time: 126.387 ms
+(71 rows)
+

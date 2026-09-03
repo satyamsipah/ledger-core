@@ -619,6 +619,142 @@ func TestAPI_BalanceAndStatement(t *testing.T) {
 	assertGlobalInvariant(t, ctx, sharedPool)
 }
 
+// TestAPI_SearchTransactionsAndGetTransaction covers the ledger explorer's two
+// read routes end to end, including that both require authentication --
+// unlike balance and statement above.
+func TestAPI_SearchTransactionsAndGetTransaction(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	server := newAPI(t, idempotency.DefaultLease)
+	from := newAccount(t, ctx, sharedPool, "INR", true)
+	to := newTypedAccount(t, ctx, sharedPool, ledger.AccountTypeLiability, "INR", false)
+
+	response, payload := post(t, ctx, server, "/v1/transactions", uuid.NewString(), transferBody(from, to, 500))
+	require.Equal(t, nethttp.StatusCreated, response.StatusCode, "body: %s", payload)
+
+	var posted struct {
+		ID string `json:"id"`
+	}
+	require.NoError(t, json.Unmarshal(payload, &posted))
+
+	t.Run("should read the transaction back with its entries", func(t *testing.T) {
+		response, payload := get(t, ctx, server, "/v1/transactions/"+posted.ID)
+		require.Equal(t, nethttp.StatusOK, response.StatusCode, "body: %s", payload)
+
+		var tx struct {
+			ID      string `json:"id"`
+			Status  string `json:"status"`
+			Entries []struct {
+				AccountID string `json:"account_id"`
+			} `json:"entries"`
+		}
+		require.NoError(t, json.Unmarshal(payload, &tx))
+		assert.Equal(t, posted.ID, tx.ID)
+		assert.Equal(t, "POSTED", tx.Status)
+		require.Len(t, tx.Entries, 2)
+	})
+
+	t.Run("should find the transaction by searching its own account", func(t *testing.T) {
+		response, payload := get(t, ctx, server, "/v1/transactions?account_id="+to.String())
+		require.Equal(t, nethttp.StatusOK, response.StatusCode, "body: %s", payload)
+
+		var page struct {
+			Transactions []struct {
+				ID      string `json:"id"`
+				Entries []any  `json:"entries"`
+			} `json:"transactions"`
+		}
+		require.NoError(t, json.Unmarshal(payload, &page))
+		require.Len(t, page.Transactions, 1)
+		assert.Equal(t, posted.ID, page.Transactions[0].ID)
+		assert.Empty(t, page.Transactions[0].Entries, "search results carry no entries")
+	})
+
+	t.Run("should 404 an unknown transaction id", func(t *testing.T) {
+		response, payload := get(t, ctx, server, "/v1/transactions/"+uuid.NewString())
+		assert.Equal(t, nethttp.StatusNotFound, response.StatusCode)
+		assert.Equal(t, "transaction-not-found", problemType(t, payload))
+	})
+
+	t.Run("should require authentication to search", func(t *testing.T) {
+		response, payload := doAs(t, ctx, server, "", nethttp.MethodGet, "/v1/transactions", "", "")
+		assert.Equal(t, nethttp.StatusUnauthorized, response.StatusCode, "body: %s", payload)
+		assert.Equal(t, "missing-api-key", problemType(t, payload))
+	})
+
+	t.Run("should require authentication to read one transaction", func(t *testing.T) {
+		response, payload := doAs(t, ctx, server, "", nethttp.MethodGet, "/v1/transactions/"+posted.ID, "", "")
+		assert.Equal(t, nethttp.StatusUnauthorized, response.StatusCode, "body: %s", payload)
+	})
+
+	assertGlobalInvariant(t, ctx, sharedPool)
+}
+
+// TestAPI_SearchAccountsAndGetAccount covers the account view's two read
+// routes end to end, including that both require authentication -- unlike
+// balance and statement.
+func TestAPI_SearchAccountsAndGetAccount(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	server := newAPI(t, idempotency.DefaultLease)
+	id := newTypedAccount(t, ctx, sharedPool, ledger.AccountTypeLiability, "INR", false)
+
+	t.Run("should read the account's metadata", func(t *testing.T) {
+		response, payload := get(t, ctx, server, "/v1/accounts/"+id.String())
+		require.Equal(t, nethttp.StatusOK, response.StatusCode, "body: %s", payload)
+
+		var account struct {
+			ID            string `json:"id"`
+			AccountType   string `json:"account_type"`
+			NormalBalance string `json:"normal_balance"`
+			Currency      string `json:"currency"`
+			Status        string `json:"status"`
+		}
+		require.NoError(t, json.Unmarshal(payload, &account))
+		assert.Equal(t, id.String(), account.ID)
+		assert.Equal(t, "LIABILITY", account.AccountType)
+		assert.Equal(t, "CREDIT", account.NormalBalance)
+		assert.Equal(t, "INR", account.Currency)
+		assert.Equal(t, "ACTIVE", account.Status)
+	})
+
+	t.Run("should find the account by searching its own external_ref", func(t *testing.T) {
+		var ref string
+		require.NoError(t, sharedPool.QueryRow(ctx, `SELECT external_ref FROM accounts WHERE id = $1`, id).Scan(&ref))
+
+		response, payload := get(t, ctx, server, "/v1/accounts?external_ref="+url.QueryEscape(ref))
+		require.Equal(t, nethttp.StatusOK, response.StatusCode, "body: %s", payload)
+
+		var page struct {
+			Accounts []struct {
+				ID string `json:"id"`
+			} `json:"accounts"`
+		}
+		require.NoError(t, json.Unmarshal(payload, &page))
+		require.Len(t, page.Accounts, 1)
+		assert.Equal(t, id.String(), page.Accounts[0].ID)
+	})
+
+	t.Run("should 404 an unknown account id", func(t *testing.T) {
+		response, payload := get(t, ctx, server, "/v1/accounts/"+uuid.NewString())
+		assert.Equal(t, nethttp.StatusNotFound, response.StatusCode)
+		assert.Equal(t, "account-not-found", problemType(t, payload))
+	})
+
+	t.Run("should require authentication to search", func(t *testing.T) {
+		response, payload := doAs(t, ctx, server, "", nethttp.MethodGet, "/v1/accounts", "", "")
+		assert.Equal(t, nethttp.StatusUnauthorized, response.StatusCode, "body: %s", payload)
+		assert.Equal(t, "missing-api-key", problemType(t, payload))
+	})
+
+	t.Run("should require authentication to read one account", func(t *testing.T) {
+		response, payload := doAs(t, ctx, server, "", nethttp.MethodGet, "/v1/accounts/"+id.String(), "", "")
+		assert.Equal(t, nethttp.StatusUnauthorized, response.StatusCode, "body: %s", payload)
+	})
+}
+
 // newAccountWithHistory returns a fresh account carrying n entries, so a
 // pagination test is not perturbed by whatever else the suite posted.
 func newAccountWithHistory(t *testing.T, ctx context.Context, server *httptest.Server, n int) uuid.UUID {

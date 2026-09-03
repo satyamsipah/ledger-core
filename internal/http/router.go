@@ -157,13 +157,32 @@ func NewMux(deps Deps) chi.Router {
 				Post("/", handlePostTransaction(deps.Ledger))
 			r.With(requireAuth(deps.Auth), requireIdempotency(deps.Idempotency, deps.Logger)).
 				Post("/{id}/reverse", handleReverseTransaction(deps.Ledger))
+
+			// Searching and reading a transaction take no idempotency key --
+			// reads create nothing, so there is nothing for a retry to
+			// duplicate -- but they DO require auth, unlike balance and
+			// statement below. A search result or a drill-down carries
+			// amounts and external references, the same class of information
+			// D24 already scopes idempotency responses to a principal to
+			// protect, and the same reasoning the reconciliation reads use.
+			r.With(requireAuth(deps.Auth)).Get("/", handleSearchTransactions(deps.Ledger))
+			r.With(requireAuth(deps.Auth)).Get("/{id}", handleGetTransaction(deps.Ledger))
 		})
 
-		// Reads take no key: they create nothing, so there is nothing for a
-		// retry to duplicate.
+		// Balance and statement take no key: they create nothing, so there is
+		// nothing for a retry to duplicate, and neither requires auth --
+		// unchanged Phase 3 behaviour, not a decision this phase revisits.
 		r.Route("/accounts", func(r chi.Router) {
 			r.Get("/{id}/balance", handleGetBalance(deps.Ledger))
 			r.Get("/{id}/statement", handleGetStatement(deps.Ledger))
+
+			// Searching and reading account metadata DO require auth, for the
+			// identical reason the new transaction reads above do: a search
+			// result carries external_ref and owner_id, and an unauthenticated
+			// search is an enumeration of the whole chart of accounts in a way
+			// that already-knowing-a-UUID (balance, statement) is not.
+			r.With(requireAuth(deps.Auth)).Get("/", handleSearchAccounts(deps.Ledger))
+			r.With(requireAuth(deps.Auth)).Get("/{id}", handleGetAccount(deps.Ledger))
 		})
 	})
 

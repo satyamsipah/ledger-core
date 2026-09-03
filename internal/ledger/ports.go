@@ -38,6 +38,28 @@ type Repository interface {
 	// GetStatement returns one keyset-paginated page of entries with a running
 	// balance.
 	GetStatement(ctx context.Context, q StatementQuery) (Statement, error)
+
+	// GetTransaction reads a transaction and its entries. Unlike
+	// LoadTransactionForUpdate, this takes no row lock: it is a dashboard/admin
+	// read of history that, once POSTED, never changes, so there is nothing for
+	// a lock to protect.
+	GetTransaction(ctx context.Context, id uuid.UUID) (*Transaction, error)
+
+	// SearchTransactions returns one keyset-paginated page of transaction
+	// headers, newest first. Entries are not included -- a search result is a
+	// list of candidates to drill into via GetTransaction, and fetching every
+	// leg of every matching transaction up front would make a broad, unfiltered
+	// search materialise the whole journal.
+	SearchTransactions(ctx context.Context, q TransactionQuery) (TransactionPage, error)
+
+	// GetAccount reads one account's metadata (not its balance -- see GetBalance
+	// for that).
+	GetAccount(ctx context.Context, id uuid.UUID) (*Account, error)
+
+	// SearchAccounts returns one keyset-paginated page of accounts, newest
+	// first. Sharded accounts are internal plumbing and never appear here; only
+	// their logical parent does.
+	SearchAccounts(ctx context.Context, q AccountQuery) (AccountPage, error)
 }
 
 // Tx is the set of writes available inside one database transaction. Every
@@ -259,4 +281,69 @@ type Statement struct {
 
 	// NextCursor is nil once the page is the last one.
 	NextCursor *StatementCursor
+}
+
+// ---------------------------------------------------------------------------
+// Search: transactions and accounts
+//
+// Both queries paginate on a bare id, descending, rather than on a
+// (created_at, id) pair the way StatementCursor does. Transaction and account
+// ids are UUIDv7 (D3), so id order already IS creation order -- closely
+// enough that a second sort column buys nothing a filtered primary-key-order
+// scan does not already give for free, and it is what lets both searches
+// reuse the primary key index with no new migration.
+// ---------------------------------------------------------------------------
+
+// TransactionQuery selects one keyset-paginated page of transactions.
+type TransactionQuery struct {
+	// ExternalRef, when set, matches as a case-insensitive substring -- this is
+	// a search box, not an exact-match lookup (GetTransaction and the
+	// external_ref-based support tooling already cover the exact case).
+	ExternalRef *string
+	Status      TransactionStatus
+	Type        TransactionType
+
+	// AccountID, when set, restricts to transactions with at least one entry
+	// against this account.
+	AccountID *uuid.UUID
+
+	From time.Time
+	To   time.Time
+
+	Limit int
+
+	// After is the id of the last transaction on the previous page, or nil for
+	// the first.
+	After *uuid.UUID
+}
+
+// TransactionPage is one page of transaction headers, newest first. Entries
+// are never populated here; see SearchTransactions.
+type TransactionPage struct {
+	Transactions []Transaction
+
+	// NextCursor is nil once the page is the last one.
+	NextCursor *uuid.UUID
+}
+
+// AccountQuery selects one keyset-paginated page of accounts.
+type AccountQuery struct {
+	// ExternalRef, when set, matches as a case-insensitive substring.
+	ExternalRef *string
+	OwnerID     *string
+	Currency    string
+
+	Limit int
+
+	// After is the id of the last account on the previous page, or nil for the
+	// first.
+	After *uuid.UUID
+}
+
+// AccountPage is one page of accounts, newest first.
+type AccountPage struct {
+	Accounts []Account
+
+	// NextCursor is nil once the page is the last one.
+	NextCursor *uuid.UUID
 }

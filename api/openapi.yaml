@@ -57,6 +57,65 @@ tags:
 
 paths:
   /v1/transactions:
+    get:
+      tags: [transactions]
+      summary: Search transactions
+      operationId: searchTransactions
+      description: |
+        The ledger explorer's search: one keyset-paginated page of transaction
+        headers, newest first, matching every filter supplied. Entries are not
+        included -- a match is a candidate to open with `GET
+        /v1/transactions/{id}`, not the full journal for every one at once.
+
+        `external_ref` matches as a case-insensitive substring; every other
+        filter is an exact match. Requires authentication: a result carries
+        amounts and external references, the same class of information D24
+        already scopes idempotency responses to a principal to protect.
+      parameters:
+        - name: external_ref
+          in: query
+          schema: { type: string }
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/TransactionStatus' }
+        - name: type
+          in: query
+          schema: { $ref: '#/components/schemas/TransactionType' }
+        - name: account_id
+          in: query
+          description: Restrict to transactions with at least one entry against this account.
+          schema: { type: string, format: uuid }
+        - name: from
+          in: query
+          description: Start of the period. Defaults to 30 days ago.
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          description: End of the period. Defaults to now.
+          schema: { type: string, format: date-time }
+        - name: limit
+          in: query
+          description: Page size. Clamped to 1000.
+          schema: { type: integer, default: 100, minimum: 1, maximum: 1000 }
+        - name: cursor
+          in: query
+          description: The `next_cursor` from the previous page.
+          schema: { type: string }
+      responses:
+        '200':
+          description: One page of matching transactions.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionList'
+        '401':
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
     post:
       tags: [transactions]
       summary: Post a balanced transaction
@@ -168,6 +227,118 @@ paths:
           $ref: '#/components/responses/InternalError'
         '503':
           $ref: '#/components/responses/Unavailable'
+
+  /v1/transactions/{id}:
+    get:
+      tags: [transactions]
+      summary: Read one transaction and its journal entries
+      operationId: getTransaction
+      description: |
+        The ledger explorer's drill-down: the transaction header and every one
+        of its entries, in submission order. Requires authentication, for the
+        same reason the search above does.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: The transaction.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transaction'
+        '401':
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: No such transaction.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/accounts:
+    get:
+      tags: [accounts]
+      summary: Search accounts
+      operationId: searchAccounts
+      description: |
+        One keyset-paginated page of accounts, newest first, matching every
+        filter supplied. Sharded accounts never appear: a shard is internal
+        routing plumbing (see docs/DECISIONS.md D25), not a distinct
+        customer-facing account.
+
+        `external_ref` matches as a case-insensitive substring; `owner_id` and
+        `currency` are exact matches. Requires authentication: an unauthenticated
+        search would let any caller enumerate the whole chart of accounts,
+        which already-knowing-a-UUID (`GET /v1/accounts/{id}/balance`) does not.
+      parameters:
+        - name: external_ref
+          in: query
+          schema: { type: string }
+        - name: owner_id
+          in: query
+          schema: { type: string }
+        - name: currency
+          in: query
+          schema: { type: string, pattern: '^[A-Z]{3}$' }
+        - name: limit
+          in: query
+          description: Page size. Clamped to 1000.
+          schema: { type: integer, default: 100, minimum: 1, maximum: 1000 }
+        - name: cursor
+          in: query
+          description: The `next_cursor` from the previous page.
+          schema: { type: string }
+      responses:
+        '200':
+          description: One page of matching accounts.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountList'
+        '401':
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+  /v1/accounts/{id}:
+    get:
+      tags: [accounts]
+      summary: Read one account's metadata
+      operationId: getAccount
+      description: |
+        An account's metadata -- not its balance; see `GET
+        /v1/accounts/{id}/balance` for that. Requires authentication, for the
+        same reason the search above does.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: The account.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Account'
+        '401':
+          description: Missing or invalid API key.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: No such account.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
 
   /v1/accounts/{id}/balance:
     get:
@@ -500,11 +671,16 @@ components:
       bearerFormat: lk_live_<64 hex characters>
       description: |
         A key minted by `cmd/issue-api-key`. Presented as
-        `Authorization: Bearer <key>`. Required on every write route; read
-        routes take none, because there is no per-principal authorization
-        model on this schema yet (see docs/DECISIONS.md D47) -- authentication
-        alone is what scopes the idempotency namespace, which is all this
-        header exists to provide today.
+        `Authorization: Bearer <key>`. Required on every write route.
+
+        Most read routes take none -- `GET /v1/accounts/{id}/balance` and
+        `.../statement` require already knowing the account's UUID, and there
+        is no per-principal authorization model on this schema yet (see
+        docs/DECISIONS.md D47) for a key to usefully scope anyway. A handful of
+        reads that would otherwise let any caller enumerate amounts, external
+        references or the chart of accounts DO require it: reconciliation
+        runs, transaction search and drill-down, and account search and
+        lookup. Each documents this on its own operation.
 
   parameters:
     IdempotencyKey:
@@ -666,6 +842,57 @@ components:
         entries:
           type: array
           items: { $ref: '#/components/schemas/Entry' }
+
+    TransactionList:
+      type: object
+      required: [transactions, next_cursor]
+      description: One keyset-paginated page from GET /v1/transactions.
+      properties:
+        transactions:
+          type: array
+          items: { $ref: '#/components/schemas/Transaction' }
+        next_cursor:
+          type: [string, 'null']
+          description: Null on the last page. Opaque; pass it back as `cursor`.
+
+    AccountType:
+      type: string
+      enum: [ASSET, LIABILITY, EQUITY, REVENUE, EXPENSE]
+
+    AccountStatus:
+      type: string
+      enum: [ACTIVE, FROZEN, CLOSED]
+      description: Only ACTIVE accounts may be posted to.
+
+    Account:
+      type: object
+      required: [id, external_ref, account_type, normal_balance, currency,
+                  allow_negative, status, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        external_ref: { type: string }
+        account_type: { $ref: '#/components/schemas/AccountType' }
+        normal_balance: { $ref: '#/components/schemas/Direction' }
+        currency:
+          type: string
+          pattern: '^[A-Z]{3}$'
+        owner_id: { type: string }
+        allow_negative: { type: boolean }
+        status: { $ref: '#/components/schemas/AccountStatus' }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    AccountList:
+      type: object
+      required: [accounts, next_cursor]
+      description: One keyset-paginated page from GET /v1/accounts.
+      properties:
+        accounts:
+          type: array
+          items: { $ref: '#/components/schemas/Account' }
+        next_cursor:
+          type: [string, 'null']
+          description: Null on the last page. Opaque; pass it back as `cursor`.
 
     Balance:
       type: object

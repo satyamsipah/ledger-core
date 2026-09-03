@@ -72,6 +72,10 @@ func gatherEnvironmentInfo(ctx context.Context, composeFile string, pool *pgxpoo
 // it -- not an error, just the signal to report the documented default
 // instead.
 func containerEnvOrDefault(ctx context.Context, composeFile, service, key, fallback string) string {
+	//nolint:gosec // G204: composeFile is this process's own CLI flag,
+	// service/key are call-site literals ("api", "LEDGER_POSTGRES_MAX_CONNS")
+	// -- never external input; see resolveContainerNames's identical
+	// reasoning.
 	cmd := exec.CommandContext(ctx, "docker", "compose", "-f", composeFile, "exec", "-T", service, "printenv", key)
 	out, err := cmd.Output()
 	if err != nil {

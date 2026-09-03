@@ -44,6 +44,9 @@ func (r scenarioResult) overallOK() bool {
 }
 
 func writeJSONReport(path string, report runReport) error {
+	//nolint:gosec // G304: path is filepath.Join(*resultsDir, "benchmarks.json"),
+	// resultsDir this process's own -results-dir CLI flag -- never external
+	// input.
 	f, err := os.Create(path)
 	if err != nil {
 		return fmt.Errorf("create %s: %w", path, err)
@@ -113,7 +116,7 @@ func renderMarkdown(path string, report runReport) error {
 			passFail(s.Correctness.OK))
 	}
 
-	return os.WriteFile(path, []byte(b.String()), 0o644)
+	return os.WriteFile(path, []byte(b.String()), 0o600)
 }
 
 func passFail(ok bool) string {

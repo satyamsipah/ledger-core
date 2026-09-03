@@ -29,6 +29,10 @@ import (
 // here still has compose's default naming, so this harness has to ask rather
 // than guess for those).
 func resolveContainerNames(ctx context.Context, composeFile string, wantServices []string) (map[string]string, error) {
+	//nolint:gosec // G204: composeFile is this process's own -compose-file
+	// CLI flag (default deploy/docker-compose.yml), never external input --
+	// this binary is a developer-run benchmarking tool, not a network-facing
+	// service.
 	cmd := exec.CommandContext(ctx, "docker", "compose", "-f", composeFile, "ps", "--format", "json")
 	out, err := cmd.Output()
 	if err != nil {
@@ -141,6 +145,10 @@ func (s *statsSampler) run(ctx context.Context, containerNames []string, interva
 // pass/fail result.
 func (s *statsSampler) sampleOnce(ctx context.Context, containerNames []string) {
 	args := append([]string{"stats", "--no-stream", "--format", "{{json .}}"}, containerNames...)
+	//nolint:gosec // G204: containerNames come from resolveContainerNames,
+	// which reads them back from `docker compose ps` itself -- Docker-
+	// generated, not external input; see the identical reasoning already
+	// established for test/kafka_testdb.go's own container-name arguments.
 	cmd := exec.CommandContext(ctx, "docker", args...)
 	out, err := cmd.Output()
 	if err != nil {

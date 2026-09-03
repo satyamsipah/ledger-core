@@ -60,14 +60,25 @@ func runK6(ctx context.Context, k6Bin string, s scenario, env map[string]string,
 		args = append(args, "-e", fmt.Sprintf("%s=%s", k, v))
 	}
 
+	//nolint:gosec // G204: k6Bin and args come from this process's own CLI
+	// flags and scenario registry, never from network or user-request input --
+	// this binary is a developer-run benchmarking tool, not a network-facing
+	// service.
 	cmd := exec.CommandContext(ctx, k6Bin, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	runErr := cmd.Run()
 
+	//nolint:gosec // G304: summaryPath is built by this process itself
+	// (filepath.Join of its own temp dir and scenario name), never external
+	// input.
 	data, err := os.ReadFile(summaryPath)
 	if err != nil {
-		return k6Summary{}, false, fmt.Errorf("read k6 summary %s: %w (k6 run error: %v)", summaryPath, err, runErr)
+		// Both %w: Go 1.20+ allows more than one, and both are genuinely
+		// this failure's causes -- the summary read failing IS the error
+		// returned, but k6's own exit (if non-nil) is what makes it
+		// diagnosable rather than a bare "file not found".
+		return k6Summary{}, false, fmt.Errorf("read k6 summary %s: %w (k6 run error: %w)", summaryPath, err, runErr)
 	}
 
 	var summary k6Summary

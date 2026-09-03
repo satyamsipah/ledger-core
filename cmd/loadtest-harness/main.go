@@ -184,7 +184,7 @@ func run() error {
 		Scenarios:   results,
 	}
 
-	if err := os.MkdirAll(*resultsDir, 0o755); err != nil {
+	if err := os.MkdirAll(*resultsDir, 0o750); err != nil {
 		return fmt.Errorf("create results dir %s: %w", *resultsDir, err)
 	}
 	jsonPath := filepath.Join(*resultsDir, "benchmarks.json")

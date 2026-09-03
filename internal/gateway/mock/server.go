@@ -188,6 +188,9 @@ func (s *Server) pay(w http.ResponseWriter, r *http.Request) {
 	}
 
 	outcome := behaviour.Outcome
+	//nolint:gosec // G404: fault-injection probability, not a security
+	// primitive -- the same reasoning already established for shard
+	// selection (internal/ledger/service.go) and retry jitter (internal/db/retry.go).
 	if behaviour.FailureRatePercent > 0 && rand.IntN(100) < behaviour.FailureRatePercent {
 		outcome = "error"
 	}

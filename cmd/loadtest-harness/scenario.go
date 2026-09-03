@@ -23,6 +23,36 @@ var scenarios = []scenario{
 		EndpointTag: "post_transaction",
 		Description: "Two fixed accounts, moderate steady-state rate. Every other scenario is read against this one.",
 	},
+	{
+		Name:        "hot_account",
+		Script:      "test/load/hot_account.js",
+		EndpointTag: "post_transaction",
+		Description: "Same rate and shape as baseline_simple_transfer; 90% of traffic credits one account instead of spreading out, isolating row-lock contention's cost (D11).",
+	},
+	{
+		Name:        "idempotent_retry_storm",
+		Script:      "test/load/idempotent_retry_storm.js",
+		EndpointTag: "post_transaction",
+		Description: "30% of requests replay an exact earlier (key, body) pair from the same VU, exercising the idempotency read path (D20) instead of PostTransaction.",
+	},
+	{
+		Name:        "saga_heavy",
+		Script:      "test/load/saga_heavy.js",
+		EndpointTag: "start_payout",
+		Description: "Full RESERVE/GATEWAY/SETTLE marketplace payouts against a gateway failing 5% of calls ambiguously; each iteration polls the saga to a settled state rather than trusting the 202.",
+	},
+	{
+		Name:   "mixed_realistic",
+		Script: "test/load/mixed_realistic.js",
+		// Empty: this scenario tags every request by which of its four
+		// sub-shapes produced it (mixed_transfer/mixed_hot/mixed_retry/
+		// mixed_payout), so there is no single tagged submetric that
+		// represents "the mix" -- the untagged http_req_duration, which pools
+		// all four, is the honest answer for a blended scenario's own summary
+		// row.
+		EndpointTag: "",
+		Description: "A weighted concurrent blend of the other four scenarios (60% transfers, 20% hot-account, 15% idempotent retries, 5% payouts) via k6's own multi-scenario executor.",
+	},
 }
 
 func findScenario(name string) (scenario, bool) {

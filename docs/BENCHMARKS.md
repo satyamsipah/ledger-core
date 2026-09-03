@@ -1,6 +1,6 @@
 # Load test benchmarks
 
-Generated 2026-09-03T06:31:09+05:30 by `make loadtest` (cmd/loadtest-harness). Reproduce with:
+Generated 2026-09-03T06:55:09+05:30 by `make loadtest` (cmd/loadtest-harness). Reproduce with:
 
 ```
 make loadtest
@@ -27,20 +27,20 @@ make loadtest
 
 | Scenario | Requests | Throughput (req/s) | p50 (ms) | p95 (ms) | p99 (ms) | Error rate | Thresholds | Correctness |
 |---|---|---|---|---|---|---|---|---|
-| baseline_simple_transfer | 7248 | 85.3 | 3.34 | 11.84 | 260.65 | 0.000% | PASS | PASS |
+| mixed_realistic | 11320 | 98.4 | 3.37 | 11.11 | 52.53 | 0.000% | PASS | PASS |
 
-## baseline_simple_transfer
+## mixed_realistic
 
-Two fixed accounts, moderate steady-state rate. Every other scenario is read against this one.
+A weighted concurrent blend of the other four scenarios (60% transfers, 20% hot-account, 15% idempotent retries, 5% payouts) via k6's own multi-scenario executor.
 
-- Duration: 86.2s, 7248 requests, 85.3 req/s
-- Latency: p50=3.34ms p95=11.84ms p99=260.65ms
+- Duration: 115.7s, 11320 requests, 98.4 req/s
+- Latency: p50=3.37ms p95=11.11ms p99=52.53ms
 - Error rate: 0.000%
 - Serialization retries (`ledger_db_tx_retries_total` increase over the run): 0
-- Outbox lag at end of run: 31.31s (Debezium arm: replication-slot confirmation lag, bounded below by Kafka Connect's `offset.flush.interval.ms` -- not a queue depth; see cmd/loadtest-harness/prometheus.go's doc comment)
+- Outbox lag at end of run: 32.12s (Debezium arm: replication-slot confirmation lag, bounded below by Kafka Connect's `offset.flush.interval.ms` -- not a queue depth; see cmd/loadtest-harness/prometheus.go's doc comment)
 - Consumer lag at end of run: 0
-- `api` container: CPU avg 12.4% / max 35.9%, memory avg 31.4MB / max 35.1MB
-- `postgres` container: CPU avg 23.6% / max 91.3%, memory avg 155.2MB / max 197.9MB
+- `api` container: CPU avg 11.0% / max 30.9%, memory avg 25.6MB / max 30.0MB
+- `postgres` container: CPU avg 22.6% / max 101.9%, memory avg 346.7MB / max 358.0MB
 - Thresholds: PASS
 - Correctness-under-load proof (global invariant, projection drift, orphans, async-pipeline rebuild, all against this run's own data): PASS
 

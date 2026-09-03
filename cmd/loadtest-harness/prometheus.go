@@ -62,12 +62,41 @@ func promInstantQuery(ctx context.Context, promURL, query string) (float64, erro
 	return strconv.ParseFloat(str, 64)
 }
 
+// promScrapeInterval mirrors deploy/prometheus/prometheus.yml's
+// `global.scrape_interval`. Not read from that file -- there is no live
+// config-sharing path between it and this binary -- but load-bearing enough
+// (see waitForPipelineDrained's own comment) that it is named here rather
+// than left as a bare literal.
+const promScrapeInterval = 10 * time.Second
+
 // waitForPipelineDrained polls the outbox backlog and the projector's
-// consumer lag until both read zero, so the correctness proof that follows
-// (in particular internal/projector.Rebuild, which diffs journal_entries
-// against the KAFKA-DRIVEN projection) is comparing against a projection
-// that has actually caught up with the load just generated -- not reporting
-// a false mismatch for every event still in flight.
+// consumer lag until both read zero TWICE, with a gap longer than
+// Prometheus's own scrape interval between the two readings, so the
+// correctness proof that follows (in particular internal/projector.Rebuild,
+// which diffs journal_entries against the KAFKA-DRIVEN projection) is
+// comparing against a projection that has actually caught up with the load
+// just generated -- not reporting a false mismatch for an event still in
+// flight.
+//
+// The double-check with a scrape-interval gap is not defensive
+// over-engineering -- it fixes a real failure observed running this exact
+// function against a live stack. A single zero reading is not proof of
+// nothing in flight: Prometheus refreshes ledger_projector_consumer_lag only
+// once per scrape_interval (10s), so a reading taken between scrapes can be
+// up to 10s stale. mixed_realistic's own payouts (saga_heavy.js's shape,
+// each ending in a SETTLE transaction whose BalanceUpdated event still has
+// to travel outbox -> Kafka -> projector) kept producing new events for
+// several seconds after the LAST scrape this function happened to poll,
+// so a single zero read passed while the freshest SETTLE event was still
+// unconsumed -- internal/projector.Rebuild then reported a real, reproducible
+// mismatch on the exact two accounts (payout suspense and the customer
+// wallet) that saga's SETTLE touches, off by exactly its own payout amount.
+// Re-running cmd/projector -rebuild ~45s later, with no new load, showed a
+// clean match -- confirming the pipeline HAD caught up and the earlier
+// report was a race in this function, not real drift. Requiring the SAME
+// zero result to hold across a gap longer than one scrape interval is what
+// actually closes that race, rather than polling faster (which samples the
+// same stale scrape value more often, not a fresher one).
 //
 // Deliberately NOT gated on ledger_outbox_lag_seconds, despite that metric's
 // own doc comment ("zero when nothing is unpublished") suggesting it belongs
@@ -75,7 +104,7 @@ func promInstantQuery(ctx context.Context, promURL, query string) (float64, erro
 // pg_stat_replication.replay_lag on the outbox replication slot -- the WAL
 // PUBLISHER's confirmation lag, not a queue depth -- and it is bounded below
 // by Kafka Connect's own `offset.flush.interval.ms` (60s by default), which
-// governs how often Debezium's own offset commit advances the slot's
+// governs how often the connector's own offset commit advances the slot's
 // confirmed position. It was observed, running this exact wait against a
 // live stack, to sit at 40-80s for a full minute after every event had
 // already been produced to Kafka AND consumed by the projector -- confirmed
@@ -89,6 +118,9 @@ func promInstantQuery(ctx context.Context, promURL, query string) (float64, erro
 // output -- it is a real and useful number, just not a drain signal.
 func waitForPipelineDrained(ctx context.Context, promURL string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
+	consecutiveZero := 0
+	const requiredConsecutiveZero = 2 // spans > one scrape interval; see doc comment
+
 	for {
 		backlog, err := promInstantQuery(ctx, promURL, `sum(ledger_outbox_backlog{job="outbox-publisher"})`)
 		if err != nil {
@@ -98,16 +130,23 @@ func waitForPipelineDrained(ctx context.Context, promURL string, timeout time.Du
 		if err != nil {
 			return fmt.Errorf("query consumer lag: %w", err)
 		}
+
 		if backlog == 0 && consumerLag == 0 {
-			return nil
+			consecutiveZero++
+			if consecutiveZero >= requiredConsecutiveZero {
+				return nil
+			}
+		} else {
+			consecutiveZero = 0
 		}
+
 		if time.Now().After(deadline) {
 			return fmt.Errorf("pipeline did not drain within %s (outbox backlog=%.0f, consumer lag=%.0f)", timeout, backlog, consumerLag)
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(2 * time.Second):
+		case <-time.After(promScrapeInterval + 2*time.Second):
 		}
 	}
 }

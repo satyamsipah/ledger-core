@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-03T06:31:09.085372+05:30",
+  "generated_at": "2026-09-03T06:55:09.490326+05:30",
   "environment": {
     "caveat": "Single-node local/dev environment (Docker Compose on one developer machine), not a production cluster. Absolute numbers describe this machine; do not quote them as production capacity.",
     "os": "darwin",
@@ -14,31 +14,31 @@
   },
   "scenarios": [
     {
-      "name": "baseline_simple_transfer",
-      "description": "Two fixed accounts, moderate steady-state rate. Every other scenario is read against this one.",
-      "started_at": "2026-09-03T06:29:42.457234+05:30",
-      "duration_seconds": 86.171992208,
-      "total_requests": 7248,
-      "throughput_rps": 85.25477297340889,
-      "p50_ms": 3.336,
-      "p95_ms": 11.844949999999999,
-      "p99_ms": 260.64599,
+      "name": "mixed_realistic",
+      "description": "A weighted concurrent blend of the other four scenarios (60% transfers, 20% hot-account, 15% idempotent retries, 5% payouts) via k6's own multi-scenario executor.",
+      "started_at": "2026-09-03T06:52:37.185274+05:30",
+      "duration_seconds": 115.702975209,
+      "total_requests": 11320,
+      "throughput_rps": 98.40025780867545,
+      "p50_ms": 3.3725,
+      "p95_ms": 11.10905,
+      "p99_ms": 52.529469999999726,
       "error_rate_percent": 0,
       "thresholds_passed": true,
       "serialization_retries": 0,
-      "outbox_lag_seconds_at_end": 31.311848,
+      "outbox_lag_seconds_at_end": 32.118924,
       "consumer_lag_at_end": 0,
       "api_resources": {
-        "CPUAvgPercent": 12.40214285714286,
-        "CPUMaxPercent": 35.93,
-        "MemAvgMB": 31.352857142857136,
-        "MemMaxMB": 35.09
+        "CPUAvgPercent": 10.964285714285712,
+        "CPUMaxPercent": 30.86,
+        "MemAvgMB": 25.613214285714303,
+        "MemMaxMB": 30
       },
       "postgres_resources": {
-        "CPUAvgPercent": 23.598809523809525,
-        "CPUMaxPercent": 91.29,
-        "MemAvgMB": 155.15023809523808,
-        "MemMaxMB": 197.9
+        "CPUAvgPercent": 22.591785714285702,
+        "CPUMaxPercent": 101.92,
+        "MemAvgMB": 346.7232142857142,
+        "MemMaxMB": 358
       },
       "correctness": {
         "global_invariant": {

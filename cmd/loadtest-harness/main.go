@@ -45,7 +45,7 @@ func run() error {
 	k6Bin := flag.String("k6-bin", "k6", "the k6 binary to invoke")
 	principal := flag.String("principal", "loadtest", "the principal this harness authenticates load-test traffic as (internal/auth/pgauth.Issue)")
 	resultsDir := flag.String("results-dir", "docs", "directory to write benchmarks.json and BENCHMARKS.md into")
-	drainTimeout := flag.Duration("drain-timeout", 60*time.Second, "how long to wait for the outbox backlog and consumer lag to reach zero before running the correctness proof")
+	drainTimeout := flag.Duration("drain-timeout", 120*time.Second, "how long to wait for the outbox backlog and consumer lag to reach zero (twice, across a gap longer than Prometheus's own scrape interval) before running the correctness proof")
 	statsInterval := flag.Duration("stats-interval", 2*time.Second, "docker stats sampling interval")
 	flag.Parse()
 

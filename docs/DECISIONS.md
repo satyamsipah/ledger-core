@@ -2833,17 +2833,28 @@ filter buttons, status badges, and the drill-down link to the real
 transaction the timing-difference exception matched.
 
 **A third bug, found by this second pass -- pre-existing, not introduced by
-this phase, and deliberately not fixed here.** The reconciliation list view
-(`app/reconciliation/page.tsx`) renders a per-run "by category" badge
-column, populated from `ReconciliationRun.by_category` -- present and
-correct on `GET /v1/reconciliation/runs/{id}` (the single-run read used by
-the drill-down above), but `pgreconciliation.Repository.ListRuns` never
-queries or populates it at all, so the list endpoint always returns it
-absent. `api/openapi.yaml`'s schema documents `by_category` as a plain
-field with no "single-run only" caveat (unlike `exceptions`, which states
-one explicitly), so the list endpoint is not honoring its own documented
-contract -- a Phase 6 gap, invisible until something actually rendered the
-list's `by_category` and found it empty. Flagged as a follow-up task rather
-than fixed in this PR: it is unrelated Phase 6 code, and this phase's own
-scope is additive read endpoints plus the dashboard that consumes them, not
-an audit of every existing read path.
+this phase, and deliberately not fixed in this PR.** The reconciliation
+list view (`app/reconciliation/page.tsx`) renders a per-run "by category"
+badge column, populated from `ReconciliationRun.by_category` -- present
+and correct on `GET /v1/reconciliation/runs/{id}` (the single-run read
+used by the drill-down above), but `pgreconciliation.Repository.ListRuns`
+never queried or populated it at all, so the list endpoint always
+returned it absent. `api/openapi.yaml`'s schema documents `by_category`
+as a plain field with no "single-run only" caveat (unlike `exceptions`,
+which states one explicitly), so the list endpoint was not honoring its
+own documented contract -- a Phase 6 gap, invisible until something
+actually rendered the list's `by_category` and found it empty. Flagged as
+a follow-up task rather than fixed inline: it was unrelated Phase 6 code,
+and this phase's own scope was additive read endpoints plus the dashboard
+that consumes them, not an audit of every existing read path.
+
+**Closed separately, same day.** A second Claude session, spawned from
+this flag, batch-queried category breakdowns for every run on a page (one
+`GROUP BY run_id, category` query in `ListRuns`, alongside `GetRun`'s
+existing per-run query, both now sharing the same shape) and added
+`TestReconciliation_ListRunsIncludesByCategory`, which drives a real
+`AMOUNT_MISMATCH` through the engine and asserts the *list* endpoint --
+not the single-run read -- returns it. Merged as
+[#8](https://github.com/satyamsipah/ledger-core/pull/8), `fix(reconciliation):
+populate by_category on ListRuns`, after CI passed clean on a rebase onto
+this phase's own merged `main`.

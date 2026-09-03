@@ -1,0 +1,7 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Architecture question
+    url: https://github.com/satyamsipah/ledger-core/blob/main/docs/ARCHITECTURE.md
+    about: Check docs/ARCHITECTURE.md and docs/DECISIONS.md before opening
+      an issue — most "why does it work this way" questions are already
+      answered there, with the rejected alternatives.

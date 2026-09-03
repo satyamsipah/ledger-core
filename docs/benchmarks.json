@@ -1,0 +1,66 @@
+{
+  "generated_at": "2026-09-03T06:31:09.085372+05:30",
+  "environment": {
+    "caveat": "Single-node local/dev environment (Docker Compose on one developer machine), not a production cluster. Absolute numbers describe this machine; do not quote them as production capacity.",
+    "os": "darwin",
+    "arch": "arm64",
+    "cpu_count": 8,
+    "postgres_version": "PostgreSQL 16.15 on aarch64-unknown-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit",
+    "postgres_shared_buffers": "128MB",
+    "postgres_max_connections": "100",
+    "postgres_wal_level": "logical",
+    "pool_max_conns": "20 (internal/config default; not overridden)",
+    "pool_min_conns": "2 (internal/config default; not overridden)"
+  },
+  "scenarios": [
+    {
+      "name": "baseline_simple_transfer",
+      "description": "Two fixed accounts, moderate steady-state rate. Every other scenario is read against this one.",
+      "started_at": "2026-09-03T06:29:42.457234+05:30",
+      "duration_seconds": 86.171992208,
+      "total_requests": 7248,
+      "throughput_rps": 85.25477297340889,
+      "p50_ms": 3.336,
+      "p95_ms": 11.844949999999999,
+      "p99_ms": 260.64599,
+      "error_rate_percent": 0,
+      "thresholds_passed": true,
+      "serialization_retries": 0,
+      "outbox_lag_seconds_at_end": 31.311848,
+      "consumer_lag_at_end": 0,
+      "api_resources": {
+        "CPUAvgPercent": 12.40214285714286,
+        "CPUMaxPercent": 35.93,
+        "MemAvgMB": 31.352857142857136,
+        "MemMaxMB": 35.09
+      },
+      "postgres_resources": {
+        "CPUAvgPercent": 23.598809523809525,
+        "CPUMaxPercent": 91.29,
+        "MemAvgMB": 155.15023809523808,
+        "MemMaxMB": 197.9
+      },
+      "correctness": {
+        "global_invariant": {
+          "Violations": null
+        },
+        "projection_drift": {
+          "AccountsCompared": 12,
+          "Drifted": null,
+          "TotalDrifted": 0
+        },
+        "orphans": {
+          "FewEntryTransactions": null,
+          "TotalFewEntry": 0,
+          "OrphanEntries": null,
+          "TotalOrphanEntries": 0
+        },
+        "async_pipeline_rebuild": {
+          "AccountsCompared": 12,
+          "Mismatches": null
+        },
+        "ok": true
+      }
+    }
+  ]
+}

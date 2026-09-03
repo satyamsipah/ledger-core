@@ -16,7 +16,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"log/slog"
 	nethttp "net/http"
@@ -40,10 +42,91 @@ import (
 const serviceName = "reconciler"
 
 func main() {
-	if err := run(); err != nil {
+	check := flag.Bool("check", false, "run the internal consistency checks once, print a JSON report to stdout, and exit non-zero on any violation")
+	flag.Parse()
+
+	var err error
+	if *check {
+		err = runCheck()
+	} else {
+		err = run()
+	}
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// checkReport is runCheck's JSON output shape. It carries every result the
+// long-lived consistency loop already produces, plus one field that loop
+// never needed: a single OK a caller can gate on without knowing which of the
+// three checks it should inspect.
+type checkReport struct {
+	GlobalInvariant consistency.GlobalInvariantResult `json:"global_invariant"`
+	ProjectionDrift consistency.DriftResult           `json:"projection_drift"`
+	Orphans         consistency.OrphanResult          `json:"orphans"`
+	OK              bool                              `json:"ok"`
+}
+
+// runCheck is a one-shot: connect, run the same three internal structural
+// checks runConsistencyLoop below runs forever, print the result as JSON, and
+// exit non-zero if any of them found a violation.
+//
+// This is what makes "N transactions, zero balance drift" a claim the
+// load-testing harness (cmd/loadtest-harness) can actually verify rather than
+// assert -- the long-lived loop below reports through a Prometheus gauge,
+// which is the right shape for continuous monitoring but not for a one-shot
+// pass/fail a shell script or another Go program can check the exit code of.
+// It deliberately mirrors cmd/projector's own -rebuild flag rather than
+// inventing a different shape for the same kind of one-shot proof.
+func runCheck() error {
+	cfg, err := config.Load(serviceName)
+	if err != nil {
+		return err
+	}
+
+	logger := observability.NewLogger(cfg.Observability, serviceName, cfg.Env)
+
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.Postgres.QueryTimeout*10)
+	defer cancel()
+
+	pool, err := db.NewPool(ctx, cfg.Postgres, logger)
+	if err != nil {
+		return fmt.Errorf("init postgres: %w", err)
+	}
+	defer pool.Close()
+
+	invariant, err := consistency.CheckGlobalInvariant(ctx, pool.Pool)
+	if err != nil {
+		return fmt.Errorf("check global invariant: %w", err)
+	}
+	drift, err := consistency.CheckProjectionDrift(ctx, pool.Pool)
+	if err != nil {
+		return fmt.Errorf("check projection drift: %w", err)
+	}
+	orphans, err := consistency.CheckOrphans(ctx, pool.Pool)
+	if err != nil {
+		return fmt.Errorf("check orphans: %w", err)
+	}
+
+	report := checkReport{
+		GlobalInvariant: invariant,
+		ProjectionDrift: drift,
+		Orphans:         orphans,
+		OK:              invariant.OK() && drift.OK() && orphans.OK(),
+	}
+
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(report); err != nil {
+		return fmt.Errorf("encode check report: %w", err)
+	}
+
+	if !report.OK {
+		return fmt.Errorf("consistency check failed: global_invariant_ok=%v projection_drift_ok=%v orphans_ok=%v",
+			invariant.OK(), drift.OK(), orphans.OK())
+	}
+	return nil
 }
 
 func run() error {

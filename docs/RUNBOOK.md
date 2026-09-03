@@ -197,8 +197,10 @@ a customer's payout is not completing.
     LIMIT 20;
    ```
 3. Read its attempt history for the actual failure:
-   `GET /v1/sagas/{id}` (requires auth — see README's Authentication
-   section) returns every `saga_steps` row with its error.
+   `GET /v1/sagas/{id}` (no auth required — saga reads are unauthenticated,
+   unlike transaction and reconciliation reads; see
+   [docs/ARCHITECTURE.md](ARCHITECTURE.md#authentication)) returns every
+   `saga_steps` row with its error.
 4. If the step is `GATEWAY`, check the gateway itself is reachable and
    answering — `mock-gateway`'s own `/healthz` locally, or the real payment
    gateway's status page in production.

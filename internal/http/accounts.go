@@ -145,3 +145,69 @@ func handleGetStatement(service LedgerService) nethttp.HandlerFunc {
 		writeJSON(w, nethttp.StatusOK, newStatementResponse(statement))
 	}
 }
+
+// handleGetAccount answers with one account's metadata -- the account view's
+// entry point once a search result, or a known id, has been chosen.
+func handleGetAccount(service LedgerService) nethttp.HandlerFunc {
+	return func(w nethttp.ResponseWriter, r *nethttp.Request) {
+		id, err := uuid.Parse(chi.URLParam(r, "id"))
+		if err != nil {
+			writeProblem(w, r, fmt.Errorf("account id %q is not a UUID: %w",
+				chi.URLParam(r, "id"), ledger.ErrAccountNotFound))
+			return
+		}
+
+		account, err := service.GetAccount(r.Context(), id)
+		if err != nil {
+			writeProblem(w, r, err)
+			return
+		}
+
+		writeJSON(w, nethttp.StatusOK, newAccountResponse(account))
+	}
+}
+
+// handleSearchAccounts answers with one keyset-paginated page of accounts
+// matching the query parameters. Sharded accounts never appear: see
+// Repository.SearchAccounts.
+func handleSearchAccounts(service LedgerService) nethttp.HandlerFunc {
+	return func(w nethttp.ResponseWriter, r *nethttp.Request) {
+		params := r.URL.Query()
+		query := ledger.AccountQuery{}
+
+		if raw := params.Get("external_ref"); raw != "" {
+			query.ExternalRef = &raw
+		}
+		if raw := params.Get("owner_id"); raw != "" {
+			query.OwnerID = &raw
+		}
+		if raw := params.Get("currency"); raw != "" {
+			query.Currency = raw
+		}
+		if raw := params.Get("limit"); raw != "" {
+			limit, err := strconv.Atoi(raw)
+			if err != nil {
+				writeProblem(w, r, fmt.Errorf("limit %q is not an integer: %w: %w",
+					raw, err, ledger.ErrInvalidEntry))
+				return
+			}
+			query.Limit = limit
+		}
+		if raw := params.Get("cursor"); raw != "" {
+			after, err := decodeIDCursor(raw)
+			if err != nil {
+				writeProblem(w, r, err)
+				return
+			}
+			query.After = &after
+		}
+
+		page, err := service.SearchAccounts(r.Context(), query)
+		if err != nil {
+			writeProblem(w, r, err)
+			return
+		}
+
+		writeJSON(w, nethttp.StatusOK, newAccountListResponse(page))
+	}
+}

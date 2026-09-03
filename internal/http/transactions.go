@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	nethttp "net/http"
+	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -27,6 +28,10 @@ type LedgerService interface {
 	GetBalance(ctx context.Context, accountID uuid.UUID) (ledger.Balance, error)
 	GetBalanceAsOf(ctx context.Context, accountID uuid.UUID, at time.Time) (ledger.Money, error)
 	GetStatement(ctx context.Context, q ledger.StatementQuery) (ledger.Statement, error)
+	GetTransaction(ctx context.Context, id uuid.UUID) (*ledger.Transaction, error)
+	SearchTransactions(ctx context.Context, q ledger.TransactionQuery) (ledger.TransactionPage, error)
+	GetAccount(ctx context.Context, id uuid.UUID) (*ledger.Account, error)
+	SearchAccounts(ctx context.Context, q ledger.AccountQuery) (ledger.AccountPage, error)
 }
 
 // handlePostTransaction posts a balanced transaction.
@@ -119,6 +124,101 @@ func handleReverseTransaction(service LedgerService) nethttp.HandlerFunc {
 		state.settle()
 
 		writeStored(w, reversal)
+	}
+}
+
+// handleGetTransaction answers with one transaction and every one of its
+// journal entries -- the ledger explorer's drill-down.
+func handleGetTransaction(service LedgerService) nethttp.HandlerFunc {
+	return func(w nethttp.ResponseWriter, r *nethttp.Request) {
+		id, err := uuid.Parse(chi.URLParam(r, "id"))
+		if err != nil {
+			writeProblem(w, r, fmt.Errorf("transaction id %q is not a UUID: %w",
+				chi.URLParam(r, "id"), ledger.ErrTransactionNotFound))
+			return
+		}
+
+		transaction, err := service.GetTransaction(r.Context(), id)
+		if err != nil {
+			writeProblem(w, r, err)
+			return
+		}
+
+		writeJSON(w, nethttp.StatusOK, newTransactionResponse(transaction))
+	}
+}
+
+// handleSearchTransactions answers with one keyset-paginated page of
+// transaction headers matching the query parameters -- the ledger explorer's
+// search. Entries are not included; a match is a candidate to open with
+// handleGetTransaction, not the full journal for every one at once.
+func handleSearchTransactions(service LedgerService) nethttp.HandlerFunc {
+	return func(w nethttp.ResponseWriter, r *nethttp.Request) {
+		params := r.URL.Query()
+
+		now := time.Now().UTC()
+		query := ledger.TransactionQuery{To: now, From: now.Add(-defaultStatementWindow)}
+
+		if raw := params.Get("from"); raw != "" {
+			from, err := time.Parse(time.RFC3339, raw)
+			if err != nil {
+				writeProblem(w, r, fmt.Errorf("from %q is not an RFC 3339 timestamp: %w: %w",
+					raw, err, ledger.ErrInvalidEntry))
+				return
+			}
+			query.From = from
+		}
+		if raw := params.Get("to"); raw != "" {
+			to, err := time.Parse(time.RFC3339, raw)
+			if err != nil {
+				writeProblem(w, r, fmt.Errorf("to %q is not an RFC 3339 timestamp: %w: %w",
+					raw, err, ledger.ErrInvalidEntry))
+				return
+			}
+			query.To = to
+		}
+		if raw := params.Get("external_ref"); raw != "" {
+			query.ExternalRef = &raw
+		}
+		if raw := params.Get("status"); raw != "" {
+			query.Status = ledger.TransactionStatus(raw)
+		}
+		if raw := params.Get("type"); raw != "" {
+			query.Type = ledger.TransactionType(raw)
+		}
+		if raw := params.Get("account_id"); raw != "" {
+			accountID, err := uuid.Parse(raw)
+			if err != nil {
+				writeProblem(w, r, fmt.Errorf("account_id %q is not a UUID: %w", raw, ledger.ErrInvalidEntry))
+				return
+			}
+			query.AccountID = &accountID
+		}
+		if raw := params.Get("limit"); raw != "" {
+			limit, err := strconv.Atoi(raw)
+			if err != nil {
+				writeProblem(w, r, fmt.Errorf("limit %q is not an integer: %w: %w",
+					raw, err, ledger.ErrInvalidEntry))
+				return
+			}
+			query.Limit = limit
+		}
+		if raw := params.Get("cursor"); raw != "" {
+			after, err := decodeIDCursor(raw)
+			if err != nil {
+				writeProblem(w, r, err)
+				return
+			}
+			query.After = &after
+		}
+
+		page, err := service.SearchTransactions(r.Context(), query)
+		if err != nil {
+			writeProblem(w, r, err)
+			return
+		}
+
+		writeJSON(w, nethttp.StatusOK, newTransactionListResponse(page))
 	}
 }
 

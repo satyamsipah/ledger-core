@@ -191,6 +191,104 @@ func newStatementResponse(s ledger.Statement) statementResponse {
 	return response
 }
 
+// transactionListResponse is one keyset-paginated page of transaction
+// headers, from the ledger explorer's search.
+type transactionListResponse struct {
+	Transactions []transactionResponse `json:"transactions"`
+
+	// NextCursor is null on the last page. Opaque, like statementResponse's.
+	NextCursor *string `json:"next_cursor"`
+}
+
+func newTransactionListResponse(p ledger.TransactionPage) transactionListResponse {
+	items := make([]transactionResponse, len(p.Transactions))
+	for i := range p.Transactions {
+		items[i] = newTransactionResponse(&p.Transactions[i])
+	}
+
+	response := transactionListResponse{Transactions: items}
+	if p.NextCursor != nil {
+		cursor := encodeIDCursor(*p.NextCursor)
+		response.NextCursor = &cursor
+	}
+	return response
+}
+
+// accountResponse is one account's metadata -- not its balance; see
+// balanceResponse for that.
+type accountResponse struct {
+	ID            string    `json:"id"`
+	ExternalRef   string    `json:"external_ref"`
+	AccountType   string    `json:"account_type"`
+	NormalBalance string    `json:"normal_balance"`
+	Currency      string    `json:"currency"`
+	OwnerID       *string   `json:"owner_id,omitempty"`
+	AllowNegative bool      `json:"allow_negative"`
+	Status        string    `json:"status"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+func newAccountResponse(a *ledger.Account) accountResponse {
+	return accountResponse{
+		ID:            a.ID.String(),
+		ExternalRef:   a.ExternalRef,
+		AccountType:   string(a.Type),
+		NormalBalance: string(a.NormalBalance),
+		Currency:      a.Currency,
+		OwnerID:       a.OwnerID,
+		AllowNegative: a.AllowNegative,
+		Status:        string(a.Status),
+		CreatedAt:     a.CreatedAt,
+		UpdatedAt:     a.UpdatedAt,
+	}
+}
+
+// accountListResponse is one keyset-paginated page of accounts.
+type accountListResponse struct {
+	Accounts   []accountResponse `json:"accounts"`
+	NextCursor *string           `json:"next_cursor"`
+}
+
+func newAccountListResponse(p ledger.AccountPage) accountListResponse {
+	items := make([]accountResponse, len(p.Accounts))
+	for i := range p.Accounts {
+		items[i] = newAccountResponse(&p.Accounts[i])
+	}
+
+	response := accountListResponse{Accounts: items}
+	if p.NextCursor != nil {
+		cursor := encodeIDCursor(*p.NextCursor)
+		response.NextCursor = &cursor
+	}
+	return response
+}
+
+// encodeIDCursor renders a keyset position that is a bare id as one opaque
+// token, on the same principle as encodeCursor: search results paginate on
+// id alone (see TransactionQuery's doc comment for why a second sort column
+// is unnecessary here), but the token stays opaque regardless, so "do not
+// construct one" is one rule across every paginated endpoint rather than a
+// rule that only applies to the statement's compound cursor.
+func encodeIDCursor(id uuid.UUID) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(id.String()))
+}
+
+// decodeIDCursor parses a token this service issued for a search endpoint.
+func decodeIDCursor(token string) (uuid.UUID, error) {
+	raw, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("cursor is not valid: %w", ledger.ErrInvalidEntry)
+	}
+
+	id, err := uuid.Parse(string(raw))
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("cursor is not valid: %w", ledger.ErrInvalidEntry)
+	}
+
+	return id, nil
+}
+
 // encodeCursor renders a keyset position as one opaque token.
 //
 // Opaque rather than two query parameters, and the reason is not tidiness. The

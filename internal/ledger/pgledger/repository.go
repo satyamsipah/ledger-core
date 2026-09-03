@@ -77,8 +77,9 @@ func WithAdvisoryLocks(enabled bool) Option {
 	return func(r *Repository) { r.advisoryLocks = enabled }
 }
 
-// WithReadReplica routes GetBalanceAsOf and GetStatement -- the two read-only
-// statement/temporal queries, never the write path -- to a second pool
+// WithReadReplica routes GetBalanceAsOf, GetStatement, GetTransaction,
+// SearchTransactions, GetAccount and SearchAccounts -- read-only
+// statement/temporal/search queries, never the write path -- to a second pool
 // against a streaming (physical) hot standby, instead of the primary.
 //
 // Deliberately narrow. Every OTHER read this repository does, including the
@@ -91,7 +92,13 @@ func WithAdvisoryLocks(enabled bool) Option {
 // risk: both already document that a temporal or paginated read is
 // bounded-stale by nature (D16), so the additional staleness a replica adds
 // is a difference in degree, not in kind, and is the entire reason this
-// option is safe to offer at all.
+// option is safe to offer at all. GetTransaction, SearchTransactions,
+// GetAccount and SearchAccounts join them for the identical reason: they
+// read transaction and account history that, once written, this package
+// never mutates outside its own narrow, explicitly-locked paths (a status
+// flip on reversal, a balance row) -- so nothing here ever decides whether a
+// write may proceed, and there is no lost update for replica lag to
+// reintroduce.
 //
 // Nil-safe by omission, not by a nil check here: New defaults readPool to
 // the primary when this option is never applied, so every existing caller
@@ -477,6 +484,254 @@ func (r *Repository) GetStatement(ctx context.Context, q ledger.StatementQuery) 
 	}
 
 	return statement, nil
+}
+
+// GetTransaction reads one transaction and its entries. No row lock: history
+// that is already POSTED never changes outside MarkReversed's own narrow
+// status flip, so there is nothing here for a lock to protect.
+func (r *Repository) GetTransaction(ctx context.Context, id uuid.UUID) (*ledger.Transaction, error) {
+	ctx, cancel := context.WithTimeout(ctx, r.timeout)
+	defer cancel()
+
+	var (
+		transaction ledger.Transaction
+		metadata    []byte
+	)
+	err := r.readPool.QueryRow(ctx, `
+		SELECT id, idempotency_key, transaction_type, status, external_ref,
+		       metadata, created_at, posted_at
+		  FROM transactions
+		 WHERE id = $1`, id).
+		Scan(&transaction.ID, &transaction.IdempotencyKey, &transaction.Type,
+			&transaction.Status, &transaction.ExternalRef, &metadata,
+			&transaction.CreatedAt, &transaction.PostedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("transaction %s: %w", id, ledger.ErrTransactionNotFound)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read transaction %s: %w", id, mapError(err))
+	}
+
+	if len(metadata) > 0 {
+		if err := json.Unmarshal(metadata, &transaction.Metadata); err != nil {
+			return nil, fmt.Errorf("decode metadata for transaction %s: %w", id, err)
+		}
+	}
+
+	rows, err := r.readPool.Query(ctx, `
+		SELECT id, transaction_id, account_id, direction, amount_minor, currency,
+		       entry_seq, created_at
+		  FROM journal_entries
+		 WHERE transaction_id = $1
+		 ORDER BY entry_seq`, id)
+	if err != nil {
+		return nil, fmt.Errorf("read entries for transaction %s: %w", id, mapError(err))
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			entry       ledger.JournalEntry
+			amountMinor int64
+			currency    string
+		)
+		if err := rows.Scan(&entry.ID, &entry.TransactionID, &entry.AccountID,
+			&entry.Direction, &amountMinor, &currency, &entry.EntrySeq, &entry.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan entry for transaction %s: %w", id, err)
+		}
+
+		amount, err := ledger.NewMoney(amountMinor, currency)
+		if err != nil {
+			return nil, fmt.Errorf("entry %s: %w", entry.ID, err)
+		}
+		entry.Amount = amount
+
+		transaction.Entries = append(transaction.Entries, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read entries for transaction %s: %w", id, mapError(err))
+	}
+
+	return &transaction, nil
+}
+
+// SearchTransactions returns one keyset-paginated page of transaction
+// headers, newest first.
+//
+// Filters compile to parameterised predicates -- every value a caller
+// supplies travels as a $N argument, never interpolated into the SQL text --
+// so an arbitrary combination of filters is exactly as safe as a single one.
+// Ordering by t.id DESC rather than t.created_at DESC is what lets this query
+// answer from the primary key alone: transaction ids are UUIDv7 (D3), so id
+// order already tracks creation order closely enough that a second sort
+// column, and the index it would need, buys nothing here.
+func (r *Repository) SearchTransactions(ctx context.Context, q ledger.TransactionQuery) (ledger.TransactionPage, error) {
+	ctx, cancel := context.WithTimeout(ctx, r.timeout)
+	defer cancel()
+
+	var args []any
+	arg := func(v any) string {
+		args = append(args, v)
+		return fmt.Sprintf("$%d", len(args))
+	}
+
+	where := []string{
+		fmt.Sprintf("t.created_at >= %s", arg(q.From)),
+		fmt.Sprintf("t.created_at <= %s", arg(q.To)),
+	}
+	if q.ExternalRef != nil && *q.ExternalRef != "" {
+		where = append(where, fmt.Sprintf("t.external_ref ILIKE %s", arg("%"+*q.ExternalRef+"%")))
+	}
+	if q.Status != "" {
+		where = append(where, fmt.Sprintf("t.status = %s", arg(string(q.Status))))
+	}
+	if q.Type != "" {
+		where = append(where, fmt.Sprintf("t.transaction_type = %s", arg(string(q.Type))))
+	}
+	if q.AccountID != nil {
+		where = append(where, fmt.Sprintf(
+			"EXISTS (SELECT 1 FROM journal_entries je WHERE je.transaction_id = t.id AND je.account_id = %s)",
+			arg(*q.AccountID)))
+	}
+	if q.After != nil {
+		where = append(where, fmt.Sprintf("t.id < %s", arg(*q.After)))
+	}
+
+	// One extra row, discarded before returning, on the same principle
+	// GetStatement uses: "is there another page" is answered by fact rather
+	// than by the guess that a full page implies more.
+	query := fmt.Sprintf(`
+		SELECT t.id, t.idempotency_key, t.transaction_type, t.status, t.external_ref,
+		       t.metadata, t.created_at, t.posted_at
+		  FROM transactions t
+		 WHERE %s
+		 ORDER BY t.id DESC
+		 LIMIT %s`, strings.Join(where, " AND "), arg(q.Limit+1))
+
+	rows, err := r.readPool.Query(ctx, query, args...)
+	if err != nil {
+		return ledger.TransactionPage{}, fmt.Errorf("search transactions: %w", mapError(err))
+	}
+	defer rows.Close()
+
+	var page ledger.TransactionPage
+	for rows.Next() {
+		var (
+			transaction ledger.Transaction
+			metadata    []byte
+		)
+		if err := rows.Scan(&transaction.ID, &transaction.IdempotencyKey, &transaction.Type,
+			&transaction.Status, &transaction.ExternalRef, &metadata,
+			&transaction.CreatedAt, &transaction.PostedAt); err != nil {
+			return ledger.TransactionPage{}, fmt.Errorf("scan transaction: %w", err)
+		}
+		if len(metadata) > 0 {
+			if err := json.Unmarshal(metadata, &transaction.Metadata); err != nil {
+				return ledger.TransactionPage{}, fmt.Errorf("decode metadata for transaction %s: %w", transaction.ID, err)
+			}
+		}
+		page.Transactions = append(page.Transactions, transaction)
+	}
+	if err := rows.Err(); err != nil {
+		return ledger.TransactionPage{}, fmt.Errorf("search transactions: %w", mapError(err))
+	}
+
+	if len(page.Transactions) > q.Limit {
+		last := page.Transactions[q.Limit-1].ID
+		page.Transactions = page.Transactions[:q.Limit]
+		page.NextCursor = &last
+	}
+
+	return page, nil
+}
+
+// GetAccount reads one account's metadata.
+func (r *Repository) GetAccount(ctx context.Context, id uuid.UUID) (*ledger.Account, error) {
+	ctx, cancel := context.WithTimeout(ctx, r.timeout)
+	defer cancel()
+
+	var a ledger.Account
+	err := r.readPool.QueryRow(ctx, `
+		SELECT id, external_ref, account_type, normal_balance, currency, owner_id,
+		       allow_negative, status, version, created_at, updated_at
+		  FROM accounts
+		 WHERE id = $1`, id).
+		Scan(&a.ID, &a.ExternalRef, &a.Type, &a.NormalBalance, &a.Currency,
+			&a.OwnerID, &a.AllowNegative, &a.Status, &a.Version, &a.CreatedAt, &a.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("account %s: %w", id, ledger.ErrAccountNotFound)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read account %s: %w", id, mapError(err))
+	}
+
+	return &a, nil
+}
+
+// SearchAccounts returns one keyset-paginated page of accounts, newest first.
+//
+// parent_account_id IS NULL is unconditional, not a filter a caller can lift:
+// a sharded account's shards are internal routing plumbing (D25), never a
+// result a search should surface as if it were a distinct customer-facing
+// account.
+func (r *Repository) SearchAccounts(ctx context.Context, q ledger.AccountQuery) (ledger.AccountPage, error) {
+	ctx, cancel := context.WithTimeout(ctx, r.timeout)
+	defer cancel()
+
+	where := []string{"a.parent_account_id IS NULL"}
+	var args []any
+	arg := func(v any) string {
+		args = append(args, v)
+		return fmt.Sprintf("$%d", len(args))
+	}
+
+	if q.ExternalRef != nil && *q.ExternalRef != "" {
+		where = append(where, fmt.Sprintf("a.external_ref ILIKE %s", arg("%"+*q.ExternalRef+"%")))
+	}
+	if q.OwnerID != nil && *q.OwnerID != "" {
+		where = append(where, fmt.Sprintf("a.owner_id = %s", arg(*q.OwnerID)))
+	}
+	if q.Currency != "" {
+		where = append(where, fmt.Sprintf("a.currency = %s", arg(q.Currency)))
+	}
+	if q.After != nil {
+		where = append(where, fmt.Sprintf("a.id < %s", arg(*q.After)))
+	}
+
+	query := fmt.Sprintf(`
+		SELECT a.id, a.external_ref, a.account_type, a.normal_balance, a.currency,
+		       a.owner_id, a.allow_negative, a.status, a.version, a.created_at, a.updated_at
+		  FROM accounts a
+		 WHERE %s
+		 ORDER BY a.id DESC
+		 LIMIT %s`, strings.Join(where, " AND "), arg(q.Limit+1))
+
+	rows, err := r.readPool.Query(ctx, query, args...)
+	if err != nil {
+		return ledger.AccountPage{}, fmt.Errorf("search accounts: %w", mapError(err))
+	}
+	defer rows.Close()
+
+	var page ledger.AccountPage
+	for rows.Next() {
+		var a ledger.Account
+		if err := rows.Scan(&a.ID, &a.ExternalRef, &a.Type, &a.NormalBalance, &a.Currency,
+			&a.OwnerID, &a.AllowNegative, &a.Status, &a.Version, &a.CreatedAt, &a.UpdatedAt); err != nil {
+			return ledger.AccountPage{}, fmt.Errorf("scan account: %w", err)
+		}
+		page.Accounts = append(page.Accounts, a)
+	}
+	if err := rows.Err(); err != nil {
+		return ledger.AccountPage{}, fmt.Errorf("search accounts: %w", mapError(err))
+	}
+
+	if len(page.Accounts) > q.Limit {
+		last := page.Accounts[q.Limit-1].ID
+		page.Accounts = page.Accounts[:q.Limit]
+		page.NextCursor = &last
+	}
+
+	return page, nil
 }
 
 // txn implements ledger.Tx against one pgx transaction.

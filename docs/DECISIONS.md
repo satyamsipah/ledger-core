@@ -2644,3 +2644,206 @@ ROUTING, not a highly-available read path) rather than an oversight, but
 worth stating rather than leaving implicit. Replica lag under real write
 load (this entry measured it idle) is exactly what `docs/BENCHMARKS.md`'s
 `mixed_realistic` numbers with the replica in place are for.
+
+---
+
+## Phase 8 — Admin dashboard, Part 1
+
+### D55. Four read-only endpoints, added because the dashboard's ledger
+### explorer had nothing to search or drill into
+
+**Decided.** Before any dashboard code, the API surface itself was the
+blocker: there was no `GET /v1/transactions`, no `GET /v1/transactions/{id}`,
+and no way to list or search accounts at all -- only per-account `balance`
+and `statement`, which both require already knowing the account's UUID. A
+"searchable transactions, drill into journal entries" requirement cannot be
+met against an API that has no notion of a transaction except by having just
+posted or reversed one. Four endpoints were added: `GET /v1/transactions`
+(search, keyset-paginated), `GET /v1/transactions/{id}` (header plus every
+entry), `GET /v1/accounts` (search), `GET /v1/accounts/{id}` (metadata).
+Repository methods behind them (`GetTransaction`, `SearchTransactions`,
+`GetAccount`, `SearchAccounts`) are plain reads with no row lock: history
+that is already `POSTED` never changes outside `MarkReversed`'s own narrow
+status flip, so there is nothing here for a lock to protect, unlike
+`LoadTransactionForUpdate`.
+
+**Pagination reuses the primary key instead of adding an index.** Both
+searches order by `id DESC` and keyset-paginate on a bare id, not the
+`(created_at, id)` pair `StatementCursor` uses. Transaction and account ids
+are UUIDv7 (D3), so id order already tracks creation order closely enough
+that a second sort column -- and the index it would need -- buys nothing. A
+migration adding `(created_at DESC, id DESC)` was drafted and then rejected:
+it would have duplicated ordering the primary key already gives for free,
+for a dashboard-scale query that CLAUDE.md's own index-decision table
+already accepts a sequential scan for on comparably low-cardinality columns
+(`accounts.account_type`, `accounts.status`).
+
+**`external_ref` is `ILIKE '%term%'`, a deliberate cost.** This is a search
+box, not the exact-match lookup `transactions_external_ref_idx` already
+serves for support tooling (that index cannot be used by a leading-wildcard
+scan, and no attempt was made to force it). Accepted at today's table size,
+on the same "no query exists for it yet" principle the index-decision table
+already applies elsewhere; a trigram index is the honest fix the day this
+search is slow enough to profile rather than assumed.
+
+**`account_id` filters transactions via `EXISTS (... journal_entries ...)`,
+not a join.** Reuses `journal_entries_account_id_created_at_idx` for the
+existence check without materialising every matching entry, and composes
+cleanly with every other filter as one more `AND`ed predicate.
+
+**All four require authentication, breaking symmetry with balance and
+statement.** `GET /v1/accounts/{id}/balance` and `.../statement` take no
+key (D47: there is no per-principal authorization model to enforce, and both
+already require knowing a specific UUID). The four new endpoints do NOT
+extend that precedent -- they require `requireAuth`, on the same reasoning
+`GET /v1/reconciliation/runs` already uses: a search result carries amounts
+and external references, the class of information D24 scopes idempotency
+responses to a principal to protect, and unlike a balance lookup, a *search*
+needs no UUID at all -- leaving it open would let any caller enumerate the
+whole chart of accounts or journal. This is a new asymmetry in the API
+(reads split between authenticated and not), stated here rather than
+silently mirroring whichever precedent was closer to hand.
+
+**Rejected: extending `WithReadReplica` opinion unchanged, but honestly
+reconsidered.** The four new methods route to `readPool` alongside
+`GetBalanceAsOf` and `GetStatement`, and that option's doc comment was
+updated to name them rather than left describing only two of six methods.
+The safety argument is the identical one D-tagged entry for the replica
+already makes: none of these methods ever decide whether a write may
+proceed, so there is no lost update for replication lag to reintroduce.
+
+**Sharded accounts are unconditionally excluded from `SearchAccounts`** via
+`parent_account_id IS NULL`, not a filter a caller can lift. A shard is
+internal routing plumbing (D25), and a search surfacing it as if it were a
+distinct customer-facing account would be confusing at best and a double
+count of the same logical balance at worst.
+
+### D56. The dashboard: Next.js Server Components reading through one seam,
+### mock by default
+
+**Decided.** `web/` is Next.js 14 App Router, TypeScript, Tailwind, and
+hand-written shadcn-style primitives (no CLI codegen, so every component's
+provenance is a file in this repo rather than a generator's output). Every
+page is a Server Component that fetches directly -- no client-side data
+fetching library, no loading spinners racing a `useEffect`. Filtering is
+native `<form method="GET">`, and pagination is a plain link carrying an
+opaque cursor forward: the URL is the whole of a list view's state, so a
+reload or a shared link reproduces the same page.
+
+**One seam, `lib/api/client.ts`, decides mock vs. live.** Every page calls
+the same functions (`searchTransactions`, `getAccount`, `listSagas`, ...)
+regardless of `LEDGER_DATA_MODE`; the function bodies branch, not the
+callers. This is what let every view be built and manually verified before
+Part A's new endpoints existed against a live database in this session --
+mock mode shipped first, then live mode was verified against them once they
+did.
+
+**The mock dataset is generated, not hand-written, and internally
+consistent.** `lib/api/mock/data.ts` builds accounts, transactions, sagas
+and reconciliation runs from a seeded PRNG so a reload doesn't reshuffle the
+numbers, and derives every balance from its own entries (D13's sign
+convention, reimplemented in TypeScript) rather than inventing a balance
+number independent of the journal that produced it. The one bug this caught
+before it shipped: a stuck saga's `updated_at` could land in the future
+relative to wall-clock `now` (createdAt sampled from "up to 3 days ago" plus
+up to 42 simulated stuck-hours), which `formatDistanceToNow` rendered as "in
+about 13 hours" -- clamped to `now` when the candidate exceeds it.
+
+**Every write-adjacent secret stays server-side, enforced by the `server-only`
+package, not merely by convention.** `lib/api/client.ts` and
+`lib/prometheus/client.ts` both import it, so a page component that
+accidentally imported either into client code fails the build rather than
+shipping `LEDGER_API_KEY` to the browser.
+
+**The dashboard is always honest about which data it is showing.** A "Mock
+data" / "Live API" badge renders in the nav on every page, computed from the
+same `dataMode()` the client uses -- a screenshot or a shared link is never
+ambiguous about which backend produced it, which matters specifically
+because the mock data is deliberately built to look plausible.
+
+**Rejected: a client-side charting/polling library for System Health and the
+saga monitor's "live" view.** `AutoRefresh` is nine lines: a client
+component that calls `router.refresh()` on an interval, which re-runs the
+page's own server-side fetch. No websocket, no separate polling client, no
+second source of truth for what "current" means -- the live view and a hard
+reload produce the identical render.
+
+**Rejected: Radix `Select` for filter forms.** Every filter bar had to work
+with zero client JS, since it is a native GET form; Radix's `Select` renders
+no real `<select>` for the browser to submit, so filter dropdowns use a
+plain `<select>` (`components/ledger/native-select.tsx`) instead. The Radix
+primitive is still vendored (`components/ui/select.tsx`) for a future view
+that genuinely needs client-side interactivity beyond form submission.
+
+**Verification.** `pnpm build`, `pnpm lint`, and `pnpm test` (23 unit and
+component tests: money formatting, pagination-cursor helpers, PromQL query
+builders, and one React Testing Library render test) all pass. Every view
+was driven by hand in a real browser against `LEDGER_DATA_MODE=mock`, which
+caught the stuck-saga clamp bug above.
+
+**Then again against `LEDGER_DATA_MODE=live`, which caught a second, more
+interesting bug.** The `docker compose` stack in this same session's sandbox
+has 3.9GB of memory, and building all seven Go service images in parallel
+(`make up`'s default) exhausted it -- `signal: killed`, `cannot allocate
+memory`, mid-`go build`. `docker compose build api` alone, sequentially,
+took 23s with no such problem; the other six services (unmodified by this
+phase) were left on their existing images rather than rebuilt for no reason.
+Against that live `api` -- real Postgres, real prior load-test data, `GET
+/v1/transactions` and `GET /v1/accounts` exercised for the first time
+outside a test -- the transaction list, the drill-down, the account balance
+and statement all rendered correctly on the first try.
+
+System Health did not. `InvariantTile` treated `value === null` ("no
+series returned" -- `ledger_consistency_global_invariant_violation_minor`
+is a `GaugeVec` keyed by `currency`, so it emits no series at all until the
+reconciler process, which was not running in this cut-down live check, has
+called `.WithLabelValues` at least once) the same as `value !== 0`
+("confirmed violated"), rendering a false "Violated -- page immediately" in
+red for a metric that had simply never reported. Fixed by giving the tile a
+real third state -- unknown, distinct from both healthy and violated --
+with a regression test asserting the violated copy never appears when the
+value is `null`. This is the exact shape of alert-fatigue bug the metric's
+own doc comment warns about for the opposite direction (D50: "reset to zero
+... so a currency that stops violating does not leave a stale series
+behind") -- a consumer of the metric has to get the *absence* of a series
+right too, not only its value.
+
+**Update: that gap was closed in a follow-up pass.** `docker compose build
+saga-orchestrator` and `... build reconciler`, run one at a time exactly
+like `api` was, built cleanly in 14-15s each -- the OOM was specifically
+about building all seven in parallel, not about memory to build any one of
+them. Brought up alongside `mock-gateway` (a `saga-orchestrator` dependency,
+built the same way), a real `POST /v1/payouts` against real seeded accounts
+drove one saga through `RESERVE` -> `GATEWAY` -> `SETTLE` -> `DONE`, and the
+saga monitor rendered its state machine and attempt history -- including
+the link to a real posted transaction -- correctly on the first look.
+
+For the reconciliation report, `LEDGER_RECONCILER_PSP_CSV_PATH` cannot be
+changed on a running container (it is read from the environment at start),
+and editing `deploy/docker-compose.yml` to add a bind mount was ruled out
+deliberately -- deploy manifests were out of scope for this phase from the
+original proposal onward. `docker compose run --rm -e ... -v ...:ro
+reconciler`, a one-off invocation using compose's own runtime overrides
+rather than an edit to any file, ran the real reconciliation engine once
+against a hand-built two-row PSP statement (one row matching a real posted
+transaction, one row naming a reference the ledger never posted) and
+produced one real `TIMING_DIFFERENCE` (auto-resolved) and one real
+`MISSING_IN_LEDGER` (open) exception. Both rendered correctly: category
+filter buttons, status badges, and the drill-down link to the real
+transaction the timing-difference exception matched.
+
+**A third bug, found by this second pass -- pre-existing, not introduced by
+this phase, and deliberately not fixed here.** The reconciliation list view
+(`app/reconciliation/page.tsx`) renders a per-run "by category" badge
+column, populated from `ReconciliationRun.by_category` -- present and
+correct on `GET /v1/reconciliation/runs/{id}` (the single-run read used by
+the drill-down above), but `pgreconciliation.Repository.ListRuns` never
+queries or populates it at all, so the list endpoint always returns it
+absent. `api/openapi.yaml`'s schema documents `by_category` as a plain
+field with no "single-run only" caveat (unlike `exceptions`, which states
+one explicitly), so the list endpoint is not honoring its own documented
+contract -- a Phase 6 gap, invisible until something actually rendered the
+list's `by_category` and found it empty. Flagged as a follow-up task rather
+than fixed in this PR: it is unrelated Phase 6 code, and this phase's own
+scope is additive read endpoints plus the dashboard that consumes them, not
+an audit of every existing read path.

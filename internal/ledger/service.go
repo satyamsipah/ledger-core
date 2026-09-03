@@ -55,6 +55,15 @@ const (
 	MaxStatementLimit     = 1000
 )
 
+// Search page sizing, for SearchTransactions and SearchAccounts. Shared
+// between the two rather than each defining its own: both are dashboard list
+// views with the identical reason for the cap DefaultStatementLimit already
+// states.
+const (
+	DefaultSearchLimit = 100
+	MaxSearchLimit     = 1000
+)
+
 // EntryRequest is one requested leg of a transaction.
 type EntryRequest struct {
 	AccountID uuid.UUID
@@ -709,6 +718,55 @@ func (s *Service) GetStatement(ctx context.Context, q StatementQuery) (Statement
 	}
 
 	return s.repo.GetStatement(ctx, q)
+}
+
+// GetTransaction reads one transaction and its entries.
+//
+// This is a plain read of history that, once POSTED, the journal's own
+// append-only guarantee already makes immutable -- so unlike
+// LoadTransactionForUpdate there is no lock to take and nothing this method
+// needs to serialise against.
+func (s *Service) GetTransaction(ctx context.Context, id uuid.UUID) (*Transaction, error) {
+	return s.repo.GetTransaction(ctx, id)
+}
+
+// SearchTransactions returns one keyset-paginated page of transaction
+// headers matching q, newest first.
+func (s *Service) SearchTransactions(ctx context.Context, q TransactionQuery) (TransactionPage, error) {
+	if q.To.IsZero() {
+		q.To = time.Now().UTC()
+	}
+	if q.To.Before(q.From) {
+		return TransactionPage{}, fmt.Errorf("search transactions: period ends (%s) before it starts (%s): %w",
+			q.To, q.From, ErrInvalidEntry)
+	}
+
+	switch {
+	case q.Limit <= 0:
+		q.Limit = DefaultSearchLimit
+	case q.Limit > MaxSearchLimit:
+		q.Limit = MaxSearchLimit
+	}
+
+	return s.repo.SearchTransactions(ctx, q)
+}
+
+// GetAccount reads one account's metadata.
+func (s *Service) GetAccount(ctx context.Context, id uuid.UUID) (*Account, error) {
+	return s.repo.GetAccount(ctx, id)
+}
+
+// SearchAccounts returns one keyset-paginated page of accounts matching q,
+// newest first.
+func (s *Service) SearchAccounts(ctx context.Context, q AccountQuery) (AccountPage, error) {
+	switch {
+	case q.Limit <= 0:
+		q.Limit = DefaultSearchLimit
+	case q.Limit > MaxSearchLimit:
+		q.Limit = MaxSearchLimit
+	}
+
+	return s.repo.SearchAccounts(ctx, q)
 }
 
 // ---------------------------------------------------------------------------

@@ -197,6 +197,56 @@ func TestReconciliation_ThreeWayMatch(t *testing.T) {
 	assert.Equal(t, reconciliation.CategoryAmountMismatch, byRef[sagaRef].Category)
 }
 
+// TestReconciliation_ListRunsIncludesByCategory pins api/openapi.yaml's
+// ReconciliationRun.by_category contract for the list read, not only the
+// single-run read: unlike exceptions, that field is not documented as
+// detail-only, so a dashboard rendering a per-category badge column from the
+// list endpoint must not see it come back empty.
+func TestReconciliation_ListRunsIncludesByCategory(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	svc := newLedgerService(sharedPool)
+	a := newAccount(t, ctx, sharedPool, "INR", true)
+	b := newAccount(t, ctx, sharedPool, "INR", true)
+
+	// A single mismatch is enough to guarantee this run's ByCategory carries
+	// an AMOUNT_MISMATCH entry regardless of what else lands on the same
+	// statement. The run's total ExceptionCount is not asserted: other tests
+	// in this suite run in parallel and post their own external-ref'd
+	// transactions, and Match's lookback window (see engine.go) scans all of
+	// them, not only refs this test's own psp slice mentions -- so this run
+	// may legitimately also pick up MISSING_IN_PSP entries for their refs.
+	amountRef := "recon-list-amount-" + uuid.NewString()
+	reconciliationTxn(t, ctx, svc, amountRef, 1000, a, b)
+	psp := []reconciliation.PSPRecord{
+		{ExternalRef: amountRef, AmountMinor: 999, Currency: "INR", Status: "SETTLED", SettledAt: time.Now()},
+	}
+
+	engine := newReconciliationEngine(t)
+	run, err := engine.Run(ctx, "list-by-category-test.csv", psp)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, run.ByCategory[reconciliation.CategoryAmountMismatch], 1)
+
+	// A generous limit rather than limit=1: other tests in this suite create
+	// runs of their own in parallel, so this test's row is not guaranteed to
+	// be the single most recent one -- only guaranteed to be present.
+	store := pgreconciliation.New(sharedPool, 30*time.Second)
+	runs, err := store.ListRuns(ctx, 50)
+	require.NoError(t, err)
+
+	var found *reconciliation.Run
+	for i := range runs {
+		if runs[i].ID == run.ID {
+			found = &runs[i]
+			break
+		}
+	}
+	require.NotNil(t, found, "this run must appear in the list")
+	assert.NotEmpty(t, found.ByCategory, "list read must populate by_category, not only the single-run read")
+	assert.GreaterOrEqual(t, found.ByCategory[reconciliation.CategoryAmountMismatch], 1)
+}
+
 // TestReconciliation_EmptyStatementIsRejected asserts that Run refuses to
 // silently report "no discrepancies" for a statement that never actually
 // arrived.

@@ -51,17 +51,15 @@ pnpm build
 ```
 
 There is no browser/e2e suite in this phase; every view was verified by hand
-against `LEDGER_DATA_MODE=mock` (all five views, populated data). The
-ledger explorer, account view and system health were verified a second time
-against a live `docker compose` stack (`api` + `postgres` + `prometheus`,
-rebuilt and reseeded in this session); the saga monitor and reconciliation
-report were not part of that cut-down stack and were checked live only
-against their empty states. See D56 in
-[docs/DECISIONS.md](../docs/DECISIONS.md) for the two real bugs the live
-pass caught, including a genuine gap the mock-only pass could not have
-found (the "no data" vs. "violated" confusion on System Health only showed
-up once a metric Prometheus had literally never scraped was queried for
-real).
+against `LEDGER_DATA_MODE=mock` (all five views, populated data), then
+again against a live `docker compose` stack -- rebuilt and reseeded in
+this session, including a real payout saga driven to completion and a real
+reconciliation run against a hand-built PSP statement, so every one of the
+five views was checked against genuine populated data, not just its empty
+state. See D56 in [docs/DECISIONS.md](../docs/DECISIONS.md) for the two
+dashboard bugs the live pass caught (both fixed here) and one pre-existing
+backend gap it surfaced (`ListRuns` never populating `by_category` --
+filed as a follow-up, not fixed in this phase).
 
 ## Structure
 

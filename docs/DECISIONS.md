@@ -2808,14 +2808,42 @@ own doc comment warns about for the opposite direction (D50: "reset to zero
 behind") -- a consumer of the metric has to get the *absence* of a series
 right too, not only its value.
 
-**What this live check did not cover, stated rather than left implicit.**
-The saga orchestrator and reconciler were not part of this cut-down stack
-(they build fine; they were left out to keep the OOM-constrained rebuild to
-exactly the one image this phase actually changed), so the saga monitor and
-reconciliation report were exercised live only against their empty states
--- a real, previously-verified rendering path, but not the same as seeing a
-live `NEEDS_MANUAL_REVIEW` saga or a live reconciliation exception. Both
-were driven with populated data in mock mode instead. A full `make up`
-brings up all sixteen services from a clean image and is the honest way to
-close that gap; it was not attempted a second time in this session after
-the first attempt's OOM, to avoid spending the same failure twice.
+**Update: that gap was closed in a follow-up pass.** `docker compose build
+saga-orchestrator` and `... build reconciler`, run one at a time exactly
+like `api` was, built cleanly in 14-15s each -- the OOM was specifically
+about building all seven in parallel, not about memory to build any one of
+them. Brought up alongside `mock-gateway` (a `saga-orchestrator` dependency,
+built the same way), a real `POST /v1/payouts` against real seeded accounts
+drove one saga through `RESERVE` -> `GATEWAY` -> `SETTLE` -> `DONE`, and the
+saga monitor rendered its state machine and attempt history -- including
+the link to a real posted transaction -- correctly on the first look.
+
+For the reconciliation report, `LEDGER_RECONCILER_PSP_CSV_PATH` cannot be
+changed on a running container (it is read from the environment at start),
+and editing `deploy/docker-compose.yml` to add a bind mount was ruled out
+deliberately -- deploy manifests were out of scope for this phase from the
+original proposal onward. `docker compose run --rm -e ... -v ...:ro
+reconciler`, a one-off invocation using compose's own runtime overrides
+rather than an edit to any file, ran the real reconciliation engine once
+against a hand-built two-row PSP statement (one row matching a real posted
+transaction, one row naming a reference the ledger never posted) and
+produced one real `TIMING_DIFFERENCE` (auto-resolved) and one real
+`MISSING_IN_LEDGER` (open) exception. Both rendered correctly: category
+filter buttons, status badges, and the drill-down link to the real
+transaction the timing-difference exception matched.
+
+**A third bug, found by this second pass -- pre-existing, not introduced by
+this phase, and deliberately not fixed here.** The reconciliation list view
+(`app/reconciliation/page.tsx`) renders a per-run "by category" badge
+column, populated from `ReconciliationRun.by_category` -- present and
+correct on `GET /v1/reconciliation/runs/{id}` (the single-run read used by
+the drill-down above), but `pgreconciliation.Repository.ListRuns` never
+queries or populates it at all, so the list endpoint always returns it
+absent. `api/openapi.yaml`'s schema documents `by_category` as a plain
+field with no "single-run only" caveat (unlike `exceptions`, which states
+one explicitly), so the list endpoint is not honoring its own documented
+contract -- a Phase 6 gap, invisible until something actually rendered the
+list's `by_category` and found it empty. Flagged as a follow-up task rather
+than fixed in this PR: it is unrelated Phase 6 code, and this phase's own
+scope is additive read endpoints plus the dashboard that consumes them, not
+an audit of every existing read path.

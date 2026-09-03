@@ -46,8 +46,9 @@ type Store interface {
 	GetRun(ctx context.Context, id uuid.UUID) (*Run, error)
 
 	// ListRuns returns the most recent runs, newest first, for the report
-	// listing endpoint. ByCategory is left empty on every entry: a list view
-	// summarises run-level counts, which Run already carries.
+	// listing endpoint, each with ByCategory populated -- see
+	// api/openapi.yaml's ReconciliationRun.by_category, which is not
+	// restricted to the single-run read the way exceptions is.
 	ListRuns(ctx context.Context, limit int) ([]Run, error)
 
 	// ListExceptions returns every exception one run raised, oldest first,

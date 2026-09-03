@@ -337,9 +337,10 @@ func (r *Repository) categoryBreakdown(ctx context.Context, runID uuid.UUID) (ma
 	return breakdown, nil
 }
 
-// ListRuns returns the most recent runs, newest first. ByCategory is left
-// empty on every entry -- a list view summarises run-level counts, which the
-// run itself already carries; a per-category breakdown is what GetRun is for.
+// ListRuns returns the most recent runs, newest first, each with its
+// category breakdown populated -- api/openapi.yaml documents by_category on
+// ReconciliationRun with no single-run restriction (unlike exceptions, which
+// is explicitly detail-only), so the list read owes it the same as GetRun.
 func (r *Repository) ListRuns(ctx context.Context, limit int) ([]reconciliation.Run, error) {
 	ctx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
@@ -354,7 +355,6 @@ func (r *Repository) ListRuns(ctx context.Context, limit int) ([]reconciliation.
 	if err != nil {
 		return nil, fmt.Errorf("list reconciliation runs: %w", err)
 	}
-	defer rows.Close()
 
 	var runs []reconciliation.Run
 	for rows.Next() {
@@ -362,15 +362,64 @@ func (r *Repository) ListRuns(ctx context.Context, limit int) ([]reconciliation.
 		var errMsg string
 		if err := rows.Scan(&run.ID, &run.Source, &run.StartedAt, &run.FinishedAt, &run.Status,
 			&run.PSPRowCount, &run.MatchedCount, &run.AutoResolvedCount, &run.ExceptionCount, &errMsg); err != nil {
+			rows.Close()
 			return nil, fmt.Errorf("scan reconciliation run: %w", err)
 		}
 		run.Error = errMsg
 		runs = append(runs, run)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list reconciliation runs: %w", err)
+	closeErr := rows.Err()
+	rows.Close()
+	if closeErr != nil {
+		return nil, fmt.Errorf("list reconciliation runs: %w", closeErr)
+	}
+	if len(runs) == 0 {
+		return runs, nil
+	}
+
+	runIDs := make([]uuid.UUID, len(runs))
+	for i, run := range runs {
+		runIDs[i] = run.ID
+	}
+	breakdowns, err := r.categoryBreakdowns(ctx, runIDs)
+	if err != nil {
+		return nil, err
+	}
+	for i := range runs {
+		runs[i].ByCategory = breakdowns[runs[i].ID]
 	}
 	return runs, nil
+}
+
+// categoryBreakdowns is categoryBreakdown for a page of runs at once -- one
+// GROUP BY run_id, category instead of one round trip per run, so ListRuns
+// stays a small, fixed number of statements regardless of its limit.
+func (r *Repository) categoryBreakdowns(ctx context.Context, runIDs []uuid.UUID) (map[uuid.UUID]map[reconciliation.Category]int, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT run_id, category, count(*) FROM reconciliation_exceptions
+		 WHERE run_id = ANY($1) GROUP BY run_id, category`, runIDs)
+	if err != nil {
+		return nil, fmt.Errorf("category breakdowns: %w", err)
+	}
+	defer rows.Close()
+
+	breakdowns := make(map[uuid.UUID]map[reconciliation.Category]int, len(runIDs))
+	for rows.Next() {
+		var runID uuid.UUID
+		var category reconciliation.Category
+		var count int
+		if err := rows.Scan(&runID, &category, &count); err != nil {
+			return nil, fmt.Errorf("scan category breakdowns: %w", err)
+		}
+		if breakdowns[runID] == nil {
+			breakdowns[runID] = map[reconciliation.Category]int{}
+		}
+		breakdowns[runID][category] = count
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("category breakdowns: %w", err)
+	}
+	return breakdowns, nil
 }
 
 // ListExceptions returns one run's exceptions, oldest first -- the order they

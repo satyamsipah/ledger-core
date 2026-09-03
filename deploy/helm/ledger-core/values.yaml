@@ -1,0 +1,204 @@
+# Default values for ledger-core.
+#
+# This file has NO secrets in it and ships no working postgres.dsn,
+# kafka.brokers or gateway.url -- `helm install` fails closed (each is
+# `required` in the templates that use it) rather than silently deploying
+# against something that looks configured but is not. Supply real values
+# with `-f` pointing at a values file kept out of version control, or
+# `--set-file`/`--set` from a secret manager in CI. See README.md in this
+# directory for a worked example.
+
+image:
+  registry: ghcr.io/satyamsipah/ledger-core
+  tag: ""
+  pullPolicy: IfNotPresent
+
+env: production
+logLevel: info
+
+postgres:
+  # A full DSN, not host/user/password split into separate keys: this
+  # chart does not run Postgres itself (see Chart.yaml), so the operator's
+  # own managed-Postgres connection string is what belongs here, whatever
+  # shape its host, port and TLS mode happen to take.
+  dsn: ""
+  maxConns: 20
+  minConns: 2
+
+kafka:
+  # Comma-separated broker list. Not secret -- a hostname is not a
+  # credential -- so this lives in the ConfigMap, not the Secret.
+  brokers: ""
+
+# The real external payment gateway. Never a mock -- deploy/Dockerfile.prod
+# builds no mock-gateway image variant for production at all, and this
+# value has no default for the identical reason
+# docker-compose.prod.yml's LEDGER_GATEWAY_URL has none.
+gateway:
+  url: ""
+
+reconciler:
+  # Empty by default, same as every other deployment path in this repo:
+  # a meaningful reconciliation run needs an operator-supplied PSP
+  # statement feed, which this chart cannot default sensibly.
+  pspCsvPath: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# Applies to every pod this chart creates. uid/gid 65532 matches
+# gcr.io/distroless/static-debian12:nonroot's own "nonroot" user --
+# stated explicitly here rather than left to the image default, so a
+# cluster-wide PodSecurityPolicy/PSA restricted profile can verify it
+# without inspecting the image.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+# Runs as a pre-install,pre-upgrade Helm hook -- see templates/
+# migration-job.yaml -- so `helm upgrade` cannot roll a new image out
+# against a schema it does not match. This is what satisfies "running
+# migrations safely before the rollout": the hook must exit 0 before Helm
+# proceeds to the Deployments below at all.
+migration:
+  enabled: true
+  backoffLimit: 2
+  activeDeadlineSeconds: 300
+
+# A second hook, one weight after migration (see the resources' own
+# "helm.sh/hook-weight"): the topic layout must exist before
+# outbox-publisher or projector's first poll/consume, and provisioning it
+# explicitly -- rather than relying on broker auto-create -- is what makes
+# partition count and retention a decision on record instead of whatever
+# the broker defaults to. See internal/kafka's own package doc.
+kafkaInit:
+  enabled: true
+  backoffLimit: 2
+  activeDeadlineSeconds: 120
+
+# One entry per deployable service. Every key below is read by templates/
+# deployment.yaml, service.yaml, hpa.yaml and pdb.yaml via one shared
+# range loop -- see templates/_helpers.tpl -- so adding a sixth service
+# means adding one entry here, not four new template files that could
+# drift from each other.
+#
+# healthPort is the one field worth explaining: every worker service
+# shares its health endpoint with its metrics listener (cmd/reconciler's
+# own doc comment: "Health and metrics share the metrics listener"), but
+# cmd/api's /healthz lives on its main HTTP port instead, because that
+# server -- not the metrics one -- owns the full router. Getting this
+# wrong per service is exactly the kind of readiness-probe mistake this
+# chart exists to not make.
+services:
+  api:
+    enabled: true
+    port: 8080
+    metricsPort: 9090
+    healthPort: 8080
+    exposeMainPort: true
+    replicas: 2
+    resources:
+      requests: { cpu: 100m, memory: 128Mi }
+      limits: { cpu: 500m, memory: 256Mi }
+    hpa:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 10
+      targetCPUUtilizationPercentage: 70
+    pdb:
+      enabled: true
+      minAvailable: 1
+    extraEnv: {}
+
+  outbox-publisher:
+    enabled: true
+    metricsPort: 9091
+    healthPort: 9091
+    exposeMainPort: false
+    replicas: 1
+    resources:
+      requests: { cpu: 50m, memory: 64Mi }
+      limits: { cpu: 250m, memory: 128Mi }
+    hpa:
+      enabled: false
+    pdb:
+      enabled: true
+      minAvailable: 1
+    extraEnv:
+      # polling, not debezium: this chart does not deploy Kafka Connect,
+      # so there is no connector for the debezium arm to monitor. See
+      # docs/DECISIONS.md D31 -- the same choice
+      # docker-compose.prod.yml makes, for the same reason.
+      LEDGER_OUTBOX_PUBLISHER: polling
+
+  projector:
+    enabled: true
+    metricsPort: 9093
+    healthPort: 9093
+    exposeMainPort: false
+    replicas: 1
+    resources:
+      requests: { cpu: 50m, memory: 64Mi }
+      limits: { cpu: 250m, memory: 128Mi }
+    hpa:
+      # Off by default: this is one Kafka consumer group, and scaling
+      # replicas up only helps up to the transaction topic's partition
+      # count (6) -- past that, extra pods sit idle rather than sharing
+      # more work. Raise maxReplicas and enable this only alongside
+      # raising the topic's partition count in internal/kafka.
+      enabled: false
+    pdb:
+      enabled: true
+      minAvailable: 1
+    extraEnv: {}
+
+  saga-orchestrator:
+    enabled: true
+    metricsPort: 9094
+    healthPort: 9094
+    exposeMainPort: false
+    replicas: 2
+    resources:
+      requests: { cpu: 100m, memory: 128Mi }
+      limits: { cpu: 500m, memory: 256Mi }
+    hpa:
+      # Safe to autoscale, unlike the consumer group above: D40 -- the
+      # orchestrator drives itself from a Postgres claim loop with no
+      # leader election, so replicas are horizontally interchangeable by
+      # construction.
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 6
+      targetCPUUtilizationPercentage: 70
+    pdb:
+      enabled: true
+      minAvailable: 1
+    extraEnv: {}
+
+  reconciler:
+    enabled: true
+    metricsPort: 9095
+    healthPort: 9095
+    exposeMainPort: false
+    replicas: 1
+    resources:
+      requests: { cpu: 50m, memory: 64Mi }
+      limits: { cpu: 250m, memory: 128Mi }
+    hpa:
+      enabled: false
+    pdb:
+      enabled: true
+      minAvailable: 1
+    extraEnv: {}

@@ -1,0 +1,43 @@
+{{- if .Values.kafkaInit.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "ledger-core.fullname" . }}-kafka-init
+  labels:
+    {{- include "ledger-core.labels" . | nindent 4 }}
+  annotations:
+    # weight "1": after migration's "0". Provisioning the topic layout
+    # does not depend on the schema, but running them concurrently buys
+    # nothing and two hook Jobs racing to be "the" pre-install step is a
+    # confusing failure to debug the one time one of them fails.
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "1"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ .Values.kafkaInit.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.kafkaInit.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "ledger-core.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: kafka-init
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ include "ledger-core.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: kafka-init
+          image: {{ include "ledger-core.image" (dict "root" $ "svcName" "kafka-init") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "ledger-core.fullname" . }}-config
+            - secretRef:
+                name: {{ include "ledger-core.fullname" . }}-secret
+          env:
+            - name: LEDGER_SERVICE
+              value: kafka-init
+{{- end }}

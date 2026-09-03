@@ -1,0 +1,171 @@
+name: deploy
+
+# Triggered on a version tag -- git tag v0.5.0 && git push --tags -- or run
+# by hand for a re-deploy of an already-tagged, already-pushed release.
+# workflow_dispatch does NOT rebuild images; it re-runs the Kubernetes
+# rollout against whatever was already built and pushed for that tag, which
+# matters the day a rollout needs retrying without also rebuilding.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Existing image tag to (re-)deploy, e.g. v0.5.0. Leave empty to build and push a fresh one from the current ref."
+        required: false
+        type: string
+
+# A deploy is never cancelled mid-flight the way ci.yml's test runs are --
+# two overlapping deploys would race the Helm migration hook against a
+# live rollout, which is exactly the kind of ambiguity a payments ledger's
+# own migrations are built to never be. Queue instead of cancel.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_BASE: ghcr.io/${{ github.repository_owner }}/ledger-core
+
+permissions:
+  contents: read
+  # id-token/packages: write is scoped to exactly the two things this
+  # workflow does that ci.yml's read-only jobs never need: push images to
+  # GHCR, and (implicitly, via GITHUB_TOKEN) nothing else.
+  packages: write
+
+jobs:
+  resolve-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      build: ${{ steps.resolve.outputs.build }}
+    steps:
+      - id: resolve
+        run: |
+          if [ -n "${{ inputs.image_tag }}" ]; then
+            echo "tag=${{ inputs.image_tag }}" >> "$GITHUB_OUTPUT"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-and-push:
+    needs: resolve-tag
+    if: needs.resolve-tag.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      # Every image shares deploy/Dockerfile.prod and one Go build cache
+      # key, but the local sandbox this workflow's own Dockerfile.prod
+      # comment describes -- a 3.9GB Docker VM OOM'ing on seven parallel
+      # `go build`s -- is exactly the failure this matrix would otherwise
+      # reproduce on a small GitHub-hosted runner. fail-fast: false so one
+      # service's build failure does not hide another's; max-parallel
+      # keeps the actual concurrent build count bounded rather than
+      # trusting the runner to have enough memory for eight at once.
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        service:
+          - { name: api, healthcheck_port: 8080 }
+          - { name: outbox-publisher, healthcheck_port: 9091 }
+          - { name: projector, healthcheck_port: 9093 }
+          - { name: saga-orchestrator, healthcheck_port: 9094 }
+          - { name: reconciler, healthcheck_port: 9095 }
+          - { name: migrate, healthcheck_port: 9090 }
+          - { name: kafka-init, healthcheck_port: 9090 }
+          - { name: issue-api-key, healthcheck_port: 9090 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          # GITHUB_TOKEN, not a separate registry secret: GHCR accepts it
+          # directly, scoped to this repository, and it is already rotated
+          # by GitHub on every run -- one fewer long-lived credential to
+          # manage for a registry this workflow only ever pushes to, never
+          # reads from elsewhere.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile.prod
+          build-args: |
+            SERVICE=${{ matrix.service.name }}
+            HEALTHCHECK_PORT=${{ matrix.service.healthcheck_port }}
+          push: true
+          tags: ${{ env.IMAGE_BASE }}-${{ matrix.service.name }}:${{ needs.resolve-tag.outputs.tag }}
+          # GitHub Actions' own cache backend, keyed per service: eight
+          # services sharing one cache key would each evict the others'
+          # layers on every run, which is worse than no cache at all for a
+          # matrix this shape.
+          cache-from: type=gha,scope=${{ matrix.service.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service.name }}
+
+  check-deploy-config:
+    needs: [resolve-tag, build-and-push]
+    # `always()` because build-and-push is skipped entirely on a
+    # workflow_dispatch re-deploy (needs.resolve-tag.outputs.build ==
+    # 'false') -- the normal `needs` success requirement would otherwise
+    # treat "skipped, on purpose" as "failed, stop here".
+    if: always() && !cancelled() && (needs.build-and-push.result == 'success' || needs.build-and-push.result == 'skipped')
+    runs-on: ubuntu-latest
+    outputs:
+      ready: ${{ steps.check.outputs.ready }}
+    steps:
+      - id: check
+        run: |
+          if [ -z "${{ secrets.KUBE_CONFIG }}" ] || [ -z "${{ secrets.PROD_POSTGRES_DSN }}" ] || \
+             [ -z "${{ secrets.PROD_KAFKA_BROKERS }}" ] || [ -z "${{ secrets.PROD_GATEWAY_URL }}" ]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::One or more of KUBE_CONFIG, PROD_POSTGRES_DSN, PROD_KAFKA_BROKERS, PROD_GATEWAY_URL is not configured as a repository/environment secret. Images were built and pushed (tag ${{ needs.resolve-tag.outputs.tag }}), but the Kubernetes rollout is skipped -- this is expected until a target cluster exists and its secrets are set. See deploy/helm/ledger-core/README.md."
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  deploy:
+    needs: [resolve-tag, check-deploy-config]
+    if: needs.check-deploy-config.outputs.ready == 'true'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      - name: Configure kubeconfig
+        run: |
+          umask 077
+          mkdir -p "$HOME/.kube"
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > "$HOME/.kube/config"
+
+      - name: helm upgrade --install
+        # The migrate and kafka-init hook Jobs run as part of this command,
+        # before Helm touches a single Deployment -- see
+        # deploy/helm/ledger-core/templates/migration-job.yaml's
+        # hook-weight "0" and kafka-init-job.yaml's "1". A migration
+        # failure fails THIS step and the rollout never proceeds; it does
+        # not partially apply.
+        run: |
+          helm upgrade --install ledger-core deploy/helm/ledger-core \
+            --namespace ledger-core --create-namespace \
+            --atomic --timeout 10m \
+            --set image.tag=${{ needs.resolve-tag.outputs.tag }} \
+            --set postgres.dsn="${{ secrets.PROD_POSTGRES_DSN }}" \
+            --set kafka.brokers="${{ secrets.PROD_KAFKA_BROKERS }}" \
+            --set gateway.url="${{ secrets.PROD_GATEWAY_URL }}"
+
+      - name: Rollout status
+        run: |
+          for svc in api outbox-publisher projector saga-orchestrator reconciler; do
+            kubectl rollout status deployment/ledger-core-$svc -n ledger-core --timeout=5m
+          done

@@ -29,6 +29,7 @@ import (
 	"github.com/satyamsipah/ledger-core/internal/config"
 	"github.com/satyamsipah/ledger-core/internal/db"
 	ledgerhttp "github.com/satyamsipah/ledger-core/internal/http"
+	"github.com/satyamsipah/ledger-core/internal/kafka"
 	"github.com/satyamsipah/ledger-core/internal/observability"
 	"github.com/satyamsipah/ledger-core/internal/outbox/publish"
 	"github.com/satyamsipah/ledger-core/internal/outbox/publish/debezium"
@@ -102,6 +103,7 @@ func run() error {
 			return fmt.Errorf("init kafka client: %w", err)
 		}
 		defer client.Close()
+		checkers = append(checkers, kafka.NewChecker(client))
 
 		publisher = polling.New(pool.Pool, client, logger, metrics, polling.Config{
 			Interval:  cfg.Outbox.PollInterval,

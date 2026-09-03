@@ -1,0 +1,16 @@
+{{- range $svcName, $svc := .Values.services }}
+{{- if and $svc.enabled $svc.pdb.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "ledger-core.fullname" $ }}-{{ $svcName }}
+  labels:
+    {{- include "ledger-core.serviceSelectorLabels" (dict "root" $ "svcName" $svcName) | nindent 4 }}
+spec:
+  minAvailable: {{ $svc.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "ledger-core.serviceSelectorLabels" (dict "root" $ "svcName" $svcName) | nindent 6 }}
+---
+{{- end }}
+{{- end }}

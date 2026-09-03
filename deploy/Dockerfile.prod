@@ -1,0 +1,88 @@
+# Production image: distroless, not deploy/Dockerfile's alpine.
+#
+# deploy/Dockerfile stays exactly as it is for local development -- its
+# wget-based Docker Compose HEALTHCHECK depends on a shell and busybox that
+# this image deliberately does not have. This is the same build otherwise:
+# one Dockerfile, selected by SERVICE, so cmd/api, cmd/projector and every
+# other service share one base image and one set of build flags rather than
+# eight Dockerfiles that can silently drift apart from each other.
+#
+# WHY DISTROLESS. gcr.io/distroless/static-debian12:nonroot ships almost
+# nothing -- ca-certificates, tzdata (unused; this codebase logs and stamps
+# timestamps in UTC, but it is a fixed ~4MB base-image cost this Dockerfile
+# does not control), and the non-root user this Dockerfile's uid 10001
+# already runs as -- and it also has no shell, no package manager, no
+# coreutils. For a payments ledger,
+# that is not a size optimisation so much as removing the toolset an
+# attacker with code execution would otherwise have for free. See
+# docs/DECISIONS.md for the trade-off this accepts: no `docker exec sh`
+# into a production container for interactive debugging. kubectl logs,
+# kubectl debug (which attaches a full-toolset ephemeral container without
+# needing one baked into the image), and the metrics/tracing this codebase
+# already emits are the intended path instead.
+ARG SERVICE=api
+
+FROM golang:1.25-alpine AS build
+ARG SERVICE
+
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+# Both binaries are static (CGO_ENABLED=0) for the identical reason: a
+# distroless image has no libc other than what a Go binary already carries
+# on its own, and a dynamically-linked binary is a container that starts
+# and immediately fails to find dlopen has anything to say.
+RUN CGO_ENABLED=0 GOOS=linux go build \
+        -trimpath \
+        -ldflags='-s -w' \
+        -o /out/service \
+        ./cmd/${SERVICE}
+
+RUN CGO_ENABLED=0 GOOS=linux go build \
+        -trimpath \
+        -ldflags='-s -w' \
+        -o /out/healthcheck \
+        ./cmd/healthcheck
+
+FROM gcr.io/distroless/static-debian12:nonroot
+ARG SERVICE
+
+# Every worker service (outbox-publisher, projector, saga-orchestrator,
+# reconciler) shares its health endpoint with its metrics listener, port
+# 9090 -- "Health and metrics share the metrics listener" is the docs/
+# comment this repeats from cmd/reconciler. cmd/api is the one exception:
+# its /healthz lives on the main HTTP port, 8080, because that server (not
+# the metrics one) owns the full router. Rather than hard-code one port for
+# every image, HEALTHCHECK_PORT is a build arg the api build overrides --
+# see the api-service block in deploy/docker-compose.prod.yml and the
+# per-service "healthPort" in deploy/helm/ledger-core/values.yaml, which
+# both encode this same exception rather than assuming one port fits every
+# service.
+ARG HEALTHCHECK_PORT=9090
+
+# distroless/static-debian12:nonroot already runs as uid 65532 (its own
+# "nonroot" user) and its filesystem is read-only in intent even where the
+# runtime doesn't enforce it -- there is no adduser/chown step here because
+# there is no shell to run one with. This is the same "unprivileged by
+# construction" property deploy/Dockerfile documents for its own uid 10001,
+# arrived at differently because this base image has no useradd to call.
+
+COPY --from=build /out/service /usr/local/bin/service
+COPY --from=build /out/healthcheck /usr/local/bin/healthcheck
+
+ENV LEDGER_SERVICE=${SERVICE}
+# HEALTHCHECK_URL, not a -url flag baked into the CMD array below: Docker's
+# ARG substitution is documented to apply to ENV's right-hand side but NOT
+# to HEALTHCHECK, so this is the one place in this Dockerfile the build arg
+# can actually reach the healthcheck binary. See cmd/healthcheck/main.go.
+ENV HEALTHCHECK_URL=http://127.0.0.1:${HEALTHCHECK_PORT}/healthz
+EXPOSE 8080 9090
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
+    CMD ["/usr/local/bin/healthcheck"]
+
+ENTRYPOINT ["/usr/local/bin/service"]

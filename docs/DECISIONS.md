@@ -2273,3 +2273,104 @@ publisher-running test to trip over — the correct owner of the fix, since
 the alternative (loosening `TestOutboxPublish_KafkaOutage`'s own assertion)
 would have weakened a real zero-loss guarantee to work around a different
 test's mess rather than cleaning up the mess.
+
+---
+
+## Phase 7 — Defensible performance numbers
+
+### D52. The harness is Go for measurement, Make/compose for lifecycle; three findings from actually running it
+
+**Decided.** `cmd/loadtest-harness` runs k6, queries Prometheus, samples
+`docker stats`, and proves correctness under load by calling
+`internal/consistency`'s three checks and `internal/projector.Rebuild`
+directly against the pool it already holds. `make loadtest` owns bringing
+the stack up fresh and seeding it (`docker compose down --volumes`, `up
+--build -d`, the existing seed target) before invoking the binary, reusing
+exactly the same primitives a developer runs by hand rather than
+reimplementing compose lifecycle management in Go.
+
+**Rejected: a pure bash harness.** k6's own `--summary-export` and
+Prometheus's HTTP API both return JSON; turning that into the JSON results
+file and the `docs/BENCHMARKS.md` table the phase asks for is straightforward
+in Go and painful in bash, and this repo already has five `cmd/` binaries for
+exactly this kind of "needed a real program" job.
+
+**Rejected: a Go program that also drives compose.** Compose's own
+healthcheck-ordered `up -d` is already the tool for "bring this stack up
+correctly"; reimplementing it in Go over the Docker API would duplicate
+`docker-compose.yml`'s own dependency graph for no behavioural gain.
+
+**`cmd/reconciler` gained `-check`, mirroring `cmd/projector -rebuild`.** The
+three internal structural checks (D49) previously only ran on a ticker inside
+a long-lived process, reporting through a Prometheus gauge -- the right shape
+for continuous monitoring, wrong shape for "did this load run corrupt
+anything, yes or no, exit code please." `-check` runs all three once, prints
+JSON, and exits non-zero on any violation. The harness itself calls the same
+underlying `internal/consistency` functions directly rather than shelling out
+to this flag -- it already holds the pool `-check` would open a second one
+for -- but the flag stands on its own as something a person can run by hand
+after a load run they started manually, which is the reproducibility the
+phase asks for.
+
+**`internal/gateway/mock.Behaviour` gained `FailureRatePercent`.**
+`saga_heavy` (not yet built) needs a real per-request chance of an ambiguous
+gateway failure, and the existing `Outcome` field is deterministic --
+"succeed", "decline", or "error" until told otherwise. Deliberately resolves
+to `"error"`, never `"decline"`: a 500 is UNKNOWN (the gateway may have
+processed the payment and failed to say so), which is what exercises the
+saga's probe-then-decide machinery, where a deterministic decline is already
+covered by `Outcome` on its own and would not add coverage.
+
+**Three things this entry would rather have not discovered, found only by
+actually running the harness against the real stack repeatedly rather than
+reasoning about it from the code:**
+
+1. **k6's `--summary-export` `"thresholds"` object does not mean what its key
+   suggests.** A run whose CLI output showed `✓ PASSED` for every threshold
+   wrote `"thresholds": {"p(99)<500": false}` into the JSON for that exact
+   metric. Parsing that boolean as "did this threshold pass" would have
+   silently inverted every threshold result in the JSON report. The harness
+   does not read it at all -- `ThresholdsPassed` comes from k6's own process
+   exit code, which is what k6's documentation actually commits to and what
+   CI would act on.
+
+2. **`ledger_outbox_lag_seconds` is not a usable drain signal under the
+   Debezium publisher arm.** Its own doc comment ("age of the oldest
+   unpublished outbox row... zero when nothing is unpublished") describes the
+   *polling* arm. Under Debezium (this stack's default, D31) it is
+   `pg_stat_replication.replay_lag` on the outbox replication slot -- the WAL
+   publisher's own confirmation lag, not a queue depth -- and it is bounded
+   below by Kafka Connect's `offset.flush.interval.ms` (60s default), which
+   governs how often the connector's own offset commit advances the slot's
+   confirmed position. Observed directly: 40-80s of reported "lag" a full
+   minute after every event a run produced had already been produced to
+   Kafka *and* consumed by the projector, confirmed by cross-checking
+   `pg_stat_replication` and the connector's own `/status` endpoint by hand.
+   `waitForPipelineDrained` gates on `ledger_outbox_backlog` (meaningful for
+   the polling arm) and `ledger_projector_consumer_lag` (real Kafka
+   consumer-group lag, meaningful for both arms, and what actually answers
+   "has the projector seen everything this run produced") instead.
+   `ledger_outbox_lag_seconds` is still reported in the benchmark output --
+   it is a real number, just not a drain signal -- with the caveat inline so
+   a reader does not mistake "31s" for a queue backlog.
+
+3. **`make loadtest`'s own `docker compose up --build` measurably inflates
+   the first scenario's tail latency.** A run immediately following a fresh
+   image rebuild recorded p99=1.67s against a p50 of 3.6ms on the identical
+   scenario that otherwise runs at p99 in the 100-300ms range -- the system
+   was fine, the machine was still finishing Docker's own layer-write and
+   build-cache bookkeeping, plus whatever else shares this host. Two
+   responses, not one: `make loadtest` now sleeps 15s after the stack reports
+   healthy before starting the timed run, and `baseline_simple_transfer`'s
+   own p99 threshold is deliberately loose (2s) rather than tuned to a number
+   that turned out to depend on what else this specific machine was doing at
+   the time. `docs/BENCHMARKS.md` states plainly that p99 on a shared
+   development machine should be read as an order of magnitude, not a
+   precise figure -- throughput and error rate did not show the same
+   variance and are the numbers worth trusting precisely.
+
+**What remains open.** Four scenarios (`hot_account`, `idempotent_retry_storm`,
+`saga_heavy`, `mixed_realistic`), the optimisation cycle (pool tuning,
+statement caching, batch inserts, the sharding comparison, index
+effectiveness, read-replica routing), and the README numbers table are not
+built by this entry.

@@ -840,6 +840,99 @@ already-running `docker compose` stack rather than Testcontainers, because
 `chaos-harness` pauses containers by name and that only means something
 against a stack that is actually running.
 
+## Load testing and benchmarks
+
+**Every number below comes from `make loadtest` against this repository,
+on the hardware stated, and is reproducible by anyone who clones it —
+`make loadtest` is the entire method.** It tears the stack down (including
+volumes), rebuilds every image, brings it back up with the read replica
+attached, seeds the chart of accounts, mints a fresh API key, runs five k6
+scenarios in sequence, and after each one proves correctness before moving
+on: `internal/consistency`'s three structural checks plus
+`internal/projector.Rebuild` against the async, Kafka-driven projection —
+the same functions `cmd/reconciler -check` and `cmd/projector -rebuild`
+wrap for a person to run by hand. `cmd/loadtest-harness` is the program
+that does this; `docs/BENCHMARKS.md` and `docs/benchmarks.json` are its
+literal output, not a hand-edited summary.
+
+```bash
+make loadtest
+```
+
+> **Single-node local/dev environment — one developer machine running
+> Docker Compose, not a production cluster.** The absolute numbers below
+> describe that machine and must not be quoted as production capacity.
+> Throughput and error rate are stable across runs; p99 latency on a
+> shared development machine swings roughly 2–4x run to run against
+> otherwise-identical load (background processes, thermal throttling, and
+> the Docker Desktop VM's own scheduling all add noise a dedicated
+> benchmarking host would not have) and should be read as an order of
+> magnitude, not a precise figure.
+
+**Hardware and configuration**, exactly as recorded by the run that
+produced the numbers below (`docs/BENCHMARKS.md`'s own Environment table,
+queried live from the running stack, not restated from memory):
+
+| | |
+|---|---|
+| OS / arch | darwin / arm64, 8 CPUs visible to the harness |
+| PostgreSQL | 16.15 (Alpine), `shared_buffers=128MB`, `max_connections=100`, `wal_level=logical` |
+| Connection pool (`api`) | `LEDGER_POSTGRES_MAX_CONNS=20`, `MIN_CONNS=2` — the measured optimum, see D53 |
+| Read replica | A genuine streaming (physical) standby (`postgres-replica`), in place for this run — see D54 |
+
+**Results** (`make loadtest`, five scenarios, one run):
+
+| Scenario | Requests | Throughput (req/s) | p50 (ms) | p95 (ms) | p99 (ms) | Error rate | Correctness |
+|---|---|---|---|---|---|---|---|
+| `baseline_simple_transfer` | 7,249 | 85.3 | 3.4 | 13.0 | 38.8 | 0.000% | PASS |
+| `hot_account` | 7,249 | 85.3 | 3.5 | 18.7 | 167.4 | 0.000% | PASS |
+| `idempotent_retry_storm` | 7,249 | 85.3 | 3.4 | 10.9 | 46.4 | 0.000% | PASS |
+| `saga_heavy` | 8,035 | 76.8 | 1.8 | 6.1 | 12.6 | 0.000% | PASS |
+| `mixed_realistic` | 10,507 | 91.3 | 3.8 | 29.5 | 168.7 | 0.000% | PASS |
+
+**40,289 real HTTP requests across the run. Zero errors. Zero balance
+drift** — every scenario's correctness proof (global invariant, the
+synchronous-balance-vs-journal check, orphan detection, and the
+async-pipeline rebuild against the Kafka-driven projection) passed clean,
+against that run's own data, not a canned fixture.
+
+What each scenario actually varies, and why it exists:
+
+- **`baseline_simple_transfer`** — two fixed, self-funding accounts, at a
+  moderate steady-state rate. Every other scenario's number is read as a
+  delta against this one, not in isolation.
+- **`hot_account`** — the identical rate and shape, with 90% of traffic
+  credited to a single account instead of spread out, isolating row-lock
+  queueing's cost (D11) from everything else that's identical between the
+  two runs.
+- **`idempotent_retry_storm`** — 30% of requests replay an exact earlier
+  `(key, body)` pair, exercising the idempotency read path (D20) — the
+  fingerprint check, the lease, the replay — instead of `PostTransaction`.
+- **`saga_heavy`** — full `RESERVE → GATEWAY → SETTLE` marketplace payouts
+  against a gateway deliberately failing 5% of calls *ambiguously*
+  (`internal/gateway/mock`'s `FailureRatePercent`, added for this
+  scenario), each iteration polling the saga to a genuinely settled state
+  rather than trusting the `202`.
+- **`mixed_realistic`** — the above four running concurrently in one
+  process via k6's own multi-scenario executor, weighted 60/20/15/5.
+
+**The optimisation cycle behind these numbers — six items, three of which
+were surprises, not confirmations — is recorded in full in
+[docs/DECISIONS.md](docs/DECISIONS.md) D53 and D54**: prepared-statement
+caching (the alternative doesn't just lose, it cannot encode this
+codebase's own batch-insert parameters), batch inserts (already `unnest`,
+never a loop — measured at 1.3x–6.0x over a hypothetical per-row insert
+depending on entry count), index effectiveness (a real, reproducible case
+where an index makes a query *three times slower* at today's data volume,
+`EXPLAIN ANALYZE` plans saved under `docs/explain/`), connection pool
+sizing (the actual ceiling is Postgres's own `max_connections` shared
+across five services, not row-lock contention — confirmed by breaking it
+on purpose), the sharding comparison (D25's own benchmark, rerun on this
+machine: 2.0x–4.4x across three runs, not the naive 16x), and the read
+replica itself (real streaming replication, `GetBalanceAsOf`/`GetStatement`
+only — verified by watching the exact query text appear in
+`pg_stat_activity` on the replica while issuing live HTTP requests).
+
 ## Tests
 
 No mocks for database behaviour — every test runs against real PostgreSQL via
@@ -977,3 +1070,6 @@ fail. A test that cannot fail is not evidence.
 - [docs/DECISIONS.md](docs/DECISIONS.md) — every significant decision, what was
   rejected, and why. Phase 3 is D20–D29, Phase 4 is D30–D36; the open gaps are
   listed at the end of the Phase 3 section
+- [docs/BENCHMARKS.md](docs/BENCHMARKS.md) / [docs/benchmarks.json](docs/benchmarks.json)
+  — `make loadtest`'s own output: full per-scenario latency, throughput,
+  resource usage and correctness-proof results, regenerated by every run

@@ -10,7 +10,7 @@ MIGRATE       := $(COMPOSE) run --rm migrate -path=/migrations -database='$(MIGR
 N ?= 1
 
 .DEFAULT_GOAL := help
-.PHONY: help up down logs migrate-up migrate-down seed rebuild test test-race lint loadtest build fmt tidy psql gateway-behaviour sagas-stuck chaos-up chaos-down chaos-test chaos-fault
+.PHONY: help up down logs migrate-up migrate-down seed rebuild test test-race lint loadtest loadtest-smoke build fmt tidy psql gateway-behaviour sagas-stuck chaos-up chaos-down chaos-test chaos-fault
 
 help: ## List available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -75,7 +75,18 @@ test-race: ## Run the test suite under the race detector
 lint: ## Run golangci-lint
 	golangci-lint run ./...
 
-loadtest: ## Run the k6 load profile against a running stack
+loadtest: ## Spin up the stack fresh, run every k6 scenario, and write docs/BENCHMARKS.md + docs/benchmarks.json
+	$(COMPOSE) down --volumes --remove-orphans
+	$(COMPOSE) up --build -d
+	@echo "waiting for the api to report healthy..."
+	@until curl -sf http://localhost:8080/healthz > /dev/null 2>&1; do sleep 1; done
+	$(COMPOSE) exec -T postgres \
+		psql -v ON_ERROR_STOP=1 -U ledger -d ledger < deploy/seed/seed.sql
+	@echo "settling for 15s before the timed run: --build's own tail CPU usage (docker layer writes, builder cache bookkeeping) measurably inflates the first scenario's p99 otherwise"
+	@sleep 15
+	go run ./cmd/loadtest-harness -scenario=all
+
+loadtest-smoke: ## Run the original probes-only k6 smoke profile against a running stack
 	k6 run test/load/smoke.js
 
 gateway-behaviour: ## Set the mock gateway's behaviour, e.g. make gateway-behaviour BEHAVIOUR='{"outcome":"decline"}'

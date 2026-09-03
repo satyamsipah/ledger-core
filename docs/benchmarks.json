@@ -1,0 +1,262 @@
+{
+  "generated_at": "2026-09-03T07:57:38.440048+05:30",
+  "environment": {
+    "caveat": "Single-node local/dev environment (Docker Compose on one developer machine), not a production cluster. Absolute numbers describe this machine; do not quote them as production capacity.",
+    "os": "darwin",
+    "arch": "arm64",
+    "cpu_count": 8,
+    "postgres_version": "PostgreSQL 16.15 on aarch64-unknown-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit",
+    "postgres_shared_buffers": "128MB",
+    "postgres_max_connections": "100",
+    "postgres_wal_level": "logical",
+    "pool_max_conns": "20",
+    "pool_min_conns": "2"
+  },
+  "scenarios": [
+    {
+      "name": "baseline_simple_transfer",
+      "description": "Two fixed accounts, moderate steady-state rate. Every other scenario is read against this one.",
+      "started_at": "2026-09-03T07:48:38.173861+05:30",
+      "duration_seconds": 85.957953333,
+      "total_requests": 7249,
+      "throughput_rps": 85.2803894856209,
+      "p50_ms": 3.382,
+      "p95_ms": 12.9874,
+      "p99_ms": 38.74868,
+      "error_rate_percent": 0,
+      "thresholds_passed": true,
+      "serialization_retries": 0,
+      "outbox_lag_seconds_at_end": 41.327785,
+      "consumer_lag_at_end": 0,
+      "api_resources": {
+        "CPUAvgPercent": 12.891666666666662,
+        "CPUMaxPercent": 25.35,
+        "MemAvgMB": 30.536428571428576,
+        "MemMaxMB": 33.09
+      },
+      "postgres_resources": {
+        "CPUAvgPercent": 27.92904761904762,
+        "CPUMaxPercent": 68.97,
+        "MemAvgMB": 140.59142857142857,
+        "MemMaxMB": 170.7
+      },
+      "correctness": {
+        "global_invariant": {
+          "Violations": null
+        },
+        "projection_drift": {
+          "AccountsCompared": 12,
+          "Drifted": null,
+          "TotalDrifted": 0
+        },
+        "orphans": {
+          "FewEntryTransactions": null,
+          "TotalFewEntry": 0,
+          "OrphanEntries": null,
+          "TotalOrphanEntries": 0
+        },
+        "async_pipeline_rebuild": {
+          "AccountsCompared": 12,
+          "Mismatches": null
+        },
+        "ok": true
+      }
+    },
+    {
+      "name": "hot_account",
+      "description": "Same rate and shape as baseline_simple_transfer; 90% of traffic credits one account instead of spreading out, isolating row-lock contention's cost (D11).",
+      "started_at": "2026-09-03T07:50:16.228938+05:30",
+      "duration_seconds": 86.203642708,
+      "total_requests": 7249,
+      "throughput_rps": 85.28111185017225,
+      "p50_ms": 3.47,
+      "p95_ms": 18.67879999999999,
+      "p99_ms": 167.39287999999988,
+      "error_rate_percent": 0,
+      "thresholds_passed": true,
+      "serialization_retries": 0,
+      "outbox_lag_seconds_at_end": 19.966888,
+      "consumer_lag_at_end": 0,
+      "api_resources": {
+        "CPUAvgPercent": 14.129285714285716,
+        "CPUMaxPercent": 30.4,
+        "MemAvgMB": 34.18595238095237,
+        "MemMaxMB": 36.52
+      },
+      "postgres_resources": {
+        "CPUAvgPercent": 31.215476190476195,
+        "CPUMaxPercent": 110,
+        "MemAvgMB": 215.70238095238096,
+        "MemMaxMB": 242.9
+      },
+      "correctness": {
+        "global_invariant": {
+          "Violations": null
+        },
+        "projection_drift": {
+          "AccountsCompared": 12,
+          "Drifted": null,
+          "TotalDrifted": 0
+        },
+        "orphans": {
+          "FewEntryTransactions": null,
+          "TotalFewEntry": 0,
+          "OrphanEntries": null,
+          "TotalOrphanEntries": 0
+        },
+        "async_pipeline_rebuild": {
+          "AccountsCompared": 12,
+          "Mismatches": null
+        },
+        "ok": true
+      }
+    },
+    {
+      "name": "idempotent_retry_storm",
+      "description": "30% of requests replay an exact earlier (key, body) pair from the same VU, exercising the idempotency read path (D20) instead of PostTransaction.",
+      "started_at": "2026-09-03T07:51:54.583661+05:30",
+      "duration_seconds": 85.706162334,
+      "total_requests": 7249,
+      "throughput_rps": 85.28149009315905,
+      "p50_ms": 3.346,
+      "p95_ms": 10.866199999999992,
+      "p99_ms": 46.4214,
+      "error_rate_percent": 0,
+      "thresholds_passed": true,
+      "serialization_retries": 0,
+      "outbox_lag_seconds_at_end": 1.279635,
+      "consumer_lag_at_end": 0,
+      "api_resources": {
+        "CPUAvgPercent": 11.968095238095234,
+        "CPUMaxPercent": 24.22,
+        "MemAvgMB": 27.906666666666666,
+        "MemMaxMB": 37.83
+      },
+      "postgres_resources": {
+        "CPUAvgPercent": 23.659761904761904,
+        "CPUMaxPercent": 69.65,
+        "MemAvgMB": 259.3619047619048,
+        "MemMaxMB": 297.6
+      },
+      "correctness": {
+        "global_invariant": {
+          "Violations": null
+        },
+        "projection_drift": {
+          "AccountsCompared": 12,
+          "Drifted": null,
+          "TotalDrifted": 0
+        },
+        "orphans": {
+          "FewEntryTransactions": null,
+          "TotalFewEntry": 0,
+          "OrphanEntries": null,
+          "TotalOrphanEntries": 0
+        },
+        "async_pipeline_rebuild": {
+          "AccountsCompared": 12,
+          "Mismatches": null
+        },
+        "ok": true
+      }
+    },
+    {
+      "name": "saga_heavy",
+      "description": "Full RESERVE/GATEWAY/SETTLE marketplace payouts against a gateway failing 5% of calls ambiguously; each iteration polls the saga to a settled state rather than trusting the 202.",
+      "started_at": "2026-09-03T07:53:32.399652+05:30",
+      "duration_seconds": 105.249392667,
+      "total_requests": 8035,
+      "throughput_rps": 76.8044111483223,
+      "p50_ms": 1.829,
+      "p95_ms": 6.136299999999999,
+      "p99_ms": 12.570279999999984,
+      "error_rate_percent": 0,
+      "thresholds_passed": true,
+      "serialization_retries": 0,
+      "outbox_lag_seconds_at_end": 0.988586,
+      "consumer_lag_at_end": 0,
+      "api_resources": {
+        "CPUAvgPercent": 7.022156862745098,
+        "CPUMaxPercent": 24.64,
+        "MemAvgMB": 22.929803921568624,
+        "MemMaxMB": 24.21
+      },
+      "postgres_resources": {
+        "CPUAvgPercent": 17.91666666666667,
+        "CPUMaxPercent": 59.64,
+        "MemAvgMB": 315.4568627450981,
+        "MemMaxMB": 333.1
+      },
+      "correctness": {
+        "global_invariant": {
+          "Violations": null
+        },
+        "projection_drift": {
+          "AccountsCompared": 12,
+          "Drifted": null,
+          "TotalDrifted": 0
+        },
+        "orphans": {
+          "FewEntryTransactions": null,
+          "TotalFewEntry": 0,
+          "OrphanEntries": null,
+          "TotalOrphanEntries": 0
+        },
+        "async_pipeline_rebuild": {
+          "AccountsCompared": 12,
+          "Mismatches": null
+        },
+        "ok": true
+      }
+    },
+    {
+      "name": "mixed_realistic",
+      "description": "A weighted concurrent blend of the other four scenarios (60% transfers, 20% hot-account, 15% idempotent retries, 5% payouts) via k6's own multi-scenario executor.",
+      "started_at": "2026-09-03T07:55:29.836544+05:30",
+      "duration_seconds": 116.0562385,
+      "total_requests": 10507,
+      "throughput_rps": 91.33024187954457,
+      "p50_ms": 3.84,
+      "p95_ms": 29.521799999999928,
+      "p99_ms": 168.72624,
+      "error_rate_percent": 0,
+      "thresholds_passed": true,
+      "serialization_retries": 0,
+      "outbox_lag_seconds_at_end": 12.882201,
+      "consumer_lag_at_end": 0,
+      "api_resources": {
+        "CPUAvgPercent": 13.646249999999998,
+        "CPUMaxPercent": 52.42,
+        "MemAvgMB": 25.283928571428564,
+        "MemMaxMB": 26.69
+      },
+      "postgres_resources": {
+        "CPUAvgPercent": 31.218214285714282,
+        "CPUMaxPercent": 100.69,
+        "MemAvgMB": 352.26249999999976,
+        "MemMaxMB": 374.6
+      },
+      "correctness": {
+        "global_invariant": {
+          "Violations": null
+        },
+        "projection_drift": {
+          "AccountsCompared": 12,
+          "Drifted": null,
+          "TotalDrifted": 0
+        },
+        "orphans": {
+          "FewEntryTransactions": null,
+          "TotalFewEntry": 0,
+          "OrphanEntries": null,
+          "TotalOrphanEntries": 0
+        },
+        "async_pipeline_rebuild": {
+          "AccountsCompared": 12,
+          "Mismatches": null
+        },
+        "ok": true
+      }
+    }
+  ]
+}

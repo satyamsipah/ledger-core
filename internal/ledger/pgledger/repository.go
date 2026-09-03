@@ -49,6 +49,7 @@ const advisoryLockClass = 0x4C454447 // "LEDG"
 // Repository is the PostgreSQL-backed ledger repository.
 type Repository struct {
 	pool          *pgxpool.Pool
+	readPool      *pgxpool.Pool
 	timeout       time.Duration
 	retrier       *db.Retrier
 	advisoryLocks bool
@@ -76,6 +77,31 @@ func WithAdvisoryLocks(enabled bool) Option {
 	return func(r *Repository) { r.advisoryLocks = enabled }
 }
 
+// WithReadReplica routes GetBalanceAsOf and GetStatement -- the two read-only
+// statement/temporal queries, never the write path -- to a second pool
+// against a streaming (physical) hot standby, instead of the primary.
+//
+// Deliberately narrow. Every OTHER read this repository does, including the
+// account_balances lookup inside a posting transaction's row lock (D1,
+// D18), stays on the primary: those reads are part of a write's own
+// consistency, and a replica is asynchronous by construction -- reading a
+// balance from it to decide whether a debit is permitted would let real
+// replication lag reintroduce the exact lost-update class of bug the row
+// lock exists to prevent. GetBalanceAsOf and GetStatement carry no such
+// risk: both already document that a temporal or paginated read is
+// bounded-stale by nature (D16), so the additional staleness a replica adds
+// is a difference in degree, not in kind, and is the entire reason this
+// option is safe to offer at all.
+//
+// Nil-safe by omission, not by a nil check here: New defaults readPool to
+// the primary when this option is never applied, so every existing caller
+// -- every test, and any deployment with no replica configured -- keeps
+// reading its own writes with no staleness at all, exactly as before this
+// option existed.
+func WithReadReplica(pool *pgxpool.Pool) Option {
+	return func(r *Repository) { r.readPool = pool }
+}
+
 // New builds a repository over an existing pool.
 //
 // The timeout bounds each logical operation rather than each statement: a
@@ -90,6 +116,9 @@ func New(pool *pgxpool.Pool, timeout time.Duration, opts ...Option) *Repository 
 	r := &Repository{pool: pool, timeout: timeout}
 	for _, opt := range opts {
 		opt(r)
+	}
+	if r.readPool == nil {
+		r.readPool = r.pool
 	}
 	return r
 }
@@ -250,7 +279,7 @@ func (r *Repository) GetBalanceAsOf(ctx context.Context, accountID uuid.UUID, at
 		currency     string
 		balanceMinor int64
 	)
-	err := r.pool.QueryRow(ctx, `
+	err := r.readPool.QueryRow(ctx, `
 		WITH acct AS (
 		    SELECT id, currency, normal_balance FROM accounts WHERE id = $1
 		),
@@ -309,7 +338,7 @@ func (r *Repository) GetStatement(ctx context.Context, q ledger.StatementQuery) 
 
 	// One extra row, discarded before returning, so "is there another page?" is
 	// answered by fact rather than by the guess that a full page implies more.
-	rows, err := r.pool.Query(ctx, `
+	rows, err := r.readPool.Query(ctx, `
 		WITH acct AS (
 		    SELECT id, currency, normal_balance FROM accounts WHERE id = $1
 		),

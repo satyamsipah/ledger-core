@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	"sync"
 	"time"
@@ -59,6 +60,20 @@ type Behaviour struct {
 
 	// Hang stops the response entirely until the client gives up.
 	Hang HangMode `json:"hang"`
+
+	// FailureRatePercent, when > 0, rolls the dice on every request
+	// independently of Outcome: with this probability (0-100) the request
+	// resolves as "error" regardless of what Outcome says.
+	//
+	// Deliberately "error", never "decline". Outcome already gives a caller a
+	// deterministic decline whenever that is what they want to test; what
+	// FailureRatePercent exists for is a load profile that wants a fraction of
+	// gateway calls to come back UNKNOWN -- a real 500, ambiguous about
+	// whether the payment was recorded -- because that is the path that
+	// exercises the saga's probe-then-decide machinery (gateway.go's own
+	// three-valued outcome) rather than its ordinary decline handling, which a
+	// deterministic Outcome already covers on its own.
+	FailureRatePercent int `json:"failure_rate_percent"`
 }
 
 // Server is an in-memory payment gateway.
@@ -172,7 +187,15 @@ func (s *Server) pay(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if behaviour.Outcome == "error" {
+	outcome := behaviour.Outcome
+	//nolint:gosec // G404: fault-injection probability, not a security
+	// primitive -- the same reasoning already established for shard
+	// selection (internal/ledger/service.go) and retry jitter (internal/db/retry.go).
+	if behaviour.FailureRatePercent > 0 && rand.IntN(100) < behaviour.FailureRatePercent {
+		outcome = "error"
+	}
+
+	if outcome == "error" {
 		// A 500 is UNKNOWN, not a decline: the gateway may have processed the
 		// payment and failed to say so. Recording nothing here is what makes a
 		// later probe informative.
@@ -188,7 +211,7 @@ func (s *Server) pay(w http.ResponseWriter, r *http.Request) {
 		Currency:    req.Currency,
 		CreatedAt:   time.Now().UTC(),
 	}
-	if behaviour.Outcome == "decline" {
+	if outcome == "decline" {
 		payment.Status = gateway.StatusFailed
 		payment.Reason = "insufficient funds at the destination bank"
 	}
@@ -236,7 +259,8 @@ func (s *Server) setBehaviour(w http.ResponseWriter, r *http.Request) {
 	s.logger.Info("gateway behaviour changed",
 		slog.String("outcome", b.Outcome),
 		slog.Int("latency_ms", b.LatencyMS),
-		slog.String("hang", string(b.Hang)))
+		slog.String("hang", string(b.Hang)),
+		slog.Int("failure_rate_percent", b.FailureRatePercent))
 	w.WriteHeader(http.StatusNoContent)
 }
 

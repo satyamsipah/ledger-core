@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/satyamsipah/ledger-core/internal/config"
@@ -40,6 +41,15 @@ func NewPool(ctx context.Context, cfg config.Postgres, logger *slog.Logger) (*Po
 	poolCfg.MaxConnLifetime = cfg.MaxConnLifetime
 	poolCfg.MaxConnIdleTime = cfg.MaxConnIdleTime
 	poolCfg.ConnConfig.ConnectTimeout = cfg.ConnectTimeout
+
+	// pgx's own default is already QueryExecModeCacheStatement -- server-side
+	// prepared statements, cached per connection -- so this only ever changes
+	// anything when POSTGRES_QUERY_EXEC_MODE is explicitly overridden to
+	// "simple_protocol" for the Phase 7 optimisation-cycle comparison
+	// (docs/DECISIONS.md). config.Load already rejects any other value.
+	if cfg.QueryExecMode == "simple_protocol" {
+		poolCfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+	}
 
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
